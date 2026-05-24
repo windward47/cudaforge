@@ -1,0 +1,50 @@
+# Build output
+build/
+out/
+*.exe
+*.dll
+*.lib
+*.exp
+*.pdb
+*.ilk
+*.sln
+*.vcxproj
+*.vcxproj.filters
+*.vcxproj.user
+CMakeFiles/
+cmake_install.cmake
+CMakeCache.txt
+CTestTestfile.cmake
+Makefile
+*.make
+
+# IDE
+.vs/
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# Test artifacts (generated during test runs)
+test_*.onnx
+
+# Claude internal
+.claude/
+
+# Coverage
+*.gcda
+*.gcno
+*.gcov
+coverage/
