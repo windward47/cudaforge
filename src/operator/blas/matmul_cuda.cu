@@ -1,6 +1,7 @@
 #include "operator.h"
 #include "cuda_ops.h"
 #include "matmul_int.h"
+#include <mma.h>
 
 /* ============================================================
  * Naive: each thread computes one output element
@@ -107,13 +108,91 @@ __global__ void matmul_f32_warp(const float* __restrict__ A,
 }
 
 /* ============================================================
+ * Tensor Core kernel (sm_70+).
+ *
+ * Uses nvcuda::wmma with m16n16k16 FP16→FP32 MMA operations.
+ * Each block (1 warp, 32 threads) computes a 16×16 output tile.
+ * FP32 inputs are converted to FP16 on load for Tensor Core compute;
+ * accumulation and output remain FP32 for full precision.
+ * ============================================================ */
+#define TC_TILE 16
+
+__global__ void matmul_f32_tc_kernel(const float* __restrict__ A,
+                                      const float* __restrict__ B,
+                                      float* __restrict__ C,
+                                      int64_t M, int64_t N, int64_t K) {
+    using namespace nvcuda;
+
+    __shared__ half As[TC_TILE][TC_TILE];
+    __shared__ half Bs[TC_TILE][TC_TILE];
+
+    /* Warp-local: this block is a single warp (32 threads) */
+    int tid = threadIdx.x;
+
+    /* Compute the 16×16 output tile this warp owns */
+    int tile_row = blockIdx.y * TC_TILE;
+    int tile_col = blockIdx.x * TC_TILE;
+
+    wmma::fragment<wmma::matrix_a, TC_TILE, TC_TILE, TC_TILE, half, wmma::row_major> a_frag;
+    wmma::fragment<wmma::matrix_b, TC_TILE, TC_TILE, TC_TILE, half, wmma::col_major> b_frag;
+    wmma::fragment<wmma::accumulator, TC_TILE, TC_TILE, TC_TILE, float> c_frag;
+
+    wmma::fill_fragment(c_frag, 0.0f);
+
+    int num_k_tiles = (int)((K + TC_TILE - 1) / TC_TILE);
+
+    for (int kt = 0; kt < num_k_tiles; kt++) {
+        int k0 = kt * TC_TILE;
+
+        /* Cooperative load A tile: TC_TILE×TC_TILE = 256 halfs, 8 per thread */
+        const float* A_base = A + tile_row * K + k0;
+        #pragma unroll
+        for (int i = tid; i < TC_TILE * TC_TILE; i += 32) {
+            int r = i / TC_TILE;
+            int c = i % TC_TILE;
+            float val = 0.0f;
+            if (tile_row + r < M && k0 + c < K)
+                val = A_base[r * K + c];
+            As[r][c] = __float2half(val);
+        }
+
+        /* Cooperative load B tile: TC_TILE×TC_TILE = 256 halfs, 8 per thread */
+        const float* B_base = B + k0 * N + tile_col;
+        #pragma unroll
+        for (int i = tid; i < TC_TILE * TC_TILE; i += 32) {
+            int r = i / TC_TILE;
+            int c = i % TC_TILE;
+            float val = 0.0f;
+            if (k0 + r < K && tile_col + c < N)
+                val = B_base[r * N + c];
+            Bs[r][c] = __float2half(val);
+        }
+
+        __syncthreads();
+
+        wmma::load_matrix_sync(a_frag, (const half*)As, TC_TILE);
+        wmma::load_matrix_sync(b_frag, (const half*)Bs, TC_TILE);
+
+        wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
+
+        __syncthreads();
+    }
+
+    /* Store.  wmma::store_matrix_sync writes a full 16×16 tile —
+     * the dispatch below only routes to this kernel when M and N are
+     * multiples of TC_TILE, so no out-of-bounds store is possible. */
+    float* C_out = C + tile_row * N + tile_col;
+    wmma::store_matrix_sync(C_out, c_frag, (unsigned)N, wmma::mem_row_major);
+}
+
+/* ============================================================
  * Dispatch: selects the best kernel for the given dimensions.
  *
  * Strategy (sm_86 / RTX 2050):
  *   - Tiny matrices (max dim <= 32): naive kernel (less launch overhead)
  *   - Small/medium (M,N < 64):    16x16 tiled shared-memory kernel
- *   - Large (M,N >= 64):          32x32 warp-tiled kernel with padding
- *   - Future: FP16 Tensor Core for M,N,K >= 1024 (mma.sync.aligned)
+ *   - Medium (M,N 64..511):       32x32 warp-tiled kernel with padding
+ *   - Large (M,N >= 512):         FP16 Tensor Core kernel (MMA m16n16k16)
  *
  * The 32×32 warp kernel uses +1 padding on shared memory columns to
  * avoid bank conflicts between consecutive rows.
@@ -140,6 +219,16 @@ int matmul_f32_cuda(const void* inputs[], void* outputs[],
         grid  = dim3((unsigned int)((N + 15) / 16),
                      (unsigned int)((M + 15) / 16), 1);
         CUDA_KERNEL_LAUNCH(matmul_f32_naive, grid, block, 0, s,
+                           A, B, C, M, N, K);
+    } else if (M >= 512 && N >= 512 && K >= 512
+               && M % TC_TILE == 0 && N % TC_TILE == 0) {
+        /* Tensor Core path: FP16→FP32 MMA for large, aligned matrices.
+         * Requires M and N to be multiples of 16 so wmma::store_matrix_sync
+         * never writes out of bounds. */
+        block = dim3(32, 1, 1);  /* 1 warp = 32 threads */
+        grid  = dim3((unsigned int)((N + TC_TILE - 1) / TC_TILE),
+                     (unsigned int)((M + TC_TILE - 1) / TC_TILE), 1);
+        CUDA_KERNEL_LAUNCH(matmul_f32_tc_kernel, grid, block, 0, s,
                            A, B, C, M, N, K);
     } else if (M >= 64 && N >= 64) {
         block = dim3(WARP_TILE, WARP_TILE, 1);

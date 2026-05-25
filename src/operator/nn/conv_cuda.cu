@@ -89,7 +89,8 @@ static int conv2d_im2col(const float* in, const float* w, float* out,
 #define CONV_DIRECT_TILE_H 8
 #define CONV_DIRECT_TILE_W 16
 #define CONV_DIRECT_THREADS (CONV_DIRECT_TILE_H * CONV_DIRECT_TILE_W)
-#define CONV_MAX_SMEM_BYTES 40960  /* safe for sm_86 (48KB default, 100KB opt-in) */
+/* Max shared memory per block — queried once from the device.
+ * Falls back to 48 KB (sm_86 default) if the query fails. */
 
 __global__ void conv2d_f32_direct_kernel(
     const float* __restrict__ input,
@@ -100,7 +101,8 @@ __global__ void conv2d_f32_direct_kernel(
     int64_t OH, int64_t OW,
     int64_t stride_h, int64_t stride_w,
     int64_t pad_h, int64_t pad_w,
-    int64_t dil_h, int64_t dil_w)
+    int64_t dil_h, int64_t dil_w,
+    int64_t fuse_activation)
 {
     int tx = threadIdx.x;
     int ty = threadIdx.y;
@@ -130,6 +132,16 @@ __global__ void conv2d_f32_direct_kernel(
         }
     }
 
+    /* Inline activation (kernel fusion) */
+    if (fuse_activation == 1) {
+        sum = sum > 0.0f ? sum : 0.0f;                       /* ReLU */
+    } else if (fuse_activation == 2) {
+        sum = 1.0f / (1.0f + expf(-sum));                     /* Sigmoid */
+    } else if (fuse_activation == 3) {
+        float t = tanhf(0.79788456f * (sum + 0.044715f * sum * sum * sum));
+        sum = 0.5f * sum * (1.0f + t);                        /* GELU */
+    }
+
     output[n * K * OH * OW + k * OH * OW + oh * OW + ow] = sum;
 }
 
@@ -147,7 +159,8 @@ __global__ void conv2d_f32_direct_smem_kernel(
     int64_t OH, int64_t OW,
     int64_t stride_h, int64_t stride_w,
     int64_t pad_h, int64_t pad_w,
-    int64_t dil_h, int64_t dil_w)
+    int64_t dil_h, int64_t dil_w,
+    int64_t fuse_activation)
 {
     /* Input window dimensions for this tile */
     int win_h = (CONV_DIRECT_TILE_H - 1) * stride_h + (KH - 1) * dil_h + 1;
@@ -210,6 +223,15 @@ __global__ void conv2d_f32_direct_smem_kernel(
     }
 
     if (valid_out) {
+        /* Inline activation (kernel fusion) */
+        if (fuse_activation == 1) {
+            sum = sum > 0.0f ? sum : 0.0f;                       /* ReLU */
+        } else if (fuse_activation == 2) {
+            sum = 1.0f / (1.0f + expf(-sum));                     /* Sigmoid */
+        } else if (fuse_activation == 3) {
+            float t = tanhf(0.79788456f * (sum + 0.044715f * sum * sum * sum));
+            sum = 0.5f * sum * (1.0f + t);                        /* GELU */
+        }
         output[n * K * OH * OW + k * OH * OW + oh * OW + ow] = sum;
     }
 }
@@ -240,18 +262,28 @@ int conv2d_f32_cuda(const void* inputs[], void* outputs[],
               (unsigned int)((OH + CONV_DIRECT_TILE_H - 1) / CONV_DIRECT_TILE_H),
               (unsigned int)(N * K));
 
-    /* Use shared-memory direct kernel when input window fits in shared memory */
+    /* Query max shared memory once (cached across calls) */
+    static int s_max_smem_bytes = 0;
+    if (s_max_smem_bytes == 0) {
+        int val = 0;
+        cudaError_t err = cudaDeviceGetAttribute(&val,
+            cudaDevAttrMaxSharedMemoryPerBlock, 0);
+        s_max_smem_bytes = (err == cudaSuccess && val > 0) ? val : 49152; /* 48KB default */
+    }
+
+    /* Use shared-memory direct kernel when input window fits */
     int win_h = (CONV_DIRECT_TILE_H - 1) * p->stride_h + (KH - 1) * p->dilation_h + 1;
     int win_w = (CONV_DIRECT_TILE_W - 1) * p->stride_w + (KW - 1) * p->dilation_w + 1;
     size_t smem_bytes = (size_t)win_h * win_w * sizeof(float);
 
-    if (smem_bytes <= CONV_MAX_SMEM_BYTES) {
+    if ((int)smem_bytes <= s_max_smem_bytes) {
         CUDA_KERNEL_LAUNCH(conv2d_f32_direct_smem_kernel, grid, block, smem_bytes, s,
                            in, w, out, C, H, W, K, KH, KW,
                            OH, OW,
                            p->stride_h, p->stride_w,
                            p->pad_h, p->pad_w,
-                           p->dilation_h, p->dilation_w);
+                           p->dilation_h, p->dilation_w,
+                           p->fuse_activation);
     } else {
         /* Direct kernel without shared memory — still avoids im2col buffer */
         CUDA_KERNEL_LAUNCH(conv2d_f32_direct_kernel, grid, block, 0, s,
@@ -259,7 +291,8 @@ int conv2d_f32_cuda(const void* inputs[], void* outputs[],
                            OH, OW,
                            p->stride_h, p->stride_w,
                            p->pad_h, p->pad_w,
-                           p->dilation_h, p->dilation_w);
+                           p->dilation_h, p->dilation_w,
+                           p->fuse_activation);
     }
     return 0;
 }

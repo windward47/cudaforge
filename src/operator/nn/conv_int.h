@@ -11,6 +11,9 @@ typedef struct {
     int64_t stride_h, stride_w;
     int64_t dilation_h, dilation_w;
     int64_t groups;
+    /* Kernel fusion: if non-zero, apply activation inline after Conv.
+       1=ReLU, 2=Sigmoid, 3=GELU (mirrors op_type_t values OP_RELU..OP_GELU). */
+    int64_t fuse_activation;
 } conv_params_t;
 
 #endif /* CONV_INT_H_ */
