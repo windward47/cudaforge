@@ -24,6 +24,7 @@ if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
 elseif(CMAKE_C_COMPILER_ID STREQUAL "MSVC")
     set(CMAKE_C_FLAGS   "${CMAKE_C_FLAGS}   /W4 /WX")
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /W4 /WX")
+    add_compile_definitions(_CRT_SECURE_NO_WARNINGS)
 endif()
 
 # ============================================================
@@ -106,9 +107,12 @@ endif()
 
 target_include_directories(operator PUBLIC
     src/operator/include
-    src/operator/blas     # for matmul_int.h (used by conv)
-    src/operator/nn       # for conv_int.h
     src/platform/include
+)
+
+target_include_directories(operator PRIVATE
+    src/operator/blas
+    src/operator/nn
 )
 
 target_link_libraries(operator PUBLIC platform)
@@ -125,6 +129,10 @@ target_include_directories(application PUBLIC
     src/application/engine
     src/operator/include
     src/platform/include
+)
+
+target_include_directories(application PRIVATE
+    src/operator/nn      # for conv_int.h (kernel fusion)
 )
 
 target_link_libraries(application PUBLIC operator platform)
@@ -149,7 +157,7 @@ target_include_directories(onnx_model PUBLIC
 )
 
 if(CMAKE_C_COMPILER_ID STREQUAL "MSVC")
-    target_compile_options(onnx_model PRIVATE /wd4996 /wd4189 /wd4456 /wd4101)
+    target_compile_options(onnx_model PRIVATE /wd4189 /wd4456 /wd4101)
 endif()
 
 target_link_libraries(onnx_model PUBLIC application operator platform)
@@ -264,7 +272,10 @@ if(ENABLE_TESTS)
     add_executable(test_graph
         src/application/engine/test/test_graph.c
     )
-    target_include_directories(test_graph PRIVATE third_party/unity/src)
+    target_include_directories(test_graph PRIVATE
+        third_party/unity/src
+        src/operator/nn       # for conv_int.h
+    )
     target_link_libraries(test_graph PRIVATE application operator platform unity)
     add_test(NAME test_graph COMMAND test_graph)
 
@@ -307,7 +318,7 @@ if(ENABLE_TESTS)
     )
     target_link_libraries(test_onnx PRIVATE onnx_model application operator platform unity)
     if(CMAKE_C_COMPILER_ID STREQUAL "MSVC")
-        target_compile_options(test_onnx PRIVATE /wd4996 /wd4189 /wd4456 /wd4101)
+        target_compile_options(test_onnx PRIVATE /wd4189 /wd4456 /wd4101)
     endif()
     add_test(NAME test_onnx COMMAND test_onnx)
 
@@ -326,7 +337,7 @@ if(ENABLE_TESTS)
     )
     target_link_libraries(test_classification PRIVATE onnx_model application operator platform unity)
     if(CMAKE_C_COMPILER_ID STREQUAL "MSVC")
-        target_compile_options(test_classification PRIVATE /wd4996 /wd4189 /wd4456 /wd4101)
+        target_compile_options(test_classification PRIVATE /wd4189 /wd4456 /wd4101)
     endif()
     add_test(NAME test_classification COMMAND test_classification)
     set_tests_properties(test_classification PROPERTIES

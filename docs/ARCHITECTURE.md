@@ -55,9 +55,7 @@ typedef struct {
     int   (*get_cache_line_size)(void);
 } platform_t;
 
-extern const platform_t g_platform_x86;
-extern const platform_t g_platform_arm;
-extern const platform_t g_platform_riscv;
+extern const platform_t* g_platform;  /* set by platform_init() to &s_platform_x86 */
 ```
 
 ### 2.2 Operator 层
@@ -68,10 +66,8 @@ extern const platform_t g_platform_riscv;
 
 | 模块目录 | 说明 |
 | --- | --- |
-| `src/operator/math/` | 数学运算（add/mul/norm/softmax 等） |
-| `src/operator/nn/` | 神经网络算子（conv/pool/batch_norm/relu 等） |
-| `src/operator/blas/` | 矩阵运算（matmul/gemm/gemv） |
-| `src/operator/utils/` | 辅助算子（reshape/transpose/concat/slice） |
+| `src/operator/nn/` | 神经网络算子（conv/pool/batchnorm/relu/add/softmax/reshape 等） |
+| `src/operator/blas/` | 矩阵运算（matmul） |
 
 **算子接口规范**：
 

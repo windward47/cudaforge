@@ -195,9 +195,10 @@ __global__ void matmul_f16_tc(const half* A, const half* B, float* C,
 /* 测试用例 */
 void test_relu_f32() {
     /* 1. 准备输入数据 */
-    tensor_t* input  = tensor_rand(DATA_TYPE_F32, 2, (int64_t[]){4, 256});
-    tensor_t* output_cpu = tensor_like(input);
-    tensor_t* output_gpu = tensor_like(input);
+    tensor_t* input  = tensor_create(DATA_TYPE_F32, 2, (int64_t[]){4, 256});
+    /* fill input->data with random values via manual loop or helper */
+    tensor_t* output_cpu = tensor_create(DATA_TYPE_F32, 2, (int64_t[]){4, 256});
+    tensor_t* output_gpu = tensor_create(DATA_TYPE_F32, 2, (int64_t[]){4, 256});
 
     /* 2. CPU fallback */
     relu_f32(input, output_cpu, input->numel);

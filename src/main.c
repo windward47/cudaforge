@@ -37,6 +37,9 @@ int main(void) {
     printf("CUDA: disabled\n");
 #endif
 
+#ifdef USE_CUDA
+    cuda_platform_finalize();
+#endif
     platform_finalize();
     return 0;
 }

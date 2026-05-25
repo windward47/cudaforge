@@ -3,12 +3,18 @@
 #include <stdlib.h>
 
 static int cuda_init(int device_id) {
-    CUDA_CHECK(cudaSetDevice(device_id));
+    cudaError_t err = cudaSetDevice(device_id);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "cudaSetDevice(%d): %s\n", device_id, cudaGetErrorString(err));
+        return -1;
+    }
     return 0;
 }
 
 static void cuda_finalize(void) {
-    CUDA_CHECK(cudaDeviceReset());
+    cudaError_t err = cudaDeviceReset();
+    if (err != cudaSuccess)
+        fprintf(stderr, "cudaDeviceReset: %s\n", cudaGetErrorString(err));
 }
 
 static int cuda_get_device_count(int* count) {
