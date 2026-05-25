@@ -38,7 +38,7 @@ if(ENABLE_CUDA)
 endif()
 
 if(ENABLE_OPENMP)
-    find_package(OpenMP)
+    find_package(OpenMP REQUIRED)
 endif()
 
 # ============================================================
@@ -82,6 +82,10 @@ target_sources(operator PRIVATE
     src/operator/nn/pooling.c
     src/operator/nn/batchnorm.c
     src/operator/blas/matmul.c
+    src/operator/nn/add.c
+    src/operator/nn/reshape.c
+    src/operator/nn/globalavgpool.c
+    src/operator/nn/softmax.c
     src/operator/operator_registry.c
     src/operator/operator_init.c
 )
@@ -93,6 +97,9 @@ if(ENABLE_CUDA)
         src/operator/nn/activations_cuda.cu
         src/operator/nn/pooling_cuda.cu
         src/operator/nn/batchnorm_cuda.cu
+        src/operator/nn/add_cuda.cu
+        src/operator/nn/globalavgpool_cuda.cu
+        src/operator/nn/softmax_cuda.cu
         src/operator/blas/matmul_cuda.cu
     )
 endif()
@@ -213,6 +220,47 @@ if(ENABLE_TESTS)
     target_include_directories(test_batchnorm PRIVATE third_party/unity/src)
     target_link_libraries(test_batchnorm PRIVATE operator platform unity)
     add_test(NAME test_batchnorm COMMAND test_batchnorm)
+
+    add_executable(test_add
+        src/operator/nn/test/test_add.c
+    )
+    target_include_directories(test_add PRIVATE
+        third_party/unity/src
+        src/operator/nn
+    )
+    target_link_libraries(test_add PRIVATE operator platform unity)
+    add_test(NAME test_add COMMAND test_add)
+
+    add_executable(test_reshape
+        src/operator/nn/test/test_reshape.c
+    )
+    target_include_directories(test_reshape PRIVATE
+        third_party/unity/src
+        src/operator/nn
+    )
+    target_link_libraries(test_reshape PRIVATE operator platform unity)
+    add_test(NAME test_reshape COMMAND test_reshape)
+
+    add_executable(test_globalavgpool
+        src/operator/nn/test/test_globalavgpool.c
+    )
+    target_include_directories(test_globalavgpool PRIVATE
+        third_party/unity/src
+        src/operator/nn
+    )
+    target_link_libraries(test_globalavgpool PRIVATE operator platform unity)
+    add_test(NAME test_globalavgpool COMMAND test_globalavgpool)
+
+    add_executable(test_softmax
+        src/operator/nn/test/test_softmax.c
+    )
+    target_include_directories(test_softmax PRIVATE
+        third_party/unity/src
+        src/operator/nn
+    )
+    target_link_libraries(test_softmax PRIVATE operator platform unity)
+    add_test(NAME test_softmax COMMAND test_softmax)
+
     add_executable(test_graph
         src/application/engine/test/test_graph.c
     )
@@ -262,6 +310,28 @@ if(ENABLE_TESTS)
         target_compile_options(test_onnx PRIVATE /wd4996 /wd4189 /wd4456 /wd4101)
     endif()
     add_test(NAME test_onnx COMMAND test_onnx)
+
+    add_executable(test_classification
+        tests/test_classification.c
+    )
+    target_include_directories(test_classification PRIVATE
+        third_party/unity/src
+        src/application/model
+        src/application/engine
+        src/application/include
+        src/operator/include
+        src/operator/blas
+        src/operator/nn
+        src/platform/include
+    )
+    target_link_libraries(test_classification PRIVATE onnx_model application operator platform unity)
+    if(CMAKE_C_COMPILER_ID STREQUAL "MSVC")
+        target_compile_options(test_classification PRIVATE /wd4996 /wd4189 /wd4456 /wd4101)
+    endif()
+    add_test(NAME test_classification COMMAND test_classification)
+    set_tests_properties(test_classification PROPERTIES
+        WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+
 endif()
 
 # ============================================================

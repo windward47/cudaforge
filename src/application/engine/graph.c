@@ -199,8 +199,7 @@ void graph_destroy(inference_graph_t* g) {
 /* ============================================================
  * Op type → name mapping
  * ============================================================ */
-static const char* op_name(op_type_t type, bool use_cuda) {
-    const char* suffix = use_cuda ? "_cuda" : "";
+static const char* op_name(op_type_t type) {
     switch (type) {
         case OP_RELU:       return "relu_f32";
         case OP_SIGMOID:    return "sigmoid_f32";
@@ -210,9 +209,12 @@ static const char* op_name(op_type_t type, bool use_cuda) {
         case OP_MAXPOOL2D:  return "maxpool2d_f32";
         case OP_AVGPOOL2D:  return "avgpool2d_f32";
         case OP_BATCHNORM:  return "batchnorm_f32";
+        case OP_ADD:        return "add_f32";
+        case OP_RESHAPE:    return "reshape_f32";
+        case OP_GLOBALAVGPOOL: return "globalavgpool_f32";
+        case OP_SOFTMAX:    return "softmax_f32";
         default:            return NULL;
     }
-    (void)suffix;
 }
 
 /* ============================================================
@@ -251,20 +253,24 @@ int graph_execute(inference_graph_t* g, tensor_t* inputs[],
 
         /* Build op name */
         char name_buf[64];
+        const char* base = op_name(n->type);
+        if (!base) return -1;
         if (use_cuda) {
-            snprintf(name_buf, sizeof(name_buf), "%s_cuda", op_name(n->type, false));
+            snprintf(name_buf, sizeof(name_buf), "%s_cuda", base);
         } else {
-            snprintf(name_buf, sizeof(name_buf), "%s", op_name(n->type, false));
+            snprintf(name_buf, sizeof(name_buf), "%s", base);
         }
 
         const operator_registry_t* op = operator_find(name_buf);
         if (!op) {
             /* Fall back to CPU version if CUDA variant not found */
             if (use_cuda) {
-                op = operator_find(op_name(n->type, false));
+                op = operator_find(base);
             }
         }
-        if (!op) return -2;
+        if (!op) {
+            return -2;
+        }
 
         /* Input slots needed: tensor inputs + weights + extra metadata slots */
         int total_inputs = n->num_inputs + n->num_weights;
@@ -275,9 +281,15 @@ int graph_execute(inference_graph_t* g, tensor_t* inputs[],
             if (max_input_idx < 5) max_input_idx = 5;
         int input_slots = max_input_idx + 1;
 
-        const void** op_inputs = (const void**)malloc(
-            (size_t)(input_slots + n->num_outputs) * sizeof(void*));
-        void** op_outputs = (void**)&op_inputs[input_slots];
+        /* Stack buffer for common case (avoids per-node malloc/free) */
+        const void* local_buf[32];
+        const void** op_inputs = local_buf;
+        void** op_outputs = NULL;
+        int total_slots = input_slots + n->num_outputs;
+        if (total_slots > 32) {
+            op_inputs = (const void**)malloc((size_t)total_slots * sizeof(void*));
+        }
+        op_outputs = (void**)&op_inputs[input_slots];
 
         for (int i = 0; i < n->num_inputs; i++) {
             int tid = n->input_tensors[i];
@@ -355,7 +367,7 @@ int graph_execute(inference_graph_t* g, tensor_t* inputs[],
         int ret = op->func(op_inputs, op_outputs,
                            (const operator_params_t*)n->params,
                            use_cuda ? &stream : NULL);
-        free(op_inputs);
+        if (op_inputs != local_buf) free((void*)op_inputs);
 
         /* Copy back to host if CUDA */
         if (use_cuda) {
@@ -363,6 +375,7 @@ int graph_execute(inference_graph_t* g, tensor_t* inputs[],
                 int tid = n->output_tensors[i];
                 if (tid >= 0) tensor_copy_to_host(g->tensors[tid].tensor);
             }
+            g_cuda.stream_synchronize(0);
         }
 
         if (ret != 0) return ret;

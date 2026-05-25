@@ -5,9 +5,20 @@
 #include "conv_int.h"
 #include "pooling_int.h"
 #include "batchnorm_int.h"
+#include "add_int.h"
+#include "reshape_int.h"
+#include "globalavgpool_int.h"
+#include "softmax_int.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+
+static char* dup_str(const char* s) {
+    if (!s) return NULL;
+    size_t len = strlen(s) + 1;
+    char* d = (char*)malloc(len);
+    return d ? (char*)memcpy(d, s, len) : NULL;
+}
 
 /* ============================================================
  * ONNX protobuf field numbers (subset)
@@ -45,6 +56,7 @@ enum {
 #define MAX_TENSOR_NAME   128
 #define MAX_NODES         128
 #define MAX_TENSOR_INFOS  256
+#define TENSOR_HT_SIZE    509  /* prime > 2 * MAX_TENSOR_INFOS for open addressing */
 
 /* ============================================================
  * Internal: tensor info during parsing
@@ -79,6 +91,8 @@ typedef struct {
 typedef struct {
     onnx_tensor_info_t tensors[MAX_TENSOR_INFOS];
     int                num_tensors;
+    /* Open-addressing hash table: name → tensor index (TENSOR_HT_SIZE entries, -1 = empty) */
+    int                tensor_ht[TENSOR_HT_SIZE];
     onnx_node_info_t   nodes[MAX_NODES];
     int                num_nodes;
     char               graph_input_names[16][MAX_TENSOR_NAME];
@@ -88,23 +102,42 @@ typedef struct {
 } onnx_parsed_model_t;
 
 /* ============================================================
- * Helper: find tensor by name
+ * FNV-1a hash for tensor name → hash table index
+ * ============================================================ */
+static unsigned int tensor_name_hash(const char* s) {
+    unsigned int h = 2166136261u;
+    while (*s) { h ^= (unsigned char)*s++; h *= 16777619u; }
+    return h % TENSOR_HT_SIZE;
+}
+
+/* ============================================================
+ * Helper: find tensor by name (hash table, O(1) expected)
  * ============================================================ */
 static onnx_tensor_info_t* find_tensor(onnx_parsed_model_t* m, const char* name) {
-    for (int i = 0; i < m->num_tensors; i++) {
-        if (strcmp(m->tensors[i].name, name) == 0)
-            return &m->tensors[i];
+    unsigned int idx = tensor_name_hash(name);
+    while (m->tensor_ht[idx] >= 0) {
+        int ti = m->tensor_ht[idx];
+        if (strcmp(m->tensors[ti].name, name) == 0)
+            return &m->tensors[ti];
+        idx = (idx + 1) % TENSOR_HT_SIZE;  /* linear probe */
     }
     return NULL;
 }
 
 static onnx_tensor_info_t* add_tensor(onnx_parsed_model_t* m, const char* name) {
     if (m->num_tensors >= MAX_TENSOR_INFOS) return NULL;
-    onnx_tensor_info_t* t = &m->tensors[m->num_tensors++];
+    onnx_tensor_info_t* t = &m->tensors[m->num_tensors];
     memset(t, 0, sizeof(*t));
     { size_t nl = strlen(name); if (nl >= MAX_TENSOR_NAME) nl = MAX_TENSOR_NAME - 1;
       memcpy(t->name, name, nl); t->name[nl] = '\0'; }
     t->tensor_id = -1;
+
+    /* Insert into hash table */
+    unsigned int idx = tensor_name_hash(t->name);
+    while (m->tensor_ht[idx] >= 0)
+        idx = (idx + 1) % TENSOR_HT_SIZE;  /* linear probe */
+    m->tensor_ht[idx] = m->num_tensors;
+    m->num_tensors++;
     return t;
 }
 
@@ -151,10 +184,10 @@ static int parse_tensor_proto(pb_message_t* msg, onnx_tensor_info_t* info) {
         return 0;
     }
 
-    /* float_data: proto3 uses field 4, proto2 uses field 6 */
-    pb_field_t* fd = pb_find_field(msg, 4);  /* proto3 */
+    /* float_data: proto3 uses field 4 */
+    pb_field_t* fd = pb_find_field(msg, 4);
     if (!fd || fd->wire_type != PB_WIRE_LENGTH_DELIMITED)
-        fd = pb_find_field(msg, F_TensorProto_float_data);  /* proto2: field 6 */
+        fd = pb_find_field(msg, F_TensorProto_float_data);
     if (fd && fd->wire_type == PB_WIRE_LENGTH_DELIMITED) {
         size_t nf = fd->length_delimited.size / 4;
         info->raw_data = (uint8_t*)malloc(nf * sizeof(float));
@@ -362,6 +395,10 @@ static op_type_t map_onnx_op(const char* onnx_op) {
     if (strcmp(onnx_op, "MaxPool") == 0) return OP_MAXPOOL2D;
     if (strcmp(onnx_op, "AveragePool") == 0) return OP_AVGPOOL2D;
     if (strcmp(onnx_op, "BatchNormalization") == 0) return OP_BATCHNORM;
+    if (strcmp(onnx_op, "Add")     == 0) return OP_ADD;
+    if (strcmp(onnx_op, "Reshape") == 0) return OP_RESHAPE;
+    if (strcmp(onnx_op, "GlobalAveragePool") == 0) return OP_GLOBALAVGPOOL;
+    if (strcmp(onnx_op, "Softmax")  == 0) return OP_SOFTMAX;
     return (op_type_t)(-1);
 }
 
@@ -377,7 +414,8 @@ static int infer_output_shape(onnx_node_info_t* node, onnx_parsed_model_t* model
     if (!in0) return 0; /* unknown input shape — skip */
 
     /* Elementwise ops: output = input shape */
-    if (ot == OP_RELU || ot == OP_SIGMOID || ot == OP_GELU || ot == OP_BATCHNORM) {
+    if (ot == OP_RELU || ot == OP_SIGMOID || ot == OP_GELU || ot == OP_BATCHNORM
+        || ot == OP_ADD || ot == OP_SOFTMAX) {
         for (int oi = 0; oi < node->num_outputs; oi++) {
             onnx_tensor_info_t* out = find_tensor(model, node->output_names[oi]);
             if (!out) out = add_tensor(model, node->output_names[oi]);
@@ -448,6 +486,64 @@ static int infer_output_shape(onnx_node_info_t* node, onnx_parsed_model_t* model
                 out->ndim = 2;
                 out->shape[0] = out_shape[0];
                 out->shape[1] = out_shape[1];
+            }
+        }
+        return 0;
+    }
+
+    /* GlobalAveragePool: NCHW → N C 1 1 */
+    if (ot == OP_GLOBALAVGPOOL) {
+        int64_t N = in0->ndim >= 4 ? in0->shape[0] : 1;
+        int64_t C = in0->ndim >= 4 ? in0->shape[1] : 1;
+        int64_t out_shape[4] = {N, C, 1, 1};
+        for (int oi = 0; oi < node->num_outputs; oi++) {
+            onnx_tensor_info_t* out = find_tensor(model, node->output_names[oi]);
+            if (!out) out = add_tensor(model, node->output_names[oi]);
+            if (out) {
+                out->ndim = 4;
+                for (int d = 0; d < 4; d++) out->shape[d] = out_shape[d];
+            }
+        }
+        return 0;
+    }
+
+    /* Reshape: output shape from the 'shape' initializer (input[1]) */
+    if (ot == OP_RESHAPE) {
+        onnx_tensor_info_t* shape_info = find_tensor(model, node->input_names[1]);
+        if (!shape_info || !shape_info->is_initializer || !shape_info->raw_data)
+            return 0;
+        int64_t* shape_raw = (int64_t*)shape_info->raw_data;
+        int64_t numel = 1;
+        for (int d = 0; d < shape_info->ndim; d++) numel *= shape_info->shape[d];
+        int ndim_out = (int)numel;
+        if (ndim_out > 8) ndim_out = 8;
+
+        /* Compute total input elements for resolving -1 */
+        int64_t input_total = 1;
+        for (int d = 0; d < in0->ndim; d++) input_total *= in0->shape[d];
+
+        int64_t out_shape[8];
+        int64_t known_product = 1;
+        int minus_one_idx = -1;
+        for (int d = 0; d < ndim_out; d++) {
+            out_shape[d] = shape_raw[d];
+            if (shape_raw[d] == -1) {
+                minus_one_idx = d;
+            } else if (shape_raw[d] == 0 && d < in0->ndim) {
+                out_shape[d] = in0->shape[d];
+            }
+            if (out_shape[d] > 0) known_product *= out_shape[d];
+        }
+        if (minus_one_idx >= 0 && known_product > 0) {
+            out_shape[minus_one_idx] = input_total / known_product;
+        }
+
+        for (int oi = 0; oi < node->num_outputs; oi++) {
+            onnx_tensor_info_t* out = find_tensor(model, node->output_names[oi]);
+            if (!out) out = add_tensor(model, node->output_names[oi]);
+            if (out) {
+                out->ndim = ndim_out;
+                for (int d = 0; d < ndim_out; d++) out->shape[d] = out_shape[d];
             }
         }
         return 0;
@@ -555,7 +651,7 @@ static inference_graph_t* build_graph_from_onnx(onnx_parsed_model_t* pm) {
         size_t params_size = 0;
 
         if (ot == OP_CONV2D) {
-            static conv_params_t cp;
+            conv_params_t cp;
             memset(&cp, 0, sizeof(cp));
             onnx_tensor_info_t* in_t = find_tensor(pm, node->input_names[0]);
             onnx_tensor_info_t* w_t  = find_tensor(pm, node->input_names[1]);
@@ -579,7 +675,7 @@ static inference_graph_t* build_graph_from_onnx(onnx_parsed_model_t* pm) {
             cp.groups = (int64_t)node_attr_int(node, "group", 1);
             params = &cp; params_size = sizeof(cp);
         } else if (ot == OP_MAXPOOL2D || ot == OP_AVGPOOL2D) {
-            static pool_params_t pp;
+            pool_params_t pp;
             memset(&pp, 0, sizeof(pp));
             onnx_tensor_info_t* in_t = find_tensor(pm, node->input_names[0]);
             if (in_t && in_t->ndim >= 4) {
@@ -599,7 +695,7 @@ static inference_graph_t* build_graph_from_onnx(onnx_parsed_model_t* pm) {
             if (na2 >= 2) { pp.pad_h = ints2[0]; pp.pad_w = ints2[1]; }
             params = &pp; params_size = sizeof(pp);
         } else if (ot == OP_MATMUL) {
-            static matmul_params_t mp;
+            matmul_params_t mp;
             memset(&mp, 0, sizeof(mp));
             onnx_tensor_info_t* in_t = find_tensor(pm, node->input_names[0]);
             onnx_tensor_info_t* w_t  = find_tensor(pm, node->input_names[1]);
@@ -614,7 +710,7 @@ static inference_graph_t* build_graph_from_onnx(onnx_parsed_model_t* pm) {
             mp.transpose_b = transB != 0;
             params = &mp; params_size = sizeof(mp);
         } else if (ot == OP_BATCHNORM) {
-            static batchnorm_params_t bp;
+            batchnorm_params_t bp;
             memset(&bp, 0, sizeof(bp));
             onnx_tensor_info_t* in_t = find_tensor(pm, node->input_names[0]);
             if (in_t && in_t->ndim >= 2) {
@@ -622,6 +718,51 @@ static inference_graph_t* build_graph_from_onnx(onnx_parsed_model_t* pm) {
             }
             bp.epsilon = node_attr_float(node, "epsilon", 1e-5f);
             params = &bp; params_size = sizeof(bp);
+        } else if (ot == OP_ADD) {
+            add_params_t ap;
+            memset(&ap, 0, sizeof(ap));
+            onnx_tensor_info_t* in_a = find_tensor(pm, node->input_names[0]);
+            onnx_tensor_info_t* in_b = find_tensor(pm, node->input_names[1]);
+            if (in_a) { ap.numel = 1; for (int d = 0; d < in_a->ndim; d++) ap.numel *= in_a->shape[d]; }
+            if (in_b) { ap.B_numel = 1; for (int d = 0; d < in_b->ndim; d++) ap.B_numel *= in_b->shape[d]; }
+            params = &ap; params_size = sizeof(ap);
+        } else if (ot == OP_RESHAPE) {
+            reshape_params_t rp;
+            memset(&rp, 0, sizeof(rp));
+            onnx_tensor_info_t* in_t = find_tensor(pm, node->input_names[0]);
+            onnx_tensor_info_t* out_t = find_tensor(pm, node->output_names[0]);
+            if (in_t) { rp.numel = 1; for (int d = 0; d < in_t->ndim; d++) rp.numel *= in_t->shape[d]; }
+            if (out_t) {
+                rp.ndim = out_t->ndim;
+                for (int d = 0; d < out_t->ndim && d < MAX_TENSOR_DIMS; d++)
+                    rp.shape[d] = out_t->shape[d];
+            }
+            params = &rp; params_size = sizeof(rp);
+        } else if (ot == OP_GLOBALAVGPOOL) {
+            globalavgpool_params_t gp;
+            memset(&gp, 0, sizeof(gp));
+            onnx_tensor_info_t* in_t = find_tensor(pm, node->input_names[0]);
+            if (in_t && in_t->ndim >= 4) {
+                gp.N = in_t->shape[0]; gp.C = in_t->shape[1];
+                gp.H = in_t->shape[2]; gp.W = in_t->shape[3];
+            }
+            params = &gp; params_size = sizeof(gp);
+        } else if (ot == OP_SOFTMAX) {
+            softmax_params_t sp;
+            memset(&sp, 0, sizeof(sp));
+            int64_t axis = node_attr_int(node, "axis", 1);
+            onnx_tensor_info_t* in_t = find_tensor(pm, node->input_names[0]);
+            if (in_t) {
+                /* Determine num_classes (axis dim) and num_blocks (product of other dims) */
+                int64_t num_classes = (axis < in_t->ndim) ? in_t->shape[axis] : 1;
+                int64_t num_blocks = 1;
+                for (int d = 0; d < in_t->ndim; d++) {
+                    if (d != axis) num_blocks *= in_t->shape[d];
+                }
+                sp.num_classes = num_classes;
+                sp.num_blocks  = num_blocks;
+            }
+            params = &sp; params_size = sizeof(sp);
         }
 
         /* Add the node. Data inputs exclude weight initializers; weights are passed separately. */
@@ -671,8 +812,8 @@ onnx_model_t* onnx_load_from_file(const char* path) {
 
     /* Parse root ModelProto */
     pb_message_t* model_msg = pb_parse_message(data, fsize, 5);
-    free(data);
     if (!model_msg) {
+        free(data);
         fprintf(stderr, "onnx_load: failed to parse protobuf\n");
         return NULL;
     }
@@ -682,94 +823,19 @@ onnx_model_t* onnx_load_from_file(const char* path) {
     if (!graph_field) {
         fprintf(stderr, "onnx_load: no graph in model\n");
         pb_message_destroy(model_msg);
+        free(data);
         return NULL;
     }
     pb_message_t* graph_msg = pb_field_as_message(graph_field, 4);
     pb_message_destroy(model_msg);
-    if (!graph_msg) return NULL;
+    if (!graph_msg) { free(data); return NULL; }
 
     onnx_parsed_model_t* pm = (onnx_parsed_model_t*)calloc(1, sizeof(onnx_parsed_model_t));
-    if (!pm) { pb_message_destroy(graph_msg); return NULL; }
+    if (!pm) { pb_message_destroy(graph_msg); free(data); return NULL; }
+    for (int i = 0; i < TENSOR_HT_SIZE; i++) pm->tensor_ht[i] = -1;
 
-    /* Parse initializers (field 5 of GraphProto) */
-    {
-        pb_field_t** inits = NULL;
-        int ic = 0;
-        pb_find_all_fields(graph_msg, F_GraphProto_initializer, &inits, &ic);
-        for (int i = 0; i < ic && pm->num_tensors < MAX_TENSOR_INFOS; i++) {
-            pb_message_t* im = pb_field_as_message(inits[i], 3);
-            if (!im) continue;
-            onnx_tensor_info_t* ti = add_tensor(pm, "");
-            if (ti) {
-                parse_tensor_proto(im, ti);
-                ti->is_initializer = 1;
-                /* Name is not explicitly in TensorProto for initializers in all ONNX versions.
-                   We need to figure out names from the graph context. For now, initializers
-                   are referenced by name. The name is in field 1 of the outer field or we
-                   need to check the raw message. */
-            }
-            pb_message_destroy(im);
-        }
-        free(inits);
-
-        /* Re-parse initializers with names. ONNX initializers have name in field 1 of
-           the ValueInfoProto that wraps them, or the TensorProto has no name.
-           Actually: in GraphProto, "initializer" is a repeated TensorProto,
-           and TensorProto has NO name field in standard ONNX (the name comes from
-           the key in the map, but protobuf map is just repeated).
-
-           The standard way: ONNX uses repeated TensorProto without name in some versions,
-           or with name in others. We need to handle both.
-
-           Re-approach: parse again looking for name. */
-    }
-
-    /* Actually, ONNX GraphProto.initializer are TensorProto messages which
-       don't have a 'name' field. The names come from the node's input references.
-       We need to match initializers to node inputs by position.
-       Let's store initializers indexed by order and match later.
-
-       But wait: the TensorProto can have a name in some ONNX versions. Let me
-       check field 1 ... Actually in onnx.proto, TensorProto doesn't have a name field.
-       The initializer names come from the repeated field key in the map.
-
-       Simplification: parse initializers in order, and in node parsing, when a node's
-       input name matches an initializer name that we track separately, connect them.
-
-       Actually the simplest approach: Parse initializer names from the node inputs.
-       An initializer is identified by being present in GraphProto.initializer AND
-       NOT being present in GraphProto.input. So:
-       1. Parse GraphProto.input → these are graph inputs (not weights)
-       2. Parse GraphProto.initializer → these are weights
-       3. For each initializer, we know its index; the name is implicit from the
-          graph structure. OR, we can check the raw protobuf.
-
-       Actually, TensorProto DOES include name as an optional field. Let me check:
-       In onnx.proto3, message TensorProto { optional string name = 1; ... }
-       But field 1 might be overloaded.
-
-       The cleanest approach: in GraphProto, initializer (field 5) entries are
-       TensorProto which may have name in some encodings. If not, we match by order.
-
-       Let me redo the initializer parsing to also try extracting a name.
-       The name field in TensorProto is field 1 ... wait, dims is field 1.
-       Let me check: TensorProto: dims=1, data_type=2, segment=3, float_data=4..6,
-       int32_data=7, string_data=8, int64_data=9, name=10, ...
-
-       No, wait: in ONNX protobuf:
-       message TensorProto {
-         repeated int64 dims = 1;
-         optional int32 data_type = 2;
-         ...
-         optional string name = 8;  // <-- name is field 8!
-         optional bytes raw_data = 9;
-         ...
-       }
-
-       So TensorProto.name is field 8! Let me handle this.
-    */
-
-    /* Parse initializers with name (field 8) */
+    /* Parse initializers (field 5 of GraphProto).
+       TensorProto.name is field 8 in the ONNX protobuf schema. */
     {
         pb_field_t** inits = NULL;
         int ic = 0;
@@ -880,7 +946,10 @@ onnx_model_t* onnx_load_from_file(const char* path) {
         free(vis);
     }
 
-    /* Parse nodes (field 1 of GraphProto) */
+    /* Parse nodes (field 1 of GraphProto).
+       Store node messages to keep attribute pointers alive through shape inference. */
+    pb_message_t* node_msgs[MAX_NODES];
+    int num_node_msgs = 0;
     {
         pb_field_t** node_fields = NULL;
         int nc = 0;
@@ -889,11 +958,13 @@ onnx_model_t* onnx_load_from_file(const char* path) {
             pb_message_t* nm = pb_field_as_message(node_fields[i], 3);
             if (!nm) continue;
             parse_node_proto(nm, &pm->nodes[pm->num_nodes++]);
-            pb_message_destroy(nm);
+            node_msgs[num_node_msgs++] = nm;  /* keep alive, destroy later */
         }
         free(node_fields);
     }
     pb_message_destroy(graph_msg);
+    /* NOTE: do NOT free(data) yet — all protobuf length_delimited.data pointers
+       (including node attributes) trace back to data. We free it after graph building. */
 
     /* Shape inference: process nodes in declaration order.
        For models with topological node order (standard ONNX), this works.
@@ -920,6 +991,13 @@ onnx_model_t* onnx_load_from_file(const char* path) {
 
     /* Build inference graph */
     inference_graph_t* g = build_graph_from_onnx(pm);
+
+    /* Now safe to destroy node messages and data buffer
+       (all protobuf data is no longer needed after graph construction) */
+    for (int i = 0; i < num_node_msgs; i++) {
+        pb_message_destroy(node_msgs[i]);
+    }
+    free(data);
     if (!g) {
         /* Clean up parsed model tensor data */
         for (int i = 0; i < pm->num_tensors; i++) {
@@ -946,7 +1024,7 @@ onnx_model_t* onnx_load_from_file(const char* path) {
     model->input_shapes = (int64_t**)malloc((size_t)pm->num_graph_inputs * sizeof(int64_t*));
     model->input_ndims  = (int*)malloc((size_t)pm->num_graph_inputs * sizeof(int));
     for (int i = 0; i < pm->num_graph_inputs; i++) {
-        model->input_names[i] = _strdup(pm->graph_input_names[i]);
+        model->input_names[i] = dup_str(pm->graph_input_names[i]);
         onnx_tensor_info_t* ti = find_tensor(pm, pm->graph_input_names[i]);
         if (ti && ti->ndim > 0) {
             model->input_ndims[i] = ti->ndim;
@@ -961,7 +1039,7 @@ onnx_model_t* onnx_load_from_file(const char* path) {
 
     model->output_names = (char**)malloc((size_t)pm->num_graph_outputs * sizeof(char*));
     for (int i = 0; i < pm->num_graph_outputs; i++) {
-        model->output_names[i] = _strdup(pm->graph_output_names[i]);
+        model->output_names[i] = dup_str(pm->graph_output_names[i]);
     }
 
     /* Clean up parsed model */

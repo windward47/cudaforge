@@ -77,7 +77,7 @@ cmake --build build -j$(nproc)
 # Smoke test — prints platform info
 ./build/Release/cudaforge.exe
 
-# Full test suite (9 test executables)
+# Full test suite (14 test executables)
 ctest --test-dir build -C Release -j$(nproc)
 
 # GPU memory safety check
@@ -104,6 +104,10 @@ CUDA: enabled (1 device(s))
 | MaxPool2D | `MaxPool` | ✓ | ✓ | |
 | AvgPool2D | `AveragePool` | ✓ | ✓ | |
 | BatchNorm | `BatchNormalization` | ✓ | ✓ | Coalesced + cross-block reduction |
+| Add | `Add` | ✓ | ✓ | Element-wise with broadcast support |
+| Reshape | `Reshape` | ✓ | — | Zero-copy shape transformation |
+| GlobalAveragePool | `GlobalAveragePool` | ✓ | ✓ | NCHW → NC×1×1 global average pooling |
+| Softmax | `Softmax` | ✓ | ✓ | Per-axis softmax for classification output |
 
 ## API at a Glance
 
@@ -237,7 +241,7 @@ CudaForge includes a **hand-written protobuf wire-format parser** (~200 lines of
 CudaForge is for learning how inference engines work under the hood. Reading its entire codebase takes an afternoon. It's also useful for embedded scenarios where you can't afford 100+ MB of dependencies.
 
 **Q: Can I run ResNet / YOLO / BERT?**
-Not yet. Only the 8 operators listed above are implemented. Many real-world models require Reshape, Softmax, Concat, etc. These are on the roadmap.
+End-to-end MNIST CNN classification (Conv×2 + ReLU + MaxPool + Reshape + Gemm + Softmax) is verified. ResNet-class models have the necessary operator support but haven't been tested yet. Large models (YOLO/BERT) are beyond current scope.
 
 **Q: Does it support FP16 or INT8?**
 Currently FP32 only. Mixed-precision and quantization are planned for future releases.

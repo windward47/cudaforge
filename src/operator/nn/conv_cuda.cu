@@ -3,9 +3,6 @@
 #include "conv_int.h"
 #include "matmul_int.h"
 
-extern int matmul_f32_cuda(const void* inputs[], void* outputs[],
-                           const operator_params_t* params, stream_t* stream);
-
 /* ============================================================
  * im2col kernel (kept as fallback)
  * ============================================================ */
@@ -54,16 +51,20 @@ static int conv2d_im2col(const float* in, const float* w, float* out,
     int64_t col_rows = C * KH * KW;
     int64_t col_cols = OH * OW;
 
+    float* col_buf = (float*)g_cuda.device_alloc((size_t)col_rows * col_cols * sizeof(float));
+    if (!col_buf) return -1;
+
+    int64_t total = col_rows * col_cols;
+    dim3 block(256, 1, 1);
+    dim3 grid((unsigned int)((total + 255) / 256), 1, 1);
+
+    matmul_params_t mp = {.M = K, .N = col_cols, .K = col_rows};
+    const void* mat_inputs[]  = {w, col_buf};
+    void*       mat_outputs[] = {NULL};
+
     for (int64_t n = 0; n < N; n++) {
         const float* in_n  = in  + n * C * H * W;
         float*       out_n = out + n * K * OH * OW;
-
-        float* col_buf = (float*)g_cuda.device_alloc((size_t)col_rows * col_cols * sizeof(float));
-        if (!col_buf) return -1;
-
-        int64_t total = col_rows * col_cols;
-        dim3 block(256, 1, 1);
-        dim3 grid((unsigned int)((total + 255) / 256), 1, 1);
 
         CUDA_KERNEL_LAUNCH(im2col_f32_kernel, grid, block, 0, s,
                            in_n, col_buf, C, H, W, KH, KW,
@@ -71,13 +72,12 @@ static int conv2d_im2col(const float* in, const float* w, float* out,
                            p->stride_h, p->stride_w,
                            p->dilation_h, p->dilation_w, OH, OW);
 
-        matmul_params_t mp = {.M = K, .N = col_cols, .K = col_rows};
-        const void* mat_inputs[]  = {w, col_buf};
-        void*       mat_outputs[] = {out_n};
-        matmul_f32_cuda(mat_inputs, mat_outputs, (const operator_params_t*)&mp, NULL);
-
-        g_cuda.device_free(col_buf);
+        mat_outputs[0] = out_n;
+        const operator_registry_t* mm = operator_find("matmul_f32_cuda");
+        if (mm) mm->func(mat_inputs, mat_outputs, (const operator_params_t*)&mp, NULL);
     }
+
+    g_cuda.device_free(col_buf);
     return 0;
 }
 
@@ -89,6 +89,7 @@ static int conv2d_im2col(const float* in, const float* w, float* out,
 #define CONV_DIRECT_TILE_H 8
 #define CONV_DIRECT_TILE_W 16
 #define CONV_DIRECT_THREADS (CONV_DIRECT_TILE_H * CONV_DIRECT_TILE_W)
+#define CONV_MAX_SMEM_BYTES 40960  /* safe for sm_86 (48KB default, 100KB opt-in) */
 
 __global__ void conv2d_f32_direct_kernel(
     const float* __restrict__ input,
@@ -244,7 +245,7 @@ int conv2d_f32_cuda(const void* inputs[], void* outputs[],
     int win_w = (CONV_DIRECT_TILE_W - 1) * p->stride_w + (KW - 1) * p->dilation_w + 1;
     size_t smem_bytes = (size_t)win_h * win_w * sizeof(float);
 
-    if (smem_bytes <= 8192) {
+    if (smem_bytes <= CONV_MAX_SMEM_BYTES) {
         CUDA_KERNEL_LAUNCH(conv2d_f32_direct_smem_kernel, grid, block, smem_bytes, s,
                            in, w, out, C, H, W, K, KH, KW,
                            OH, OW,

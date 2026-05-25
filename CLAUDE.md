@@ -95,4 +95,4 @@ compute-sanitizer --tool memcheck ./build/Release/test_matmul.exe
 | [docs/CODING_STYLE.md](docs/CODING_STYLE.md) | C 命名/错误处理/头文件规范 | 写/审代码时 |
 | [docs/CUDA_GUIDE.md](docs/CUDA_GUIDE.md) | CUDA kernel 模板、错误检查、优化策略 | 写/审 CUDA kernel 时 |
 | [docs/TASK_TEMPLATES/](docs/TASK_TEMPLATES/) | 新增算子、加 benchmark、加测试 | 接到具体任务时 |
-| [docs/TODO_LIST.md](docs/TODO_LIST.md) | 当前待办 | 了解当前进度 |
+| [docs/TODO_LIST.md](docs/TODO_LIST.md) | 当前待办任务 | 了解当前进度 |

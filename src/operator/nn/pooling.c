@@ -17,6 +17,7 @@ int maxpool2d_f32(const void* inputs[], void* outputs[],
 
     int64_t OH = (p->H + 2 * p->pad_h - p->kernel_h) / p->stride_h + 1;
     int64_t OW = (p->W + 2 * p->pad_w - p->kernel_w) / p->stride_w + 1;
+    if (OH <= 0 || OW <= 0) return -1;
 
     for (int64_t n = 0; n < p->N; n++) {
         for (int64_t c = 0; c < p->C; c++) {
@@ -54,6 +55,7 @@ int avgpool2d_f32(const void* inputs[], void* outputs[],
 
     int64_t OH = (p->H + 2 * p->pad_h - p->kernel_h) / p->stride_h + 1;
     int64_t OW = (p->W + 2 * p->pad_w - p->kernel_w) / p->stride_w + 1;
+    if (OH <= 0 || OW <= 0) return -1;
     float inv = 1.0f / (float)(p->kernel_h * p->kernel_w);
 
     for (int64_t n = 0; n < p->N; n++) {

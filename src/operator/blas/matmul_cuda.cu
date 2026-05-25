@@ -107,7 +107,16 @@ __global__ void matmul_f32_warp(const float* __restrict__ A,
 }
 
 /* ============================================================
- * Dispatch: selects the best kernel for the given dimensions
+ * Dispatch: selects the best kernel for the given dimensions.
+ *
+ * Strategy (sm_86 / RTX 2050):
+ *   - Tiny matrices (max dim <= 32): naive kernel (less launch overhead)
+ *   - Small/medium (M,N < 64):    16x16 tiled shared-memory kernel
+ *   - Large (M,N >= 64):          32x32 warp-tiled kernel with padding
+ *   - Future: FP16 Tensor Core for M,N,K >= 1024 (mma.sync.aligned)
+ *
+ * The 32×32 warp kernel uses +1 padding on shared memory columns to
+ * avoid bank conflicts between consecutive rows.
  * ============================================================ */
 int matmul_f32_cuda(const void* inputs[], void* outputs[],
                     const operator_params_t* params, stream_t* stream) {
@@ -125,7 +134,14 @@ int matmul_f32_cuda(const void* inputs[], void* outputs[],
     int64_t M = p->M, N = p->N, K = p->K;
     dim3 block, grid;
 
-    if (M >= 64 && N >= 64) {
+    if (M <= 32 && N <= 32) {
+        /* Tiny matrices: single-thread-per-output, no shared memory overhead */
+        block = dim3(16, 16, 1);
+        grid  = dim3((unsigned int)((N + 15) / 16),
+                     (unsigned int)((M + 15) / 16), 1);
+        CUDA_KERNEL_LAUNCH(matmul_f32_naive, grid, block, 0, s,
+                           A, B, C, M, N, K);
+    } else if (M >= 64 && N >= 64) {
         block = dim3(WARP_TILE, WARP_TILE, 1);
         grid  = dim3((unsigned int)((N + WARP_TILE - 1) / WARP_TILE),
                      (unsigned int)((M + WARP_TILE - 1) / WARP_TILE), 1);

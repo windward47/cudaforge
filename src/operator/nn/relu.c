@@ -8,7 +8,7 @@ int relu_f32(const void* inputs[], void* outputs[],
     (void)params;
     (void)stream;
 
-    if (!inputs || !inputs[0] || !outputs || !outputs[0]) return -1;
+    if (!inputs || !inputs[0] || !inputs[1] || !outputs || !outputs[0]) return -1;
 
     const float* in  = (const float*)inputs[0];
     float* out       = (float*)outputs[0];

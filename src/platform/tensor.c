@@ -23,6 +23,7 @@ tensor_t* tensor_create(data_type_t dtype, int ndim, const int64_t* shape) {
     }
 
     const data_type_info_t* info = data_type_get_info(dtype);
+    if (!info) { free(t); return NULL; }
     size_t bytes = (size_t)t->numel * info->size;
 
     t->data = platform_alloc_aligned(bytes, 64);
@@ -53,6 +54,7 @@ int tensor_copy_to_device(tensor_t* t) {
     if (t->data_device) return 0;  /* already on device */
 
     const data_type_info_t* info = data_type_get_info(t->dtype);
+    if (!info) return -1;
     size_t bytes = (size_t)t->numel * info->size;
 
     t->data_device = g_cuda.device_alloc(bytes);
@@ -72,8 +74,15 @@ int tensor_copy_to_host(tensor_t* t) {
     if (!g_cuda.memcpy_d2h || !g_cuda.device_free) return -1;
 
     const data_type_info_t* info = data_type_get_info(t->dtype);
+    if (!info) return -1;
     size_t bytes = (size_t)t->numel * info->size;
 
+    /* memcpy_d2h uses cudaMemcpyAsync on stream 0. The device pointer is freed
+       immediately after the async copy is queued. This is safe because:
+       1. The default stream guarantees in-order execution — the copy is queued
+          before cudaFree, so the memory is still valid when the copy runs.
+       2. The caller (graph_execute) must call stream_synchronize(0) after all
+          node outputs are copied back, before reading host data. */
     int ret = g_cuda.memcpy_d2h(t->data, t->data_device, bytes, 0);
     g_cuda.device_free(t->data_device);
     t->data_device = NULL;

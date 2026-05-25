@@ -28,7 +28,7 @@ static int launch_1d(cudaStream_t s, const void* kernel,
 int sigmoid_f32_cuda(const void* inputs[], void* outputs[],
                      const operator_params_t* params, stream_t* stream) {
     (void)params;
-    if (!inputs || !inputs[0] || !outputs || !outputs[0]) return -1;
+    if (!inputs || !inputs[0] || !inputs[1] || !outputs || !outputs[0]) return -1;
     cudaStream_t s = stream ? (cudaStream_t)stream->cuda_stream : 0;
     return launch_1d(s, (const void*)sigmoid_f32_kernel,
                      (const float*)inputs[0], (float*)outputs[0],
@@ -38,7 +38,7 @@ int sigmoid_f32_cuda(const void* inputs[], void* outputs[],
 int gelu_f32_cuda(const void* inputs[], void* outputs[],
                   const operator_params_t* params, stream_t* stream) {
     (void)params;
-    if (!inputs || !inputs[0] || !outputs || !outputs[0]) return -1;
+    if (!inputs || !inputs[0] || !inputs[1] || !outputs || !outputs[0]) return -1;
     cudaStream_t s = stream ? (cudaStream_t)stream->cuda_stream : 0;
     return launch_1d(s, (const void*)gelu_f32_kernel,
                      (const float*)inputs[0], (float*)outputs[0],

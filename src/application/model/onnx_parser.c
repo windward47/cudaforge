@@ -59,6 +59,7 @@ pb_message_t* pb_parse_message(const uint8_t* data, size_t size, int max_depth) 
 
     pb_message_t* msg = (pb_message_t*)calloc(1, sizeof(pb_message_t));
     if (!msg) return NULL;
+    for (int i = 0; i < PB_MAX_FIELD_NUM; i++) msg->first_by_fn[i] = -1;
 
     const uint8_t* p   = data;
     const uint8_t* end = data + size;
@@ -98,9 +99,9 @@ pb_message_t* pb_parse_message(const uint8_t* data, size_t size, int max_depth) 
             f.length_delimited.size  = (size_t)len;
             p += (size_t)len;
         } else if (wtype == 5) {
-            /* 32-bit fixed */
+            /* 32-bit fixed — store in length_delimited so pb_field_get_float can decode it */
             if (p + 4 > end) break;
-            f.wire_type = PB_WIRE_VARINT;
+            f.wire_type = PB_WIRE_LENGTH_DELIMITED;
             f.varint_value = 0;
             f.length_delimited.data = (uint8_t*)p;
             f.length_delimited.size = 4;
@@ -122,6 +123,9 @@ pb_message_t* pb_parse_message(const uint8_t* data, size_t size, int max_depth) 
             msg->fields   = tmp;
             msg->capacity = new_cap;
         }
+        /* Record first occurrence for O(1) find-by-number */
+        if (fn < PB_MAX_FIELD_NUM && msg->first_by_fn[fn] < 0)
+            msg->first_by_fn[fn] = msg->count;
         msg->fields[msg->count++] = f;
     }
 
@@ -139,6 +143,12 @@ void pb_message_destroy(pb_message_t* msg) {
  * ============================================================ */
 pb_field_t* pb_find_field(const pb_message_t* msg, int32_t field_number) {
     if (!msg) return NULL;
+    if (field_number >= 0 && field_number < PB_MAX_FIELD_NUM) {
+        int idx = msg->first_by_fn[field_number];
+        if (idx >= 0) return &msg->fields[idx];
+        return NULL;
+    }
+    /* Field number out of index range — fall back to linear scan (rare) */
     for (int i = 0; i < msg->count; i++) {
         if (msg->fields[i].field_number == field_number)
             return &msg->fields[i];

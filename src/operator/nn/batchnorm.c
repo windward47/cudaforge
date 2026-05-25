@@ -10,7 +10,9 @@
 int batchnorm_f32(const void* inputs[], void* outputs[],
                   const operator_params_t* params, stream_t* stream) {
     (void)stream;
-    if (!inputs || !inputs[0] || !outputs || !outputs[0]) return -1;
+    if (!inputs || !inputs[0] || !inputs[1] || !inputs[2] ||
+        !inputs[3] || !inputs[4] || !inputs[5] || !outputs || !outputs[0])
+        return -1;
     if (!params) return -1;
 
     const batchnorm_params_t* p = (const batchnorm_params_t*)params;
@@ -21,7 +23,6 @@ int batchnorm_f32(const void* inputs[], void* outputs[],
     const float* var    = (const float*)inputs[4];
     float* y            = (float*)outputs[0];
 
-    /* Get total element count per channel from meta — passed as inputs[5] */
     int64_t hw = *(const int64_t*)inputs[5];
 
     for (int64_t c = 0; c < p->C; c++) {

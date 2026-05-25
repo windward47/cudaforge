@@ -77,7 +77,7 @@ cmake --build build -j$(nproc)
 # 快速验证 — 打印平台信息
 ./build/Release/cudaforge.exe
 
-# 完整测试套件（9 个测试程序）
+# 完整测试套件（14 个测试程序）
 ctest --test-dir build -C Release -j$(nproc)
 
 # GPU 内存安全检查
@@ -104,6 +104,10 @@ CUDA: enabled (1 device(s))
 | MaxPool2D | `MaxPool` | ✓ | ✓ | |
 | AvgPool2D | `AveragePool` | ✓ | ✓ | |
 | BatchNorm | `BatchNormalization` | ✓ | ✓ | Coalesced + cross-block reduction |
+| Add | `Add` | ✓ | ✓ | 逐元素加法，支持 broadcast |
+| Reshape | `Reshape` | ✓ | — | 零拷贝形状变换 |
+| GlobalAveragePool | `GlobalAveragePool` | ✓ | ✓ | NCHW → NC×1×1 全局平均池化 |
+| Softmax | `Softmax` | ✓ | ✓ | 沿轴 softmax，分类网络输出层 |
 
 ## API 概览
 
@@ -238,7 +242,7 @@ CudaForge 内置了一个**手写的 protobuf wire-format 解析器**（约 200 
 CudaForge 的初衷是学习推理引擎的底层原理。通读全部代码只需一个下午。同时适用于无法承载 100+ MB 依赖的嵌入式场景。
 
 **Q: 能跑 ResNet / YOLO / BERT 吗？**
-暂时不能。目前只实现了 8 个算子。真实模型通常还需要 Reshape、Softmax、Concat 等，这些在后续计划中。
+当前已验证通过 MNIST CNN 分类模型的端到端推理（Conv×2 + ReLU + MaxPool + Reshape + Gemm + Softmax）。ResNet 等现代 CNN 具备基础算子支撑，但尚未实测。大型模型（YOLO/BERT）尚不支持。
 
 **Q: 支持 FP16 或 INT8 推理吗？**
 当前仅支持 FP32。混合精度和量化推理在后续计划中。

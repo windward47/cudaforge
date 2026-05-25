@@ -27,8 +27,20 @@ extern "C" {
             exit(EXIT_FAILURE); \
         } \
     } while(0)
+
+/* Non-fatal variant: logs error and returns the cudaError_t to caller */
+#define CUDA_CHECK_RET(call) \
+    do { \
+        cudaError_t _err = call; \
+        if (_err != cudaSuccess) { \
+            fprintf(stderr, "CUDA error at %s:%d: %s\n", \
+                    __FILE__, __LINE__, cudaGetErrorString(_err)); \
+            return (int)_err; \
+        } \
+    } while(0)
 #else
 #define CUDA_CHECK(call) (void)(call)
+#define CUDA_CHECK_RET(call) do { (void)(call); } while(0)
 #endif
 
 /* --------------------------------------------------------------------------

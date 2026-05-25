@@ -35,11 +35,11 @@ static void bench_matmul(int M, int N, int K) {
     for (size_t i = 0; i < size_a; i++) h_A[i] = (float)(i % 7 - 3);
     for (size_t i = 0; i < size_b; i++) h_B[i] = (float)(i % 5 - 2);
 
-    cudaMalloc(&d_A, size_a * sizeof(float));
-    cudaMalloc(&d_B, size_b * sizeof(float));
-    cudaMalloc(&d_C, size_c * sizeof(float));
-    cudaMemcpy(d_A, h_A, size_a * sizeof(float), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_B, h_B, size_b * sizeof(float), cudaMemcpyHostToDevice);
+    d_A = (float*)g_cuda.device_alloc(size_a * sizeof(float));
+    d_B = (float*)g_cuda.device_alloc(size_b * sizeof(float));
+    d_C = (float*)g_cuda.device_alloc(size_c * sizeof(float));
+    g_cuda.memcpy_h2d(d_A, h_A, size_a * sizeof(float), 0);
+    g_cuda.memcpy_h2d(d_B, h_B, size_b * sizeof(float), 0);
 
     matmul_params_t p = {.M = M, .N = N, .K = K};
 
@@ -64,18 +64,18 @@ static void bench_matmul(int M, int N, int K) {
         void*       outputs[] = {d_C};
         for (int w = 0; w < WARMUP; w++) {
             cuda_op->func(inputs, outputs, (const operator_params_t*)&p, NULL);
-            cudaDeviceSynchronize();
+            g_cuda.stream_synchronize(0);
         }
         double t0 = now_ms();
         for (int r = 0; r < REPEAT; r++) {
             cuda_op->func(inputs, outputs, (const operator_params_t*)&p, NULL);
-            cudaDeviceSynchronize();
+            g_cuda.stream_synchronize(0);
         }
         double t1 = now_ms();
         printf("  matmul(%d,%d,%d)  GPU: %8.2f ms\n", M, N, K, (t1 - t0) / REPEAT);
     }
 
-    cudaFree(d_A); cudaFree(d_B); cudaFree(d_C);
+    g_cuda.device_free(d_A); g_cuda.device_free(d_B); g_cuda.device_free(d_C);
     free(h_A); free(h_B); free(h_C);
 }
 
@@ -92,11 +92,11 @@ static void bench_conv2d(int H, int W, int C, int K, int KH, int KW) {
     for (size_t i = 0; i < size_w;  i++) h_w[i]  = (float)((i % 3) - 1);
 
     float *d_in, *d_w, *d_out;
-    cudaMalloc(&d_in,  size_in  * sizeof(float));
-    cudaMalloc(&d_w,   size_w   * sizeof(float));
-    cudaMalloc(&d_out, size_out * sizeof(float));
-    cudaMemcpy(d_in, h_in, size_in * sizeof(float), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_w,  h_w,  size_w  * sizeof(float), cudaMemcpyHostToDevice);
+    d_in = (float*)g_cuda.device_alloc(size_in  * sizeof(float));
+    d_w = (float*)g_cuda.device_alloc(size_w   * sizeof(float));
+    d_out = (float*)g_cuda.device_alloc(size_out * sizeof(float));
+    g_cuda.memcpy_h2d(d_in, h_in, size_in * sizeof(float), 0);
+    g_cuda.memcpy_h2d(d_w, h_w, size_w  * sizeof(float), 0);
 
     conv_params_t cp;
     memset(&cp, 0, sizeof(cp));
@@ -127,19 +127,19 @@ static void bench_conv2d(int H, int W, int C, int K, int KH, int KW) {
         void*       outputs[] = {d_out};
         for (int w = 0; w < WARMUP; w++) {
             cuda_op->func(inputs, outputs, (const operator_params_t*)&cp, NULL);
-            cudaDeviceSynchronize();
+            g_cuda.stream_synchronize(0);
         }
         double t0 = now_ms();
         for (int r = 0; r < REPEAT; r++) {
             cuda_op->func(inputs, outputs, (const operator_params_t*)&cp, NULL);
-            cudaDeviceSynchronize();
+            g_cuda.stream_synchronize(0);
         }
         double t1 = now_ms();
         printf("  conv2d(%dx%d,c=%d,k=%d,%dx%d) GPU: %8.2f ms\n",
                H, W, C, K, KH, KW, (t1 - t0) / REPEAT);
     }
 
-    cudaFree(d_in); cudaFree(d_w); cudaFree(d_out);
+    g_cuda.device_free(d_in); g_cuda.device_free(d_w); g_cuda.device_free(d_out);
     free(h_in); free(h_w); free(h_out);
 }
 
@@ -152,9 +152,9 @@ static void bench_activation(const char* name, const char* op_cpu, const char* o
     for (int64_t i = 0; i < n; i++) h_in[i] = (float)((i % 5) - 2.0f);
 
     float *d_in, *d_out;
-    cudaMalloc(&d_in,  n * sizeof(float));
-    cudaMalloc(&d_out, n * sizeof(float));
-    cudaMemcpy(d_in, h_in, n * sizeof(float), cudaMemcpyHostToDevice);
+    d_in = (float*)g_cuda.device_alloc(n * sizeof(float));
+    d_out = (float*)g_cuda.device_alloc(n * sizeof(float));
+    g_cuda.memcpy_h2d(d_in, h_in, n * sizeof(float), 0);
 
     /* --- CPU --- */
     const operator_registry_t* cpu_op = operator_find(op_cpu);
@@ -177,18 +177,18 @@ static void bench_activation(const char* name, const char* op_cpu, const char* o
         void*       outputs[] = {d_out};
         for (int w = 0; w < WARMUP; w++) {
             cuda_op->func(inputs, outputs, NULL, NULL);
-            cudaDeviceSynchronize();
+            g_cuda.stream_synchronize(0);
         }
         double t0 = now_ms();
         for (int r = 0; r < REPEAT; r++) {
             cuda_op->func(inputs, outputs, NULL, NULL);
-            cudaDeviceSynchronize();
+            g_cuda.stream_synchronize(0);
         }
         double t1 = now_ms();
         printf("  %-10s (n=%-8lld) GPU: %8.2f ms\n", name, (long long)n, (t1 - t0) / REPEAT);
     }
 
-    cudaFree(d_in); cudaFree(d_out);
+    g_cuda.device_free(d_in); g_cuda.device_free(d_out);
     free(h_in); free(h_out);
 }
 
@@ -204,9 +204,9 @@ static void bench_pool(const char* name, const char* op_cpu, const char* op_cuda
     for (size_t i = 0; i < n_in; i++) h_in[i] = (float)(i % 10);
 
     float *d_in, *d_out;
-    cudaMalloc(&d_in,  n_in  * sizeof(float));
-    cudaMalloc(&d_out, n_out * sizeof(float));
-    cudaMemcpy(d_in, h_in, n_in * sizeof(float), cudaMemcpyHostToDevice);
+    d_in = (float*)g_cuda.device_alloc(n_in  * sizeof(float));
+    d_out = (float*)g_cuda.device_alloc(n_out * sizeof(float));
+    g_cuda.memcpy_h2d(d_in, h_in, n_in * sizeof(float), 0);
 
     pool_params_t pp = {.N=1,.C=1,.H=H,.W=W,.kernel_h=KH,.kernel_w=KW,.stride_h=stride,.stride_w=stride};
 
@@ -231,18 +231,18 @@ static void bench_pool(const char* name, const char* op_cpu, const char* op_cuda
         void*       outputs[] = {d_out};
         for (int w = 0; w < WARMUP; w++) {
             cuda_op->func(inputs, outputs, (const operator_params_t*)&pp, NULL);
-            cudaDeviceSynchronize();
+            g_cuda.stream_synchronize(0);
         }
         double t0 = now_ms();
         for (int r = 0; r < REPEAT; r++) {
             cuda_op->func(inputs, outputs, (const operator_params_t*)&pp, NULL);
-            cudaDeviceSynchronize();
+            g_cuda.stream_synchronize(0);
         }
         double t1 = now_ms();
         printf("  %-12s (%dx%d,%dx%d) GPU: %8.2f ms\n", name, H, W, KH, KW, (t1 - t0) / REPEAT);
     }
 
-    cudaFree(d_in); cudaFree(d_out);
+    g_cuda.device_free(d_in); g_cuda.device_free(d_out);
     free(h_in); free(h_out);
 }
 
@@ -299,17 +299,17 @@ int main(void) {
         for (int64_t i = 0; i < C; i++) { g[i] = 1; b[i] = 0; m[i] = 0; v[i] = 1; }
 
         float *dx,*dg,*db,*dm,*dv,*dd;
-        cudaMalloc(&dx, n * sizeof(float));
-        cudaMalloc(&dg, C * sizeof(float));
-        cudaMalloc(&db, C * sizeof(float));
-        cudaMalloc(&dm, C * sizeof(float));
-        cudaMalloc(&dv, C * sizeof(float));
-        cudaMalloc(&dd, n * sizeof(float));
-        cudaMemcpy(dx, x, n * sizeof(float), cudaMemcpyHostToDevice);
-        cudaMemcpy(dg, g, C * sizeof(float), cudaMemcpyHostToDevice);
-        cudaMemcpy(db, b, C * sizeof(float), cudaMemcpyHostToDevice);
-        cudaMemcpy(dm, m, C * sizeof(float), cudaMemcpyHostToDevice);
-        cudaMemcpy(dv, v, C * sizeof(float), cudaMemcpyHostToDevice);
+        dx = (float*)g_cuda.device_alloc(n * sizeof(float));
+        dg = (float*)g_cuda.device_alloc(C * sizeof(float));
+        db = (float*)g_cuda.device_alloc(C * sizeof(float));
+        dm = (float*)g_cuda.device_alloc(C * sizeof(float));
+        dv = (float*)g_cuda.device_alloc(C * sizeof(float));
+        dd = (float*)g_cuda.device_alloc(n * sizeof(float));
+        g_cuda.memcpy_h2d(dx, x, n * sizeof(float), 0);
+        g_cuda.memcpy_h2d(dg, g, C * sizeof(float), 0);
+        g_cuda.memcpy_h2d(db, b, C * sizeof(float), 0);
+        g_cuda.memcpy_h2d(dm, m, C * sizeof(float), 0);
+        g_cuda.memcpy_h2d(dv, v, C * sizeof(float), 0);
 
         batchnorm_params_t bp = {.C = C, .epsilon = 1e-5f};
 
@@ -334,21 +334,23 @@ int main(void) {
             void*       outputs[] = {dd};
             for (int w = 0; w < WARMUP; w++) {
                 cuda_op->func(inputs, outputs, (const operator_params_t*)&bp, NULL);
-                cudaDeviceSynchronize();
+                g_cuda.stream_synchronize(0);
             }
             double t0 = now_ms();
             for (int r = 0; r < REPEAT; r++) {
                 cuda_op->func(inputs, outputs, (const operator_params_t*)&bp, NULL);
-                cudaDeviceSynchronize();
+                g_cuda.stream_synchronize(0);
             }
             double t1 = now_ms();
             printf("  batchnorm   (c=%lld,n=%lld) GPU: %8.2f ms\n", (long long)C, (long long)n, (t1 - t0) / REPEAT);
         }
 
-        cudaFree(dx); cudaFree(dg); cudaFree(db); cudaFree(dm); cudaFree(dv); cudaFree(dd);
+        g_cuda.device_free(dx); g_cuda.device_free(dg); g_cuda.device_free(db); g_cuda.device_free(dm); g_cuda.device_free(dv); g_cuda.device_free(dd);
         free(x); free(g); free(b); free(m); free(v); free(o);
     }
 
     printf("\n=== Done ===\n");
+    cuda_platform_finalize();
+    platform_finalize();
     return 0;
 }

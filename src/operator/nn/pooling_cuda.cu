@@ -3,18 +3,20 @@
 #include "pooling_int.h"
 #include <float.h>
 
-/* Each block handles one (n, c, oh) — threads handle ow */
+#define POOL_BLOCK_X 256
+
+/* Each block handles one (n, c, oh) — threads tile across ow */
 __global__ void maxpool2d_f32_kernel(const float* input, float* output,
                                       int64_t C, int64_t H, int64_t W,
                                       int64_t OH, int64_t OW,
                                       int64_t KH, int64_t KW,
                                       int64_t stride_h, int64_t stride_w,
                                       int64_t pad_h, int64_t pad_w) {
-    int64_t n  = blockIdx.z;
-    int64_t c  = blockIdx.y;
-    int64_t oh = blockIdx.x;
-
-    int64_t ow = threadIdx.x;
+    int nc  = blockIdx.z;
+    int n   = nc / C;
+    int c   = nc % C;
+    int oh  = blockIdx.y;
+    int ow  = blockIdx.x * blockDim.x + threadIdx.x;
     if (ow >= OW) return;
 
     float max_val = -FLT_MAX;
@@ -37,11 +39,11 @@ __global__ void avgpool2d_f32_kernel(const float* input, float* output,
                                       int64_t KH, int64_t KW,
                                       int64_t stride_h, int64_t stride_w,
                                       int64_t pad_h, int64_t pad_w) {
-    int64_t n  = blockIdx.z;
-    int64_t c  = blockIdx.y;
-    int64_t oh = blockIdx.x;
-
-    int64_t ow = threadIdx.x;
+    int nc  = blockIdx.z;
+    int n   = nc / C;
+    int c   = nc % C;
+    int oh  = blockIdx.y;
+    int ow  = blockIdx.x * blockDim.x + threadIdx.x;
     if (ow >= OW) return;
 
     float sum = 0.0f;
@@ -64,8 +66,8 @@ static int launch_pool(cudaStream_t s, const void* kernel,
                         int64_t KH, int64_t KW, int64_t OH, int64_t OW,
                         int64_t stride_h, int64_t stride_w,
                         int64_t pad_h, int64_t pad_w) {
-    dim3 block(OW > 256 ? 256 : (OW > 0 ? (unsigned)OW : 1), 1, 1);
-    dim3 grid(OH, C, N);
+    dim3 block(POOL_BLOCK_X, 1, 1);
+    dim3 grid((unsigned int)((OW + POOL_BLOCK_X - 1) / POOL_BLOCK_X), (unsigned int)OH, (unsigned int)(N * C));
     CUDA_KERNEL_LAUNCH(kernel, grid, block, 0, s,
                        in, out, C, H, W, OH, OW, KH, KW,
                        stride_h, stride_w, pad_h, pad_w);
@@ -81,6 +83,7 @@ int maxpool2d_f32_cuda(const void* inputs[], void* outputs[],
     cudaStream_t s = stream ? (cudaStream_t)stream->cuda_stream : 0;
     int64_t OH = (p->H + 2 * p->pad_h - p->kernel_h) / p->stride_h + 1;
     int64_t OW = (p->W + 2 * p->pad_w - p->kernel_w) / p->stride_w + 1;
+    if (OH <= 0 || OW <= 0) return -1;
 
     return launch_pool(s, (const void*)maxpool2d_f32_kernel,
                        (const float*)inputs[0], (float*)outputs[0],
@@ -98,6 +101,7 @@ int avgpool2d_f32_cuda(const void* inputs[], void* outputs[],
     cudaStream_t s = stream ? (cudaStream_t)stream->cuda_stream : 0;
     int64_t OH = (p->H + 2 * p->pad_h - p->kernel_h) / p->stride_h + 1;
     int64_t OW = (p->W + 2 * p->pad_w - p->kernel_w) / p->stride_w + 1;
+    if (OH <= 0 || OW <= 0) return -1;
 
     return launch_pool(s, (const void*)avgpool2d_f32_kernel,
                        (const float*)inputs[0], (float*)outputs[0],

@@ -149,7 +149,9 @@ static int batchnorm_f32_train_launch(
  * ============================================================ */
 int batchnorm_f32_cuda(const void* inputs[], void* outputs[],
                        const operator_params_t* params, stream_t* stream) {
-    if (!inputs || !inputs[0] || !outputs || !outputs[0]) return -1;
+    if (!inputs || !inputs[0] || !inputs[1] || !inputs[2] ||
+        !inputs[3] || !inputs[4] || !inputs[5] || !outputs || !outputs[0])
+        return -1;
     if (!params) return -1;
 
     const batchnorm_params_t* p = (const batchnorm_params_t*)params;

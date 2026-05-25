@@ -39,6 +39,8 @@ venv/
 
 # Test artifacts (generated during test runs)
 test_*.onnx
+mnist_data/
+*.onnx.data
 
 # Claude internal
 .claude/

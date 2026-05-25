@@ -19,6 +19,10 @@ typedef enum {
     OP_MAXPOOL2D,
     OP_AVGPOOL2D,
     OP_BATCHNORM,
+    OP_ADD,
+    OP_RESHAPE,
+    OP_GLOBALAVGPOOL,
+    OP_SOFTMAX,
     OP_INPUT,
     OP_OUTPUT
 } op_type_t;

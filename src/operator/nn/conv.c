@@ -6,9 +6,7 @@
 #include <stdlib.h>
 #include <math.h>
 
-/* Direct matmul call (same translation unit set, avoids registry lookup) */
-extern int matmul_f32(const void* inputs[], void* outputs[],
-                      const operator_params_t* params, stream_t* stream);
+/* matmul dispatched via operator registry */
 
 /* ============================================================
  * Naive 6-loop reference convolution
@@ -114,7 +112,8 @@ static int conv2d_f32_im2col(const float* input, const float* weight, float* out
         matmul_params_t mp = {.M = K, .N = col_cols, .K = col_rows};
         const void* mat_inputs[]  = {weight, col_buf};
         void*       mat_outputs[] = {out_n};
-        matmul_f32(mat_inputs, mat_outputs, (const operator_params_t*)&mp, NULL);
+        const operator_registry_t* mm = operator_find("matmul_f32");
+        if (mm) mm->func(mat_inputs, mat_outputs, (const operator_params_t*)&mp, NULL);
     }
 
     free(col_buf);

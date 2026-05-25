@@ -23,10 +23,13 @@ typedef struct {
 } pb_field_t;
 
 /* A message is a dynamic array of parsed fields */
+#define PB_MAX_FIELD_NUM 64  /* field numbers 0..63 are indexed */
+
 typedef struct {
     pb_field_t* fields;
     int         count;
     int         capacity;
+    int         first_by_fn[PB_MAX_FIELD_NUM];  /* field# → first index, -1 = absent */
 } pb_message_t;
 
 /* ---- Lifecycle ---- */
