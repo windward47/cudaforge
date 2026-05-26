@@ -242,7 +242,7 @@ CudaForge 内置了一个**手写的 protobuf wire-format 解析器**（约 200 
 CudaForge 的初衷是学习推理引擎的底层原理。通读全部代码只需一个下午。同时适用于无法承载 100+ MB 依赖的嵌入式场景。
 
 **Q: 能跑 ResNet / YOLO / BERT 吗？**
-当前已验证通过 MNIST CNN 分类模型的端到端推理（Conv×2 + ReLU + MaxPool + Reshape + Gemm + Softmax）。ResNet 等现代 CNN 具备基础算子支撑，但尚未实测。大型模型（YOLO/BERT）尚不支持。
+已通过两层验证：(1) MNIST CNN（Conv×2 + ReLU + MaxPool + Reshape + Gemm + Softmax）；(2) **ResNet-18**（1×3×224×224 → 1×1000，50 节点，CUDA 推理与 PyTorch 对比 max_diff = 5.25e-06，Top-1 一致，compute-sanitizer 零错误）。大型模型（YOLO/BERT）尚不支持。
 
 **Q: 支持 FP16 或 INT8 推理吗？**
 当前仅支持 FP32。混合精度和量化推理在后续计划中。

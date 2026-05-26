@@ -241,7 +241,7 @@ CudaForge includes a **hand-written protobuf wire-format parser** (~200 lines of
 CudaForge is for learning how inference engines work under the hood. Reading its entire codebase takes an afternoon. It's also useful for embedded scenarios where you can't afford 100+ MB of dependencies.
 
 **Q: Can I run ResNet / YOLO / BERT?**
-End-to-end MNIST CNN classification (Conv×2 + ReLU + MaxPool + Reshape + Gemm + Softmax) is verified. ResNet-class models have the necessary operator support but haven't been tested yet. Large models (YOLO/BERT) are beyond current scope.
+Two tiers verified: (1) MNIST CNN (Conv×2 + ReLU + MaxPool + Reshape + Gemm + Softmax); (2) **ResNet-18** (1×3×224×224 → 1×1000, 50 nodes, CUDA vs PyTorch max_diff = 5.25e-06, Top-1 matches, compute-sanitizer 0 errors). Large models (YOLO/BERT) are beyond current scope.
 
 **Q: Does it support FP16 or INT8?**
 Currently FP32 only. Mixed-precision and quantization are planned for future releases.
