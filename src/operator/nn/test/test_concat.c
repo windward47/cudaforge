@@ -29,8 +29,8 @@ void test_concat_two_inputs(void) {
 
     concat_params_t p;
     memset(&p, 0, sizeof(p));
-    p.axis = 1; p.num_inputs = 2;
-    p.H = H; p.W = W;
+    p.ndim = 4; p.axis = 1; p.num_inputs = 2;
+    p.outer = N; p.inner = H * W;
     p.C_total = C0 + C1;
     p.C_per_input[0] = C0; p.C_per_input[1] = C1;
     p.C_offset[0] = 0; p.C_offset[1] = C0;

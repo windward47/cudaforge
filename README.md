@@ -77,7 +77,7 @@ cmake --build build -j$(nproc)
 # 快速验证 — 打印平台信息
 ./build/Release/cudaforge.exe
 
-# 完整测试套件（14 个测试程序）
+# 完整测试套件（26 个测试程序）
 ctest --test-dir build -C Release -j$(nproc)
 
 # GPU 内存安全检查
@@ -247,7 +247,7 @@ CudaForge 内置了一个**手写的 protobuf wire-format 解析器**（约 200 
 CudaForge 的初衷是学习推理引擎的底层原理。通读全部代码只需一个下午。同时适用于无法承载 100+ MB 依赖的嵌入式场景。
 
 **Q: 能跑 ResNet / YOLO / BERT 吗？**
-已通过两层验证：(1) MNIST CNN（Conv×2 + ReLU + MaxPool + Reshape + Gemm + Softmax）；(2) **ResNet-18**（1×3×224×224 → 1×1000，50 节点，CUDA 推理与 PyTorch 对比 max_diff = 5.25e-06，Top-1 一致，compute-sanitizer 零错误）。大型模型（YOLO/BERT）尚不支持。
+已通过三层验证：(1) MNIST CNN（Conv×2 + ReLU + MaxPool + Reshape + Gemm + Softmax）；(2) **ResNet-18**（1×3×224×224 → 1×1000，50 节点，CUDA 推理与 PyTorch 对比 max_diff = 5.25e-06，Top-1 一致）；(3) **YOLOv8n**（1×3×640×640 → 1×84×8400，234 节点，CPU/CUDA 推理 max_diff < 1e-3，compute-sanitizer 零错误）。BERT 等 Transformer 模型尚不支持。
 
 **Q: 支持 FP16 或 INT8 推理吗？**
 当前仅支持 FP32。混合精度和量化推理在后续计划中。

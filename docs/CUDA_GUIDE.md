@@ -194,7 +194,9 @@ if (fuse_activation == 1) {
 
 **关键注意**：bias 必须在激活函数**之前**应用。错误顺序 `ReLU(conv(x)) + bias` 与正确顺序 `ReLU(conv(x) + bias)` 的语义完全不同。当 bias ≠ 0 时，错误顺序产生静默的数值错误。
 
-**Application 层配合**: `graph_execute` 的 fusion pre-pass 检测拓扑序相邻的 Conv→ReLU 模式，设置 `fuse_activation` 标记并跳过被融合的激活节点。输出张量通过 `effective_output_tids` 重定向到激活节点的输出，保证下游消费者拿到后激活结果。
+**多消费者安全检查**：融合前必须验证 Conv/MatMul 输出张量仅被激活节点消费。若存在额外消费者（如 SiLU 模式 `Conv→Sigmoid→Mul` 中 Conv 输出同时喂给 Sigmoid 和 Mul），融合会导致未写入的陈旧数据被下游节点读取。`graph_execute` 的 fusion pre-pass 扫描所有节点计数消费者数量，`consumers > 1` 时跳过融合。
+
+**Application 层配合**: `graph_execute` 的 fusion pre-pass 检测拓扑序相邻的 Conv→ReLU/Sigmoid/GELU 模式，设置 `fuse_activation` 标记并跳过被融合的激活节点。输出张量通过 `effective_output_tids` 重定向到激活节点的输出，保证下游消费者拿到后激活结果。
 
 ---
 

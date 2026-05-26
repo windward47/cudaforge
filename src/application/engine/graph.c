@@ -227,6 +227,10 @@ static const char* op_name(op_type_t type) {
         case OP_CONCAT:     return "concat_f32";
         case OP_RESIZE:     return "resize_f32";
         case OP_TRANSPOSE:  return "transpose_f32";
+        case OP_SUB:        return "sub_f32";
+        case OP_DIV:        return "div_f32";
+        case OP_SLICE:      return "slice_f32";
+        case OP_SPLIT:      return "split_f32";
         default:            return NULL;
     }
 }
@@ -281,6 +285,19 @@ int graph_execute(inference_graph_t* g, tensor_t* inputs[],
                     && (next_n->type == OP_RELU
                         || next_n->type == OP_SIGMOID
                         || next_n->type == OP_GELU)) {
+
+                    /* Do not fuse if the compute node's output has other
+                     * consumers (e.g. SiLU = Conv→Sigmoid→Mul: the Conv
+                     * output feeds both Sigmoid and Mul). */
+                    int out_tid = n->output_tensors[0];
+                    int consumers = 0;
+                    for (int j = 0; j < g->num_nodes; j++) {
+                        graph_node_t* other = &g->nodes[j];
+                        for (int k = 0; k < other->num_inputs && consumers <= 1; k++) {
+                            if (other->input_tensors[k] == out_tid) consumers++;
+                        }
+                    }
+                    if (consumers > 1) continue;
 
                     if (n->type == OP_CONV2D && n->params
                         && n->params_size >= sizeof(conv_params_t)) {

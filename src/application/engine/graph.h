@@ -28,6 +28,10 @@ typedef enum {
     OP_CONCAT,
     OP_RESIZE,
     OP_TRANSPOSE,
+    OP_SUB,
+    OP_DIV,
+    OP_SLICE,
+    OP_SPLIT,
     OP_INPUT,
     OP_OUTPUT
 } op_type_t;

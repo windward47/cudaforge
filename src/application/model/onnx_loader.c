@@ -13,6 +13,10 @@
 #include "concat_int.h"
 #include "resize_int.h"
 #include "transpose_int.h"
+#include "sub_int.h"
+#include "div_int.h"
+#include "slice_int.h"
+#include "split_int.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -59,9 +63,9 @@ enum {
 #define ONNX_DTYPE_FLOAT  1
 #define ONNX_DTYPE_INT64  7
 #define MAX_TENSOR_NAME   128
-#define MAX_NODES         128
-#define MAX_TENSOR_INFOS  256
-#define TENSOR_HT_SIZE    509  /* prime > 2 * MAX_TENSOR_INFOS for open addressing */
+#define MAX_NODES         512
+#define MAX_TENSOR_INFOS  1024
+#define TENSOR_HT_SIZE    2039  /* prime > 2 * MAX_TENSOR_INFOS for open addressing */
 
 /* ============================================================
  * Internal: tensor info during parsing
@@ -481,6 +485,10 @@ static op_type_t map_onnx_op(const char* onnx_op) {
     if (strcmp(onnx_op, "Concat") == 0) return OP_CONCAT;
     if (strcmp(onnx_op, "Resize") == 0) return OP_RESIZE;
     if (strcmp(onnx_op, "Transpose") == 0) return OP_TRANSPOSE;
+    if (strcmp(onnx_op, "Sub")   == 0) return OP_SUB;
+    if (strcmp(onnx_op, "Div")   == 0) return OP_DIV;
+    if (strcmp(onnx_op, "Slice") == 0) return OP_SLICE;
+    if (strcmp(onnx_op, "Split") == 0) return OP_SPLIT;
     return (op_type_t)(-1);
 }
 
@@ -497,7 +505,8 @@ static int infer_output_shape(onnx_node_info_t* node, onnx_parsed_model_t* model
 
     /* Elementwise ops: output = input shape */
     if (ot == OP_RELU || ot == OP_SIGMOID || ot == OP_GELU || ot == OP_SILU
-        || ot == OP_BATCHNORM || ot == OP_ADD || ot == OP_MUL || ot == OP_SOFTMAX) {
+        || ot == OP_BATCHNORM || ot == OP_ADD || ot == OP_MUL || ot == OP_SOFTMAX
+        || ot == OP_SUB || ot == OP_DIV) {
         for (int oi = 0; oi < node->num_outputs; oi++) {
             onnx_tensor_info_t* out = find_tensor(model, node->output_names[oi]);
             if (!out) out = add_tensor(model, node->output_names[oi]);
@@ -657,8 +666,9 @@ static int infer_output_shape(onnx_node_info_t* node, onnx_parsed_model_t* model
     /* Concat: concatenate along axis */
     if (ot == OP_CONCAT) {
         int64_t axis = node_attr_int(node, "axis", 1);
-        int64_t out_shape[8];
         int ndim_out = in0->ndim;
+        if (axis < 0) axis += ndim_out;
+        int64_t out_shape[8];
         for (int d = 0; d < ndim_out; d++) out_shape[d] = in0->shape[d];
         out_shape[axis] = 0;
         for (int ii = 0; ii < node->num_inputs && ii < 8; ii++) {
@@ -709,6 +719,146 @@ static int infer_output_shape(onnx_node_info_t* node, onnx_parsed_model_t* model
         return 0;
     }
 
+    /* Slice: compute output shape from starts/ends/steps initializers */
+    if (ot == OP_SLICE) {
+        int ndim = in0->ndim;
+        if (ndim < 1 || ndim > 8) return 0;
+
+        /* Initialize: full range */
+        int64_t starts[8] = {0};
+        int64_t ends[8] = {0};
+        int64_t steps[8] = {1,1,1,1,1,1,1,1};
+        int     slice_axes[8];
+        int     num_axes = 0;
+        for (int d = 0; d < ndim; d++) ends[d] = in0->shape[d];
+
+        /* Read starts from input[1] initializer (length matches axes count, not ndim) */
+        onnx_tensor_info_t* st = find_tensor(model, node->input_names[1]);
+        if (st && st->raw_data && st->raw_data_size >= sizeof(int64_t)) {
+            int64_t* sv = (int64_t*)st->raw_data;
+            int nsv = (int)(st->raw_data_size / sizeof(int64_t));
+            for (int d = 0; d < nsv && d < 8; d++) starts[d] = sv[d];
+        }
+
+        /* Read ends from input[2] initializer */
+        onnx_tensor_info_t* en = find_tensor(model, node->input_names[2]);
+        if (en && en->raw_data && en->raw_data_size >= sizeof(int64_t)) {
+            int64_t* ev = (int64_t*)en->raw_data;
+            int nev = (int)(en->raw_data_size / sizeof(int64_t));
+            for (int d = 0; d < nev && d < 8; d++) ends[d] = ev[d];
+        }
+
+        /* Read axes from input[3] initializer (optional) */
+        num_axes = 0;
+        if (node->num_inputs >= 4 && node->input_names[3][0] != '\0') {
+            onnx_tensor_info_t* ax = find_tensor(model, node->input_names[3]);
+            if (ax && ax->raw_data) {
+                int64_t* av = (int64_t*)ax->raw_data;
+                int n = (int)(ax->raw_data_size / sizeof(int64_t));
+                for (int i = 0; i < n && i < 8; i++) {
+                    slice_axes[i] = (int)av[i];
+                }
+                num_axes = n;
+            }
+        }
+
+        /* Read steps from input[4] initializer (optional) */
+        if (node->num_inputs >= 5 && node->input_names[4][0] != '\0') {
+            onnx_tensor_info_t* sp = find_tensor(model, node->input_names[4]);
+            if (sp && sp->raw_data && sp->raw_data_size >= sizeof(int64_t)) {
+                int64_t* sv2 = (int64_t*)sp->raw_data;
+                int nsv2 = (int)(sp->raw_data_size / sizeof(int64_t));
+                for (int d = 0; d < nsv2 && d < 8; d++) steps[d] = sv2[d];
+            }
+        }
+
+        /* If axes specified, apply starts/ends/steps only to those axes */
+        if (num_axes > 0) {
+            int64_t full_starts[8] = {0};
+            int64_t full_ends[8];
+            int64_t full_steps[8] = {1,1,1,1,1,1,1,1};
+            for (int d = 0; d < ndim; d++) full_ends[d] = in0->shape[d];
+            for (int i = 0; i < num_axes && i < 8; i++) {
+                int ax = slice_axes[i];
+                if (ax >= 0 && ax < ndim) {
+                    full_starts[ax] = starts[i];
+                    full_ends[ax] = ends[i];
+                    full_steps[ax] = steps[i];
+                }
+            }
+            for (int d = 0; d < ndim; d++) {
+                starts[d] = full_starts[d];
+                ends[d] = full_ends[d];
+                steps[d] = full_steps[d];
+            }
+        }
+
+        /* Clamp to valid range and compute output shape */
+        int64_t out_shape[8];
+        int ndim_out = ndim;
+        for (int d = 0; d < ndim; d++) {
+            if (starts[d] < 0) starts[d] += in0->shape[d];
+            if (ends[d] < 0) ends[d] += in0->shape[d];
+            if (starts[d] < 0) starts[d] = 0;
+            if (ends[d] > in0->shape[d]) ends[d] = in0->shape[d];
+            out_shape[d] = (ends[d] - starts[d] + steps[d] - 1) / steps[d];
+            if (out_shape[d] < 0) out_shape[d] = 0;
+        }
+
+        for (int oi = 0; oi < node->num_outputs; oi++) {
+            onnx_tensor_info_t* out = find_tensor(model, node->output_names[oi]);
+            if (!out) out = add_tensor(model, node->output_names[oi]);
+            if (out) {
+                out->ndim = ndim_out;
+                for (int d = 0; d < ndim_out; d++) out->shape[d] = out_shape[d];
+            }
+        }
+        return 0;
+    }
+
+    /* Split: compute per-output shapes */
+    if (ot == OP_SPLIT) {
+        int64_t axis = node_attr_int(node, "axis", 0);
+        int ndim = in0->ndim;
+        if (axis < 0) axis = ndim + axis;
+
+        /* Read split sizes from input[1] initializer (optional) */
+        int64_t splits[8];
+        int num_splits = 0;
+        if (node->num_inputs >= 2 && node->input_names[1][0] != '\0') {
+            onnx_tensor_info_t* sp = find_tensor(model, node->input_names[1]);
+            if (sp && sp->raw_data) {
+                int64_t* sv = (int64_t*)sp->raw_data;
+                int n = (int)(sp->raw_data_size / sizeof(int64_t));
+                for (int i = 0; i < n && i < 8; i++) {
+                    splits[i] = sv[i];
+                }
+                num_splits = n;
+            }
+        }
+
+        /* If no explicit split sizes, divide equally */
+        if (num_splits == 0) {
+            num_splits = node->num_outputs;
+            int64_t eq = in0->shape[axis] / num_splits;
+            for (int i = 0; i < num_splits; i++) splits[i] = eq;
+        }
+
+        for (int oi = 0; oi < node->num_outputs && oi < num_splits; oi++) {
+            int64_t out_shape[8];
+            for (int d = 0; d < ndim; d++) out_shape[d] = in0->shape[d];
+            out_shape[axis] = splits[oi];
+
+            onnx_tensor_info_t* out = find_tensor(model, node->output_names[oi]);
+            if (!out) out = add_tensor(model, node->output_names[oi]);
+            if (out) {
+                out->ndim = ndim;
+                for (int d = 0; d < ndim; d++) out->shape[d] = out_shape[d];
+            }
+        }
+        return 0;
+    }
+
     return 0;
 }
 
@@ -718,6 +868,7 @@ static int infer_output_shape(onnx_node_info_t* node, onnx_parsed_model_t* model
 static inference_graph_t* build_graph_from_onnx(onnx_parsed_model_t* pm) {
     inference_graph_t* g = graph_create();
     if (!g) return NULL;
+
 
     /* Create OP_INPUT nodes for graph inputs */
     int input_node_ids[16];
@@ -753,12 +904,15 @@ static inference_graph_t* build_graph_from_onnx(onnx_parsed_model_t* pm) {
         for (int oi = 0; oi < node->num_outputs; oi++) {
             onnx_tensor_info_t* t = find_tensor(pm, node->output_names[oi]);
             if (!t) t = add_tensor(pm, node->output_names[oi]);
+            if (!t) continue;
             if (t->tensor_id < 0) {
                 tensor_t* tt = tensor_create(DATA_TYPE_F32, t->ndim, t->shape);
+                if (!tt) continue;
                 t->tensor_id = graph_add_tensor(g, tt);
             }
         }
     }
+
 
     /* Create OP_OUTPUT nodes for graph outputs */
     for (int i = 0; i < pm->num_graph_outputs; i++) {
@@ -770,6 +924,7 @@ static inference_graph_t* build_graph_from_onnx(onnx_parsed_model_t* pm) {
                                   0, NULL, NULL, 0);
         graph_set_output(g, nid);
     }
+
 
     /* Create operator nodes */
     for (int ni = 0; ni < pm->num_nodes; ni++) {
@@ -786,13 +941,39 @@ static inference_graph_t* build_graph_from_onnx(onnx_parsed_model_t* pm) {
 
         for (int ii = 0; ii < node->num_inputs; ii++) {
             onnx_tensor_info_t* t = find_tensor(pm, node->input_names[ii]);
-            if (t && t->is_initializer && t->raw_data) {
+
+            /* Slice and Split have int64 initializer inputs (starts/ends/axes/steps
+               or split sizes). These are already extracted into params. Skip them
+               here to avoid creating incorrect F32 tensors from int64 data. */
+            if ((ot == OP_SLICE || ot == OP_SPLIT) && t && t->is_initializer)
+                continue;
+
+            /* For non-commutative ops (Sub, Div), an initializer at position 0
+               must keep its position in op_inputs rather than being pushed to the
+               end. Otherwise, e.g., ONNX Sub(constant, data) becomes data-constant
+               instead of constant-data. */
+            int as_weight = (t && t->is_initializer && t->raw_data
+                             && !((ot == OP_SUB || ot == OP_DIV) && ii == 0));
+
+            if (as_weight) {
                 tensor_t* wt = tensor_create(DATA_TYPE_F32, t->ndim, t->shape);
                 if (wt && wt->data && t->raw_data_size <= (size_t)wt->numel * sizeof(float)) {
                     memcpy(wt->data, t->raw_data, t->raw_data_size);
                 }
                 weights[num_weights++] = wt;
             } else {
+                /* Ensure tensor exists in graph for data inputs */
+                if (t && t->tensor_id < 0) {
+                    tensor_t* tt = tensor_create(DATA_TYPE_F32, t->ndim, t->shape);
+                    if (tt) {
+                        /* Copy initializer data into graph tensor */
+                        if (t->is_initializer && t->raw_data
+                            && t->raw_data_size <= (size_t)tt->numel * sizeof(float)) {
+                            memcpy(tt->data, t->raw_data, t->raw_data_size);
+                        }
+                        t->tensor_id = graph_add_tensor(g, tt);
+                    }
+                }
                 in_tids[num_data_in] = (t && t->tensor_id >= 0) ? t->tensor_id : -1;
                 num_data_in++;
             }
@@ -934,12 +1115,17 @@ static inference_graph_t* build_graph_from_onnx(onnx_parsed_model_t* pm) {
         } else if (ot == OP_CONCAT) {
             concat_params_t cp;
             memset(&cp, 0, sizeof(cp));
-            cp.axis = (int)node_attr_int(node, "axis", 1);
             cp.num_inputs = node->num_inputs;
             onnx_tensor_info_t* in0c = find_tensor(pm, node->input_names[0]);
-            if (in0c && in0c->ndim >= 4) {
-                cp.H = in0c->shape[2]; cp.W = in0c->shape[3];
-            }
+            int ndim = in0c ? in0c->ndim : 0;
+            cp.ndim = ndim;
+            cp.axis = (int)node_attr_int(node, "axis", 1);
+            if (cp.axis < 0) cp.axis += ndim;
+            /* Compute outer (product of dims before axis) and inner (product after) */
+            cp.outer = 1;
+            for (int d = 0; d < cp.axis && d < ndim; d++) cp.outer *= in0c->shape[d];
+            cp.inner = 1;
+            for (int d = cp.axis + 1; d < ndim; d++) cp.inner *= in0c->shape[d];
             cp.C_total = 0;
             for (int ii = 0; ii < node->num_inputs && ii < 8; ii++) {
                 onnx_tensor_info_t* in_i = find_tensor(pm, node->input_names[ii]);
@@ -998,18 +1184,153 @@ static inference_graph_t* build_graph_from_onnx(onnx_parsed_model_t* pm) {
                     tp.out_shape[d] = out_tt->shape[d];
             }
             params = &tp; params_size = sizeof(tp);
+        } else if (ot == OP_SUB) {
+            sub_params_t sp;
+            memset(&sp, 0, sizeof(sp));
+            onnx_tensor_info_t* in_a = find_tensor(pm, node->input_names[0]);
+            onnx_tensor_info_t* in_b = find_tensor(pm, node->input_names[1]);
+            if (in_a) { sp.numel = 1; for (int d = 0; d < in_a->ndim; d++) sp.numel *= in_a->shape[d]; }
+            if (in_b) { sp.B_numel = 1; for (int d = 0; d < in_b->ndim; d++) sp.B_numel *= in_b->shape[d]; }
+            params = &sp; params_size = sizeof(sp);
+        } else if (ot == OP_DIV) {
+            div_params_t dp;
+            memset(&dp, 0, sizeof(dp));
+            onnx_tensor_info_t* in_a = find_tensor(pm, node->input_names[0]);
+            onnx_tensor_info_t* in_b = find_tensor(pm, node->input_names[1]);
+            if (in_a) { dp.numel = 1; for (int d = 0; d < in_a->ndim; d++) dp.numel *= in_a->shape[d]; }
+            if (in_b) { dp.B_numel = 1; for (int d = 0; d < in_b->ndim; d++) dp.B_numel *= in_b->shape[d]; }
+            params = &dp; params_size = sizeof(dp);
+        } else if (ot == OP_SLICE) {
+            slice_params_t slp;
+            memset(&slp, 0, sizeof(slp));
+            onnx_tensor_info_t* in_sl = find_tensor(pm, node->input_names[0]);
+            int ndim = in_sl ? in_sl->ndim : 0;
+            slp.ndim = ndim;
+            slp.in_numel = 1;
+            int64_t ends[8];
+            for (int d = 0; d < ndim; d++) {
+                slp.in_shape[d] = in_sl->shape[d];
+                slp.in_numel *= in_sl->shape[d];
+                ends[d] = in_sl->shape[d];
+                slp.steps[d] = 1;
+                slp.starts[d] = 0;
+            }
+            /* Compute input strides */
+            int64_t stride = 1;
+            for (int d = ndim - 1; d >= 0; d--) {
+                slp.in_strides[d] = stride;
+                stride *= slp.in_shape[d];
+            }
+            /* Read starts from input[1] initializer */
+            onnx_tensor_info_t* sti = find_tensor(pm, node->input_names[1]);
+            if (sti && sti->raw_data) {
+                int64_t* sv = (int64_t*)sti->raw_data;
+                for (int d = 0; d < ndim && d < (int)(sti->raw_data_size / sizeof(int64_t)); d++)
+                    slp.starts[d] = sv[d];
+            }
+            /* Read ends from input[2] initializer */
+            onnx_tensor_info_t* eni = find_tensor(pm, node->input_names[2]);
+            if (eni && eni->raw_data) {
+                int64_t* ev = (int64_t*)eni->raw_data;
+                for (int d = 0; d < ndim && d < (int)(eni->raw_data_size / sizeof(int64_t)); d++)
+                    ends[d] = ev[d];
+            }
+            /* Read axes from input[3] initializer (optional) */
+            int slice_axes[8] = {0};
+            int num_axes = 0;
+            if (node->num_inputs >= 4 && node->input_names[3][0] != '\0') {
+                onnx_tensor_info_t* axi = find_tensor(pm, node->input_names[3]);
+                if (axi && axi->raw_data) {
+                    int64_t* av = (int64_t*)axi->raw_data;
+                    int n = (int)(axi->raw_data_size / sizeof(int64_t));
+                    for (int i = 0; i < n && i < 8; i++) slice_axes[i] = (int)av[i];
+                    num_axes = n;
+                }
+            }
+            /* Read steps from input[4] initializer (optional) */
+            if (node->num_inputs >= 5 && node->input_names[4][0] != '\0') {
+                onnx_tensor_info_t* stpi = find_tensor(pm, node->input_names[4]);
+                if (stpi && stpi->raw_data) {
+                    int64_t* sv2 = (int64_t*)stpi->raw_data;
+                    for (int d = 0; d < ndim && d < (int)(stpi->raw_data_size / sizeof(int64_t)); d++)
+                        slp.steps[d] = sv2[d];
+                }
+            }
+            /* If axes specified, remap starts/ends/steps to full-dim arrays */
+            if (num_axes > 0) {
+                int64_t full_starts[8] = {0};
+                int64_t full_ends[8];
+                int64_t full_steps[8] = {1,1,1,1,1,1,1,1};
+                for (int d = 0; d < ndim; d++) full_ends[d] = slp.in_shape[d];
+                for (int i = 0; i < num_axes && i < 8; i++) {
+                    int ax = slice_axes[i];
+                    if (ax >= 0 && ax < ndim) {
+                        full_starts[ax] = slp.starts[i];
+                        full_ends[ax] = ends[i];
+                        full_steps[ax] = slp.steps[i];
+                    }
+                }
+                for (int d = 0; d < ndim; d++) {
+                    slp.starts[d] = full_starts[d];
+                    ends[d] = full_ends[d];
+                    slp.steps[d] = full_steps[d];
+                }
+            }
+            /* Clamp and compute output shape + numel */
+            for (int d = 0; d < ndim; d++) {
+                if (slp.starts[d] < 0) slp.starts[d] += slp.in_shape[d];
+                if (ends[d] < 0) ends[d] += slp.in_shape[d];
+                if (slp.starts[d] < 0) slp.starts[d] = 0;
+                if (ends[d] > slp.in_shape[d]) ends[d] = slp.in_shape[d];
+                slp.out_shape[d] = (ends[d] - slp.starts[d] + slp.steps[d] - 1) / slp.steps[d];
+                if (slp.out_shape[d] < 0) slp.out_shape[d] = 0;
+            }
+            slp.numel = 1;
+            for (int d = 0; d < ndim; d++) slp.numel *= slp.out_shape[d];
+            params = &slp; params_size = sizeof(slp);
+        } else if (ot == OP_SPLIT) {
+            split_params_t spp;
+            memset(&spp, 0, sizeof(spp));
+            onnx_tensor_info_t* in_sp = find_tensor(pm, node->input_names[0]);
+            spp.ndim = in_sp ? in_sp->ndim : 0;
+            for (int d = 0; d < spp.ndim && d < 8; d++)
+                spp.in_shape[d] = in_sp->shape[d];
+            int64_t axis = node_attr_int(node, "axis", 0);
+            if (axis < 0) axis = spp.ndim + axis;
+            spp.axis = (int)axis;
+            spp.num_outputs = node->num_outputs;
+            /* Read split sizes from input[1] initializer */
+            if (node->num_inputs >= 2 && node->input_names[1][0] != '\0') {
+                onnx_tensor_info_t* spi = find_tensor(pm, node->input_names[1]);
+                if (spi && spi->raw_data) {
+                    int64_t* sv = (int64_t*)spi->raw_data;
+                    int n = (int)(spi->raw_data_size / sizeof(int64_t));
+                    for (int i = 0; i < n && i < 8; i++) spp.splits[i] = sv[i];
+                }
+            }
+            /* If no split sizes, divide equally */
+            if (spp.splits[0] == 0) {
+                int64_t eq = spp.in_shape[axis] / spp.num_outputs;
+                for (int i = 0; i < spp.num_outputs; i++) spp.splits[i] = eq;
+            }
+            /* Compute offsets and output numels */
+            int64_t outer = 1;
+            for (int d = 0; d < spp.axis; d++) outer *= spp.in_shape[d];
+            int64_t inner = 1;
+            for (int d = spp.axis + 1; d < spp.ndim; d++) inner *= spp.in_shape[d];
+            int64_t cumulative = 0;
+            for (int i = 0; i < spp.num_outputs; i++) {
+                spp.offsets[i] = cumulative;
+                spp.out_numel[i] = outer * spp.splits[i] * inner;
+                cumulative += spp.splits[i] * inner;
+            }
+            params = &spp; params_size = sizeof(spp);
         }
 
         /* Add the node. Data inputs exclude weight initializers; weights are passed separately. */
-        int nid = graph_add_node(g, ot, num_data_in, in_tids, num_out, out_tids,
-                                  num_weights, weights, params, params_size);
+        graph_add_node(g, ot, num_data_in, in_tids, num_out, out_tids,
+                       num_weights, weights, params, params_size);
 
-        /* For activations with no params, mark the node correctly */
-        if (ot == OP_RELU || ot == OP_SIGMOID || ot == OP_GELU || ot == OP_SILU) {
-            /* Only input[0] is a data input; num_in should be 1 */
-            /* The graph_add_node already has correct num_in */
-            (void)nid;
-        }
     }
 
     /* Build topological order */

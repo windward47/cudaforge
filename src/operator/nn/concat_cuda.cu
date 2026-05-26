@@ -4,28 +4,27 @@
 
 __global__ void concat_f32_kernel(const float* const* inputs, float* out,
                                    int64_t total_numel,
-                                   int64_t H, int64_t W, int64_t C_total,
+                                   int64_t inner, int64_t C_total,
                                    int num_inputs,
                                    const int64_t* C_per_input,
                                    const int64_t* C_offset) {
     int64_t out_idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (out_idx >= total_numel) return;
 
-    int64_t HW = H * W;
     int64_t tmp = out_idx;
-    int64_t w = tmp % W; tmp /= W;
-    int64_t h = tmp % H; tmp /= H;
+    int64_t inner_pos = tmp % inner;
+    tmp /= inner;
     int64_t c = tmp % C_total;
-    int64_t n = tmp / C_total;
+    int64_t outer = tmp / C_total;
 
-    /* Find which input this channel belongs to */
+    /* Find which input this axis position belongs to */
     int ii = 0;
     for (; ii < num_inputs; ii++) {
         if (c < C_offset[ii] + C_per_input[ii]) break;
     }
     int64_t c_local = c - C_offset[ii];
     int64_t Ci = C_per_input[ii];
-    int64_t in_idx = ((n * Ci + c_local) * H + h) * W + w;
+    int64_t in_idx = outer * Ci * inner + c_local * inner + inner_pos;
 
     out[out_idx] = inputs[ii][in_idx];
 }
@@ -57,14 +56,13 @@ int concat_f32_cuda(const void* inputs[], void* outputs[],
         (int64_t*)g_cuda.device_alloc((size_t)p->num_inputs * sizeof(int64_t));
     g_cuda.memcpy_h2d(d_C_offset, p->C_offset, (size_t)p->num_inputs * sizeof(int64_t), s);
 
-    int64_t HW = p->H * p->W;
     int64_t total = p->total_numel;
     dim3 block(256, 1, 1);
     dim3 grid((unsigned int)((total + 255) / 256), 1, 1);
 
     CUDA_KERNEL_LAUNCH(concat_f32_kernel, grid, block, 0, s,
                        d_input_ptrs, out, total,
-                       p->H, p->W, p->C_total, p->num_inputs,
+                       p->inner, p->C_total, p->num_inputs,
                        d_C_per_input, d_C_offset);
 
     g_cuda.stream_synchronize(s);

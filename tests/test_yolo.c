@@ -57,13 +57,8 @@ static int count_mismatches(const float* a, const float* b, int64_t n, float thr
  * CPU inference test
  * -------------------------------------------------------------------------- */
 void test_yolov8n_cpu(void) {
-    fprintf(stderr, "\n=== YOLOv8n CPU Inference ===\n");
-
     inference_session_t* sess = inference_session_load("tests/yolov8n_test.onnx");
     if (!sess) { fprintf(stderr, "SKIP: model not found (run gen_yolo_test.py first)\n"); return; }
-    fprintf(stderr, "Model loaded: %zu inputs, %zu outputs\n",
-           (size_t)inference_session_num_inputs(sess),
-           (size_t)inference_session_num_outputs(sess));
 
     /* Input: 1x3x640x640 */
     int64_t input_shape[] = {1, 3, 640, 640};
@@ -117,13 +112,9 @@ cpu_sess:
  * CUDA inference test
  * -------------------------------------------------------------------------- */
 void test_yolov8n_cuda(void) {
-    fprintf(stderr, "\n=== YOLOv8n CUDA Inference ===\n");
 
     inference_session_t* sess = inference_session_load("tests/yolov8n_test.onnx");
     if (!sess) { fprintf(stderr, "SKIP: model not found\n"); return; }
-    fprintf(stderr, "CUDA Model loaded: %zu inputs, %zu outputs\n",
-           (size_t)inference_session_num_inputs(sess),
-           (size_t)inference_session_num_outputs(sess));
 
     int64_t input_shape[] = {1, 3, 640, 640};
     tensor_t* input = tensor_create(DATA_TYPE_F32, 4, input_shape);
@@ -140,9 +131,7 @@ void test_yolov8n_cuda(void) {
     {
         tensor_t* inputs[]  = {input};
         tensor_t* outputs[] = {output};
-        fprintf(stderr, "CUDA: running inference...\n");
         int rc = inference_session_run(sess, inputs, outputs, 1);
-        fprintf(stderr, "CUDA: inference result=%d\n", rc);
         if (rc != 0) { fprintf(stderr, "FAIL: CUDA inference error\n"); goto cuda_output; }
     }
 
@@ -179,11 +168,9 @@ int main(void) {
 #endif
 
     test_yolov8n_cpu();
-    fprintf(stderr, "\n=== YOLOv8n CPU: DONE ===\n");
 
 #ifdef USE_CUDA
     test_yolov8n_cuda();
-    fprintf(stderr, "\n=== YOLOv8n CUDA: DONE ===\n");
     cuda_platform_finalize();
 #endif
     platform_finalize();

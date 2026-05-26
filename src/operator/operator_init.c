@@ -14,6 +14,10 @@ int register_mul_f32(void);
 int register_concat_f32(void);
 int register_resize_f32(void);
 int register_transpose_f32(void);
+int register_sub_f32(void);
+int register_div_f32(void);
+int register_slice_f32(void);
+int register_split_f32(void);
 
 /* CUDA operator registration (extern "C" from .cu files) */
 int register_relu_f32_cuda(void);
@@ -30,6 +34,10 @@ int register_mul_f32_cuda(void);
 int register_concat_f32_cuda(void);
 int register_resize_f32_cuda(void);
 int register_transpose_f32_cuda(void);
+int register_sub_f32_cuda(void);
+int register_div_f32_cuda(void);
+int register_slice_f32_cuda(void);
+int register_split_f32_cuda(void);
 
 int operator_init_all(void) {
     int ret = 0;
@@ -47,6 +55,10 @@ int operator_init_all(void) {
     ret += register_concat_f32();
     ret += register_resize_f32();
     ret += register_transpose_f32();
+    ret += register_sub_f32();
+    ret += register_div_f32();
+    ret += register_slice_f32();
+    ret += register_split_f32();
     ret += register_relu_f32_cuda();
     ret += register_matmul_f32_cuda();
     ret += register_conv2d_f32_cuda();
@@ -61,5 +73,9 @@ int operator_init_all(void) {
     ret += register_concat_f32_cuda();
     ret += register_resize_f32_cuda();
     ret += register_transpose_f32_cuda();
+    ret += register_sub_f32_cuda();
+    ret += register_div_f32_cuda();
+    ret += register_slice_f32_cuda();
+    ret += register_split_f32_cuda();
     return ret;
 }

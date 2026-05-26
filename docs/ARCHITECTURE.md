@@ -66,7 +66,7 @@ extern const platform_t* g_platform;  /* set by platform_init() to &s_platform_x
 
 | 模块目录 | 说明 |
 | --- | --- |
-| `src/operator/nn/` | 神经网络算子（conv/pool/batchnorm/relu/add/softmax/reshape 等） |
+| `src/operator/nn/` | 神经网络算子（conv/pool/batchnorm/relu/sigmoid/gelu/silu/add/sub/div/mul/concat/resize/transpose/slice/split/softmax/reshape 等） |
 | `src/operator/blas/` | 矩阵运算（matmul） |
 
 **算子接口规范**：

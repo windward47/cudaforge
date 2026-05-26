@@ -91,6 +91,10 @@ target_sources(operator PRIVATE
     src/operator/nn/concat.c
     src/operator/nn/resize.c
     src/operator/nn/transpose.c
+    src/operator/nn/sub.c
+    src/operator/nn/div.c
+    src/operator/nn/slice.c
+    src/operator/nn/split.c
     src/operator/operator_registry.c
     src/operator/operator_init.c
 )
@@ -110,6 +114,10 @@ if(ENABLE_CUDA)
         src/operator/nn/concat_cuda.cu
         src/operator/nn/resize_cuda.cu
         src/operator/nn/transpose_cuda.cu
+        src/operator/nn/sub_cuda.cu
+        src/operator/nn/div_cuda.cu
+        src/operator/nn/slice_cuda.cu
+        src/operator/nn/split_cuda.cu
         src/operator/blas/matmul_cuda.cu
     )
 endif()
@@ -345,6 +353,46 @@ if(ENABLE_TESTS)
     )
     target_link_libraries(test_transpose PRIVATE operator platform unity)
     add_test(NAME test_transpose COMMAND test_transpose)
+
+    add_executable(test_sub
+        src/operator/nn/test/test_sub.c
+    )
+    target_include_directories(test_sub PRIVATE
+        third_party/unity/src
+        src/operator/nn
+    )
+    target_link_libraries(test_sub PRIVATE operator platform unity)
+    add_test(NAME test_sub COMMAND test_sub)
+
+    add_executable(test_div
+        src/operator/nn/test/test_div.c
+    )
+    target_include_directories(test_div PRIVATE
+        third_party/unity/src
+        src/operator/nn
+    )
+    target_link_libraries(test_div PRIVATE operator platform unity)
+    add_test(NAME test_div COMMAND test_div)
+
+    add_executable(test_slice
+        src/operator/nn/test/test_slice.c
+    )
+    target_include_directories(test_slice PRIVATE
+        third_party/unity/src
+        src/operator/nn
+    )
+    target_link_libraries(test_slice PRIVATE operator platform unity)
+    add_test(NAME test_slice COMMAND test_slice)
+
+    add_executable(test_split
+        src/operator/nn/test/test_split.c
+    )
+    target_include_directories(test_split PRIVATE
+        third_party/unity/src
+        src/operator/nn
+    )
+    target_link_libraries(test_split PRIVATE operator platform unity)
+    add_test(NAME test_split COMMAND test_split)
 
     add_executable(test_graph
         src/application/engine/test/test_graph.c

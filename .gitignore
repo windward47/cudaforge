@@ -2,6 +2,7 @@
 build/
 out/
 *.exe
+*.bin
 *.dll
 *.lib
 *.exp
@@ -39,8 +40,10 @@ venv/
 
 # Test artifacts (generated during test runs)
 test_*.onnx
+*test.onnx
 mnist_data/
 *.onnx.data
+*.pt
 
 # Claude internal
 .claude/

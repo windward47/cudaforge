@@ -77,7 +77,7 @@ cmake --build build -j$(nproc)
 # Smoke test — prints platform info
 ./build/Release/cudaforge.exe
 
-# Full test suite (14 test executables)
+# Full test suite (26 test executables)
 ctest --test-dir build -C Release -j$(nproc)
 
 # GPU memory safety check
@@ -246,7 +246,7 @@ CudaForge includes a **hand-written protobuf wire-format parser** (~200 lines of
 CudaForge is for learning how inference engines work under the hood. Reading its entire codebase takes an afternoon. It's also useful for embedded scenarios where you can't afford 100+ MB of dependencies.
 
 **Q: Can I run ResNet / YOLO / BERT?**
-Two tiers verified: (1) MNIST CNN (Conv×2 + ReLU + MaxPool + Reshape + Gemm + Softmax); (2) **ResNet-18** (1×3×224×224 → 1×1000, 50 nodes, CUDA vs PyTorch max_diff = 5.25e-06, Top-1 matches, compute-sanitizer 0 errors). Large models (YOLO/BERT) are beyond current scope.
+Three tiers verified: (1) MNIST CNN (Conv×2 + ReLU + MaxPool + Reshape + Gemm + Softmax); (2) **ResNet-18** (1×3×224×224 → 1×1000, 50 nodes, CUDA vs PyTorch max_diff = 5.25e-06, Top-1 matches); (3) **YOLOv8n** (1×3×640×640 → 1×84×8400, 234 nodes, CPU/CUDA max_diff < 1e-3, compute-sanitizer 0 errors). BERT-style Transformers are beyond current scope.
 
 **Q: Does it support FP16 or INT8?**
 Currently FP32 only. Mixed-precision and quantization are planned for future releases.
