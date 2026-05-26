@@ -61,12 +61,11 @@ int softmax_f32_cuda(const void* inputs[], void* outputs[],
     float* out = (float*)outputs[0];
     cudaStream_t s = stream ? (cudaStream_t)stream->cuda_stream : 0;
 
-    dim3 block(256, 1, 1);
+    dim3 block(OPS_THREADS_PER_BLOCK, 1, 1);
     dim3 grid((unsigned int)p->num_blocks, 1, 1);
 
-    CUDA_KERNEL_LAUNCH(softmax_f32_kernel, grid, block, 0, s,
+    return CUDA_KERNEL_LAUNCH(softmax_f32_kernel, grid, block, 0, s,
                        in, out, p->num_classes, p->num_blocks);
-    return 0;
 }
 
 extern "C" int register_softmax_f32_cuda(void) {

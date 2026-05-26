@@ -21,12 +21,11 @@ int relu_f32_cuda(const void* inputs[], void* outputs[],
     float* out       = (float*)outputs[0];
     int64_t n        = *(const int64_t*)inputs[1];
 
-    dim3 block(256, 1, 1);
-    dim3 grid((n + 255) / 256, 1, 1);
+    dim3 block(OPS_THREADS_PER_BLOCK, 1, 1);
+    dim3 grid((unsigned int)((n + OPS_THREADS_PER_BLOCK - 1) / OPS_THREADS_PER_BLOCK), 1, 1);
     cudaStream_t s = stream ? (cudaStream_t)stream->cuda_stream : 0;
 
-    CUDA_KERNEL_LAUNCH(relu_f32_kernel, grid, block, 0, s, in, out, n);
-    return 0;
+    return CUDA_KERNEL_LAUNCH(relu_f32_kernel, grid, block, 0, s, in, out, n);
 }
 
 extern "C" int register_relu_f32_cuda(void) {

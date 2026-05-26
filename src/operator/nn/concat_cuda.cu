@@ -57,10 +57,10 @@ int concat_f32_cuda(const void* inputs[], void* outputs[],
     g_cuda.memcpy_h2d(d_C_offset, p->C_offset, (size_t)p->num_inputs * sizeof(int64_t), s);
 
     int64_t total = p->total_numel;
-    dim3 block(256, 1, 1);
-    dim3 grid((unsigned int)((total + 255) / 256), 1, 1);
+    dim3 block(OPS_THREADS_PER_BLOCK, 1, 1);
+    dim3 grid((unsigned int)((total + OPS_THREADS_PER_BLOCK - 1) / OPS_THREADS_PER_BLOCK), 1, 1);
 
-    CUDA_KERNEL_LAUNCH(concat_f32_kernel, grid, block, 0, s,
+    int ret = CUDA_KERNEL_LAUNCH(concat_f32_kernel, grid, block, 0, s,
                        d_input_ptrs, out, total,
                        p->inner, p->C_total, p->num_inputs,
                        d_C_per_input, d_C_offset);
@@ -69,7 +69,7 @@ int concat_f32_cuda(const void* inputs[], void* outputs[],
     g_cuda.device_free((void*)d_input_ptrs);
     g_cuda.device_free((void*)d_C_per_input);
     g_cuda.device_free((void*)d_C_offset);
-    return 0;
+    return ret;
 }
 
 extern "C" int register_concat_f32_cuda(void) {

@@ -19,11 +19,10 @@ int reshape_f32_cuda(const void* inputs[], void* outputs[],
     cudaStream_t s = stream ? (cudaStream_t)stream->cuda_stream : 0;
 
     int64_t N = p->numel;
-    dim3 block(256, 1, 1);
-    dim3 grid((unsigned int)((N + 255) / 256), 1, 1);
+    dim3 block(OPS_THREADS_PER_BLOCK, 1, 1);
+    dim3 grid((unsigned int)((N + OPS_THREADS_PER_BLOCK - 1) / OPS_THREADS_PER_BLOCK), 1, 1);
 
-    CUDA_KERNEL_LAUNCH(reshape_copy_kernel, grid, block, 0, s, src, dst, N);
-    return 0;
+    return CUDA_KERNEL_LAUNCH(reshape_copy_kernel, grid, block, 0, s, src, dst, N);
 }
 
 extern "C" int register_reshape_f32_cuda(void) {

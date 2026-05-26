@@ -31,12 +31,15 @@ void test_batchnorm_f32_basic(void) {
     int ret = op->func(inputs, outputs, (const operator_params_t*)&p, NULL);
     TEST_ASSERT_EQUAL_INT(0, ret);
 
-    TEST_ASSERT(s_y[0] < 0);
-    TEST_ASSERT(s_y[1] < 0);
-    TEST_ASSERT(s_y[2] > 0);
-    TEST_ASSERT(s_y[3] > 0);
-    TEST_ASSERT(s_y[4] < 1);
-    TEST_ASSERT(s_y[7] > 1);
+    /* y = gamma * (x - mean) / sqrt(var + epsilon) + beta, hand-computed */
+    TEST_ASSERT_FLOAT_WITHIN(0.01f, -1.3416f, s_y[0]);
+    TEST_ASSERT_FLOAT_WITHIN(0.01f, -0.4472f, s_y[1]);
+    TEST_ASSERT_FLOAT_WITHIN(0.01f,  0.4472f, s_y[2]);
+    TEST_ASSERT_FLOAT_WITHIN(0.01f,  1.3416f, s_y[3]);
+    TEST_ASSERT_FLOAT_WITHIN(0.01f, -1.6832f, s_y[4]);
+    TEST_ASSERT_FLOAT_WITHIN(0.01f,  0.1056f, s_y[5]);
+    TEST_ASSERT_FLOAT_WITHIN(0.01f,  1.8944f, s_y[6]);
+    TEST_ASSERT_FLOAT_WITHIN(0.01f,  3.6832f, s_y[7]);
 }
 
 void test_batchnorm_null_input(void) {

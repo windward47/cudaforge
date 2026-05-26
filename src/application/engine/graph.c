@@ -284,7 +284,8 @@ int graph_execute(inference_graph_t* g, tensor_t* inputs[],
                     && next_n->input_tensors[0] == n->output_tensors[0]
                     && (next_n->type == OP_RELU
                         || next_n->type == OP_SIGMOID
-                        || next_n->type == OP_GELU)) {
+                        || next_n->type == OP_GELU
+                        || next_n->type == OP_SILU)) {
 
                     /* Do not fuse if the compute node's output has other
                      * consumers (e.g. SiLU = Conv→Sigmoid→Mul: the Conv

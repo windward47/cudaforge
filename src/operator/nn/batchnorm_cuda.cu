@@ -138,9 +138,14 @@ static int batchnorm_f32_train_launch(
         (void*)&C, (void*)&hw, (void*)&epsilon, (void*)&momentum
     };
 
-    CUDA_CHECK(cudaLaunchCooperativeKernel(
+    cudaError_t err = cudaLaunchCooperativeKernel(
         (const void*)batchnorm_f32_train_kernel,
-        grid, block, args, smem, s));
+        grid, block, args, smem, s);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "CUDA error at %s:%d: %s\n",
+                __FILE__, __LINE__, cudaGetErrorString(err));
+        return (int)err;
+    }
     return 0;
 }
 
@@ -162,7 +167,7 @@ int batchnorm_f32_cuda(const void* inputs[], void* outputs[],
     dim3 block(BN_BLOCK_X, 1, 1);
     dim3 grid(spatial_blocks, p->C, 1);
 
-    CUDA_KERNEL_LAUNCH(batchnorm_f32_inference_kernel, grid, block, 0, s,
+    return CUDA_KERNEL_LAUNCH(batchnorm_f32_inference_kernel, grid, block, 0, s,
                        (const float*)inputs[0],
                        (const float*)inputs[1],
                        (const float*)inputs[2],
@@ -170,7 +175,6 @@ int batchnorm_f32_cuda(const void* inputs[], void* outputs[],
                        (const float*)inputs[4],
                        (float*)outputs[0],
                        p->C, hw, p->epsilon);
-    return 0;
 }
 
 extern "C" int register_batchnorm_f32_cuda(void) {

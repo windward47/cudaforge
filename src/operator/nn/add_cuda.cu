@@ -30,24 +30,21 @@ int add_f32_cuda(const void* inputs[], void* outputs[],
     cudaStream_t s = stream ? (cudaStream_t)stream->cuda_stream : 0;
 
     int64_t N = p->numel;
-    dim3 block(256, 1, 1);
-    dim3 grid((unsigned int)((N + 255) / 256), 1, 1);
+    dim3 block(OPS_THREADS_PER_BLOCK, 1, 1);
+    dim3 grid((unsigned int)((N + OPS_THREADS_PER_BLOCK - 1) / OPS_THREADS_PER_BLOCK), 1, 1);
 
     if (p->B_numel == 1) {
         float bv;
         g_cuda.memcpy_d2h(&bv, (void*)b, sizeof(float), 0);
         g_cuda.stream_synchronize(0);
-        CUDA_KERNEL_LAUNCH(add_f32_no_broadcast_kernel, grid, block, 0, s,
-                           a, b, out, N);
-        (void)bv;
+        return CUDA_KERNEL_LAUNCH(add_f32_no_broadcast_kernel, grid, block, 0, s,
+                                  a, b, out, N);
     } else if (p->B_numel == N) {
-        CUDA_KERNEL_LAUNCH(add_f32_no_broadcast_kernel, grid, block, 0, s,
-                           a, b, out, N);
-    } else {
-        CUDA_KERNEL_LAUNCH(add_f32_broadcast_c_kernel, grid, block, 0, s,
-                           a, b, out, N, p->B_numel);
+        return CUDA_KERNEL_LAUNCH(add_f32_no_broadcast_kernel, grid, block, 0, s,
+                                  a, b, out, N);
     }
-    return 0;
+    return CUDA_KERNEL_LAUNCH(add_f32_broadcast_c_kernel, grid, block, 0, s,
+                      a, b, out, N, p->B_numel);
 }
 
 extern "C" int register_add_f32_cuda(void) {

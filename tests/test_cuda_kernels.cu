@@ -209,7 +209,48 @@ void test_gelu_f32_cuda(void) {
     TEST_ASSERT_FLOAT_WITHIN(0.01f,-0.158f,ho[0]);
     TEST_ASSERT_FLOAT_WITHIN(0.01f,0.0f,ho[1]);
     TEST_ASSERT_FLOAT_WITHIN(0.01f,0.841f,ho[2]);
+    TEST_ASSERT_FLOAT_WITHIN(0.01f,1.954f,ho[3]);
     g_cuda.device_free(di);g_cuda.device_free(dd);
+}
+
+static void test_in_place_cuda(const char* op_name, int64_t n,
+                                const float* host_in, const float* expected, float tol) {
+    const operator_registry_t* op = operator_find(op_name);
+    TEST_ASSERT_NOT_NULL(op);
+    float* d_buf = (float*)g_cuda.device_alloc(n * sizeof(float));
+    TEST_ASSERT_NOT_NULL(d_buf);
+    if (g_cuda.memcpy_h2d(d_buf, host_in, n * sizeof(float), 0) != 0) TEST_FAIL();
+    const void* inputs[]  = {d_buf, &n};
+    void*       outputs[] = {d_buf};  /* in-place: same device pointer */
+    if (op->func(inputs, outputs, NULL, NULL) != 0) TEST_FAIL();
+    float* h_out = (float*)malloc((size_t)n * sizeof(float));
+    if (g_cuda.memcpy_d2h(h_out, d_buf, n * sizeof(float), 0) != 0) TEST_FAIL();
+    if (g_cuda.stream_synchronize(0) != 0) TEST_FAIL();
+    for (int64_t i = 0; i < n; i++)
+        TEST_ASSERT_FLOAT_WITHIN(tol, expected[i], h_out[i]);
+    free(h_out);
+    g_cuda.device_free(d_buf);
+}
+
+void test_relu_in_place_cuda(void) {
+    int64_t n = 4;
+    float in[4] = {-2.0f, 0.0f, 1.5f, 3.0f};
+    float expected[4] = {0.0f, 0.0f, 1.5f, 3.0f};
+    test_in_place_cuda("relu_f32_cuda", n, in, expected, 1e-5f);
+}
+
+void test_sigmoid_in_place_cuda(void) {
+    int64_t n = 4;
+    float in[4] = {-2.0f, 0.0f, 1.0f, 2.0f};
+    float expected[4] = {0.1192f, 0.5f, 0.7311f, 0.8808f};
+    test_in_place_cuda("sigmoid_f32_cuda", n, in, expected, 0.01f);
+}
+
+void test_gelu_in_place_cuda(void) {
+    int64_t n = 4;
+    float in[4] = {-2.0f, 0.0f, 1.0f, 2.0f};
+    float expected[4] = {-0.0455f, 0.0f, 0.8413f, 1.9545f};
+    test_in_place_cuda("gelu_f32_cuda", n, in, expected, 0.01f);
 }
 
 int main(void) {
@@ -228,6 +269,9 @@ int main(void) {
     RUN_TEST(test_batchnorm_f32_cuda);
     RUN_TEST(test_sigmoid_f32_cuda);
     RUN_TEST(test_gelu_f32_cuda);
+    RUN_TEST(test_relu_in_place_cuda);
+    RUN_TEST(test_sigmoid_in_place_cuda);
+    RUN_TEST(test_gelu_in_place_cuda);
     int result = UNITY_END();
     cuda_platform_finalize();
     platform_finalize();

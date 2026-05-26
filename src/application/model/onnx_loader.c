@@ -353,6 +353,20 @@ static int node_attr_ints(onnx_node_info_t* node, const char* name,
     return n;
 }
 
+static int node_attr_string_copy(onnx_node_info_t* node, const char* name,
+                                  char* buf, int buf_size) {
+    pb_message_t* a = node_find_attr(node, name);
+    if (!a) return 0;
+    size_t slen = 0;
+    const uint8_t* s = pb_field_get_string(a, F_AttributeProto_s, &slen);
+    if (!s || slen == 0) { pb_message_destroy(a); return 0; }
+    int n = (int)(slen < (size_t)(buf_size - 1) ? slen : (size_t)(buf_size - 1));
+    memcpy(buf, s, n);
+    buf[n] = '\0';
+    pb_message_destroy(a);
+    return n;
+}
+
 /* ============================================================
  * Parse NodeProto → onnx_node_info_t
  * ============================================================ */
@@ -1153,6 +1167,13 @@ static inference_graph_t* build_graph_from_onnx(onnx_parsed_model_t* pm) {
                 scales_info = find_tensor(pm, node->input_names[2]);
             if (!scales_info && node->num_inputs >= 2 && node->input_names[1][0] != '\0')
                 scales_info = find_tensor(pm, node->input_names[1]);
+            rp.mode = 0;  /* default: nearest */
+            {
+                char mode_str[32] = "";
+                if (node_attr_string_copy(node, "mode", mode_str, sizeof(mode_str)) > 0) {
+                    if (strcmp(mode_str, "linear") == 0) rp.mode = 1;
+                }
+            }
             rp.scale_h = 1.0f; rp.scale_w = 1.0f;
             if (scales_info && scales_info->raw_data
                 && scales_info->raw_data_size >= 4 * (int)sizeof(float)) {

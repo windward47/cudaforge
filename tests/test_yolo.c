@@ -17,7 +17,9 @@
 
 #ifdef USE_CUDA
 #include "cuda_platform.h"
+#include <cuda_runtime.h>
 #endif
+#include <time.h>
 
 extern int operator_init_all(void);
 
@@ -78,8 +80,13 @@ void test_yolov8n_cpu(void) {
     {
         tensor_t* inputs[]  = {input};
         tensor_t* outputs[] = {output};
+
+        clock_t t0 = clock();
         int rc = inference_session_run(sess, inputs, outputs, 0);
+        clock_t t1 = clock();
+        double wall_ms = (double)(t1 - t0) * 1000.0 / CLOCKS_PER_SEC;
         if (rc != 0) { fprintf(stderr, "FAIL: CPU inference error %d\n", rc); goto cpu_output; }
+        fprintf(stderr, "CPU inference: %.0f ms (single run)\n", wall_ms);
     }
 
     /* Compare */
@@ -131,8 +138,33 @@ void test_yolov8n_cuda(void) {
     {
         tensor_t* inputs[]  = {input};
         tensor_t* outputs[] = {output};
-        int rc = inference_session_run(sess, inputs, outputs, 1);
-        if (rc != 0) { fprintf(stderr, "FAIL: CUDA inference error\n"); goto cuda_output; }
+
+        /* Warmup */
+        for (int w = 0; w < 3; w++)
+            inference_session_run(sess, inputs, outputs, 1);
+
+        /* Timed runs */
+        cudaEvent_t start, stop;
+        cudaEventCreate(&start); cudaEventCreate(&stop);
+        cudaEventRecord(start, 0);
+        for (int r = 0; r < 10; r++)
+            inference_session_run(sess, inputs, outputs, 1);
+        cudaEventRecord(stop, 0);
+        cudaEventSynchronize(stop);
+        float gpu_ms = 0.0f;
+        cudaEventElapsedTime(&gpu_ms, start, stop);
+        cudaEventDestroy(start); cudaEventDestroy(stop);
+
+        clock_t t0 = clock();
+        for (int r = 0; r < 10; r++) {
+            int rc = inference_session_run(sess, inputs, outputs, 1);
+            if (rc != 0) { fprintf(stderr, "FAIL: CUDA inference error on run %d\n", r); break; }
+        }
+        clock_t t1 = clock();
+        double wall_ms = (double)(t1 - t0) * 1000.0 / CLOCKS_PER_SEC / 10.0;
+
+        fprintf(stderr, "CUDA inference: GPU=%.2f ms  wall=%.2f ms (avg of 10)\n",
+                (double)gpu_ms / 10.0, wall_ms);
     }
 
     {

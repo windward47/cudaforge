@@ -1,5 +1,6 @@
 #include "unity.h"
 #include "operator.h"
+#include <stdlib.h>
 #include <string.h>
 #include <math.h>
 
@@ -51,6 +52,40 @@ void test_avgpool2d_f32_basic(void) {
     TEST_ASSERT_FLOAT_WITHIN(1e-5, 5.5f, s_out[1]);
 }
 
+void test_pool_wide_ow(void) {
+    /* OW > 256 exercises the grid tiling path in pooling kernels.
+     * W=260, KH=2, KW=2, stride=2, pad=0 → OW=129.
+     * All ones input → max=1, avg=1 for every output element. */
+    int64_t H=2, W=260, KH=2, KW=2, stride=2, pad=0;
+    int64_t OH=1, OW=129;
+    int64_t N=H*W;
+    float* in = (float*)malloc((size_t)N * sizeof(float));
+    float* out_max = (float*)calloc((size_t)OH*OW, sizeof(float));
+    float* out_avg = (float*)calloc((size_t)OH*OW, sizeof(float));
+    for (int64_t i = 0; i < N; i++) in[i] = 1.0f;
+
+    pool_p p = {1,1,H,W, KH,KW, stride,stride, pad,pad};
+    const void* inputs[] = {in};
+
+    const operator_registry_t* max_op = operator_find("maxpool2d_f32");
+    TEST_ASSERT_NOT_NULL(max_op);
+    void* outputs_max[] = {out_max};
+    int ret = max_op->func(inputs, outputs_max, (const operator_params_t*)&p, NULL);
+    TEST_ASSERT_EQUAL_INT(0, ret);
+    for (int64_t i = 0; i < OH*OW; i++)
+        TEST_ASSERT_FLOAT_WITHIN(1e-5, 1.0f, out_max[i]);
+
+    const operator_registry_t* avg_op = operator_find("avgpool2d_f32");
+    TEST_ASSERT_NOT_NULL(avg_op);
+    void* outputs_avg[] = {out_avg};
+    ret = avg_op->func(inputs, outputs_avg, (const operator_params_t*)&p, NULL);
+    TEST_ASSERT_EQUAL_INT(0, ret);
+    for (int64_t i = 0; i < OH*OW; i++)
+        TEST_ASSERT_FLOAT_WITHIN(1e-5, 1.0f, out_avg[i]);
+
+    free(in); free(out_max); free(out_avg);
+}
+
 void test_pool_null_input(void) {
     const operator_registry_t* op = operator_find("maxpool2d_f32");
     TEST_ASSERT_NOT_NULL(op);
@@ -63,6 +98,7 @@ int main(void) {
     UNITY_BEGIN();
     RUN_TEST(test_maxpool2d_f32_basic);
     RUN_TEST(test_avgpool2d_f32_basic);
+    RUN_TEST(test_pool_wide_ow);
     RUN_TEST(test_pool_null_input);
     return UNITY_END();
 }

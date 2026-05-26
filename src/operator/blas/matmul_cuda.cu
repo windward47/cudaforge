@@ -247,10 +247,11 @@ int matmul_f32_cuda(const void* inputs[], void* outputs[],
         A_trans = (float*)g_cuda.device_alloc(bytes);
         if (!A_trans) { ret = -1; goto matmul_cleanup; }
         int64_t total = M * K;
-        dim3 tb(256, 1, 1);
-        dim3 tg((unsigned int)((total + 255) / 256), 1, 1);
-        CUDA_KERNEL_LAUNCH(transpose_f32_kernel, tg, tb, 0, s,
-                           A, A_trans, K, M);
+        dim3 tb(OPS_THREADS_PER_BLOCK, 1, 1);
+        dim3 tg((unsigned int)((total + OPS_THREADS_PER_BLOCK - 1) / OPS_THREADS_PER_BLOCK), 1, 1);
+        ret = CUDA_KERNEL_LAUNCH(transpose_f32_kernel, tg, tb, 0, s,
+                                  A, A_trans, K, M);
+        if (ret != 0) goto matmul_cleanup;
         A = A_trans;
     }
 
@@ -260,10 +261,11 @@ int matmul_f32_cuda(const void* inputs[], void* outputs[],
         B_trans = (float*)g_cuda.device_alloc(bytes);
         if (!B_trans) { ret = -1; goto matmul_cleanup; }
         int64_t total = K * N;
-        dim3 tb(256, 1, 1);
-        dim3 tg((unsigned int)((total + 255) / 256), 1, 1);
-        CUDA_KERNEL_LAUNCH(transpose_f32_kernel, tg, tb, 0, s,
-                           B, B_trans, N, K);
+        dim3 tb(OPS_THREADS_PER_BLOCK, 1, 1);
+        dim3 tg((unsigned int)((total + OPS_THREADS_PER_BLOCK - 1) / OPS_THREADS_PER_BLOCK), 1, 1);
+        ret = CUDA_KERNEL_LAUNCH(transpose_f32_kernel, tg, tb, 0, s,
+                                  B, B_trans, N, K);
+        if (ret != 0) goto matmul_cleanup;
         B = B_trans;
     }
 
@@ -271,36 +273,38 @@ int matmul_f32_cuda(const void* inputs[], void* outputs[],
         block = dim3(16, 16, 1);
         grid  = dim3((unsigned int)((N + 15) / 16),
                      (unsigned int)((M + 15) / 16), 1);
-        CUDA_KERNEL_LAUNCH(matmul_f32_naive, grid, block, 0, s,
-                           A, B, C, M, N, K);
+        ret = CUDA_KERNEL_LAUNCH(matmul_f32_naive, grid, block, 0, s,
+                                  A, B, C, M, N, K);
     } else if (M >= 512 && N >= 512 && K >= 512
                && M % TC_TILE == 0 && N % TC_TILE == 0) {
         block = dim3(32, 1, 1);
         grid  = dim3((unsigned int)((N + TC_TILE - 1) / TC_TILE),
                      (unsigned int)((M + TC_TILE - 1) / TC_TILE), 1);
-        CUDA_KERNEL_LAUNCH(matmul_f32_tc_kernel, grid, block, 0, s,
-                           A, B, C, M, N, K);
+        ret = CUDA_KERNEL_LAUNCH(matmul_f32_tc_kernel, grid, block, 0, s,
+                                  A, B, C, M, N, K);
     } else if (M >= 64 && N >= 64) {
         block = dim3(WARP_TILE, WARP_TILE, 1);
         grid  = dim3((unsigned int)((N + WARP_TILE - 1) / WARP_TILE),
                      (unsigned int)((M + WARP_TILE - 1) / WARP_TILE), 1);
-        CUDA_KERNEL_LAUNCH(matmul_f32_warp, grid, block, 0, s,
-                           A, B, C, M, N, K);
+        ret = CUDA_KERNEL_LAUNCH(matmul_f32_warp, grid, block, 0, s,
+                                  A, B, C, M, N, K);
     } else {
         block = dim3(MATMUL_TILE_SIZE, MATMUL_TILE_SIZE, 1);
         grid  = dim3((unsigned int)((N + MATMUL_TILE_SIZE - 1) / MATMUL_TILE_SIZE),
                      (unsigned int)((M + MATMUL_TILE_SIZE - 1) / MATMUL_TILE_SIZE), 1);
-        CUDA_KERNEL_LAUNCH(matmul_f32_tiled, grid, block, 0, s,
-                           A, B, C, M, N, K);
+        ret = CUDA_KERNEL_LAUNCH(matmul_f32_tiled, grid, block, 0, s,
+                                  A, B, C, M, N, K);
     }
+    if (ret != 0) goto matmul_cleanup;
 
     /* Add bias if present */
     if (bias) {
         int64_t total = M * N;
         int block_sz = 256;
         int grid_sz = (int)((total + block_sz - 1) / block_sz);
-        CUDA_KERNEL_LAUNCH(matmul_bias_add_kernel, grid_sz, block_sz, 0, s,
-                           C, bias, M, N);
+        ret = CUDA_KERNEL_LAUNCH(matmul_bias_add_kernel, grid_sz, block_sz, 0, s,
+                                  C, bias, M, N);
+        if (ret != 0) goto matmul_cleanup;
     }
 
 matmul_cleanup:

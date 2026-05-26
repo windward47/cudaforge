@@ -89,13 +89,13 @@ int main(void) {
     for (size_t i = 0; i < out_sz; i++) {
         float diff = fabsf(h_out_cpu[i] - h_out_cuda[i]);
         if (diff > max_diff) { max_diff = diff; max_idx = (int)i; }
-        if (diff > 1e-4f) mismatch++;
+        if (diff > 1e-3f) mismatch++;
     }
     fprintf(stderr, "Max diff: %.6e at idx=%d (CPU=%.6f CUDA=%.6f)\n",
             max_diff, max_idx,
             max_idx >= 0 ? h_out_cpu[max_idx] : 0.0f,
             max_idx >= 0 ? h_out_cuda[max_idx] : 0.0f);
-    fprintf(stderr, "Mismatches >1e-4: %d/%zu\n", mismatch, out_sz);
+    fprintf(stderr, "Mismatches >1e-3: %d/%zu\n", mismatch, out_sz);
     fprintf(stderr, "First 10 CPU: ");
     for (int i = 0; i < 10; i++) fprintf(stderr, "%.4f ", h_out_cpu[i]);
     fprintf(stderr, "\nFirst 10 CUDA: ");

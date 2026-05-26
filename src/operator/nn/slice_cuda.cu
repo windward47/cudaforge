@@ -52,10 +52,10 @@ int slice_f32_cuda(const void* inputs[], void* outputs[],
     float* out = (float*)outputs[0];
     cudaStream_t s = stream ? (cudaStream_t)stream->cuda_stream : 0;
 
-    dim3 block(256, 1, 1);
-    dim3 grid((unsigned int)((p->numel + 255) / 256), 1, 1);
+    dim3 block(OPS_THREADS_PER_BLOCK, 1, 1);
+    dim3 grid((unsigned int)((p->numel + OPS_THREADS_PER_BLOCK - 1) / OPS_THREADS_PER_BLOCK), 1, 1);
 
-    CUDA_KERNEL_LAUNCH(slice_f32_kernel, grid, block, 0, s,
+    return CUDA_KERNEL_LAUNCH(slice_f32_kernel, grid, block, 0, s,
         in, out, p->numel, p->ndim,
         p->out_shape[0], p->out_shape[1], p->out_shape[2], p->out_shape[3],
         p->out_shape[4], p->out_shape[5], p->out_shape[6], p->out_shape[7],
@@ -65,7 +65,6 @@ int slice_f32_cuda(const void* inputs[], void* outputs[],
         p->steps[4], p->steps[5], p->steps[6], p->steps[7],
         p->in_strides[0], p->in_strides[1], p->in_strides[2], p->in_strides[3],
         p->in_strides[4], p->in_strides[5], p->in_strides[6], p->in_strides[7]);
-    return 0;
 }
 
 extern "C" int register_slice_f32_cuda(void) {

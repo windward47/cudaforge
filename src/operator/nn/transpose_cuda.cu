@@ -56,16 +56,15 @@ int transpose_f32_cuda(const void* inputs[], void* outputs[],
     for (int d = p->ndim - 2; d >= 0; d--)
         in_stride[d] = in_stride[d + 1] * p->shape[d + 1];
 
-    dim3 block(256, 1, 1);
-    dim3 grid((unsigned int)((numel + 255) / 256), 1, 1);
+    dim3 block(OPS_THREADS_PER_BLOCK, 1, 1);
+    dim3 grid((unsigned int)((numel + OPS_THREADS_PER_BLOCK - 1) / OPS_THREADS_PER_BLOCK), 1, 1);
 
-    CUDA_KERNEL_LAUNCH(transpose_f32_kernel, grid, block, 0, s,
+    return CUDA_KERNEL_LAUNCH(transpose_f32_kernel, grid, block, 0, s,
                        in, out, numel,
                        in_stride[0], in_stride[1], in_stride[2], in_stride[3],
                        p->out_shape[0], p->out_shape[1], p->out_shape[2], p->out_shape[3],
                        p->perm[0], p->perm[1], p->perm[2], p->perm[3],
                        (int64_t)p->ndim);
-    return 0;
 }
 
 extern "C" int register_transpose_f32_cuda(void) {

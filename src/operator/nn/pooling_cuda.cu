@@ -68,10 +68,9 @@ static int launch_pool(cudaStream_t s, const void* kernel,
                         int64_t pad_h, int64_t pad_w) {
     dim3 block(POOL_BLOCK_X, 1, 1);
     dim3 grid((unsigned int)((OW + POOL_BLOCK_X - 1) / POOL_BLOCK_X), (unsigned int)OH, (unsigned int)(N * C));
-    CUDA_KERNEL_LAUNCH(kernel, grid, block, 0, s,
+    return CUDA_KERNEL_LAUNCH(kernel, grid, block, 0, s,
                        in, out, C, H, W, OH, OW, KH, KW,
                        stride_h, stride_w, pad_h, pad_w);
-    return 0;
 }
 
 int maxpool2d_f32_cuda(const void* inputs[], void* outputs[],

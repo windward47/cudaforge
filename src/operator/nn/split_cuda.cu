@@ -22,10 +22,11 @@ int split_f32_cuda(const void* inputs[], void* outputs[],
         if (!outputs[o]) continue;
         float* out = (float*)outputs[o];
 
-        dim3 block(256, 1, 1);
-        dim3 grid((unsigned int)((p->out_numel[o] + 255) / 256), 1, 1);
-        CUDA_KERNEL_LAUNCH(split_copy_kernel, grid, block, 0, s,
+        dim3 block(OPS_THREADS_PER_BLOCK, 1, 1);
+        dim3 grid((unsigned int)((p->out_numel[o] + OPS_THREADS_PER_BLOCK - 1) / OPS_THREADS_PER_BLOCK), 1, 1);
+        int ret = CUDA_KERNEL_LAUNCH(split_copy_kernel, grid, block, 0, s,
                            in, out, cumulative, p->out_numel[o]);
+        if (ret != 0) return ret;
         cumulative += p->out_numel[o];
     }
     return 0;

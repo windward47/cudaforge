@@ -19,10 +19,9 @@ __global__ void gelu_f32_kernel(const float* input, float* output, int64_t n) {
 
 static int launch_1d(cudaStream_t s, const void* kernel,
                      const float* in, float* out, int64_t n) {
-    dim3 block(256, 1, 1);
-    dim3 grid((n + 255) / 256, 1, 1);
-    CUDA_KERNEL_LAUNCH(kernel, grid, block, 0, s, in, out, n);
-    return 0;
+    dim3 block(OPS_THREADS_PER_BLOCK, 1, 1);
+    dim3 grid((unsigned int)((n + OPS_THREADS_PER_BLOCK - 1) / OPS_THREADS_PER_BLOCK), 1, 1);
+    return CUDA_KERNEL_LAUNCH(kernel, grid, block, 0, s, in, out, n);
 }
 
 int sigmoid_f32_cuda(const void* inputs[], void* outputs[],

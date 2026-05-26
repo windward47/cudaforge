@@ -14,6 +14,9 @@
 extern "C" {
 #endif
 
+/* Default threads per block for 1D element-wise kernels */
+#define OPS_THREADS_PER_BLOCK 256
+
 /* --------------------------------------------------------------------------
  *  CUDA error check — only meaningful when compiled by nvcc
  * -------------------------------------------------------------------------- */
@@ -24,7 +27,7 @@ extern "C" {
         if (err != cudaSuccess) { \
             fprintf(stderr, "CUDA error at %s:%d: %s\n", \
                     __FILE__, __LINE__, cudaGetErrorString(err)); \
-            exit(EXIT_FAILURE); \
+            goto cuda_error; \
         } \
     } while(0)
 
@@ -110,11 +113,17 @@ extern cuda_ops_t g_cuda;
 #ifdef __cplusplus
 
 template<typename... Args>
-static inline void _cuda_kernel_call(const void* kernel, dim3 grid, dim3 block,
-                                      size_t shared_mem, cudaStream_t stream,
-                                      Args&&... args) {
+static inline int _cuda_kernel_call(const void* kernel, dim3 grid, dim3 block,
+                                     size_t shared_mem, cudaStream_t stream,
+                                     Args&&... args) {
     void* params[] = { (void*)&args... };
-    CUDA_CHECK(cudaLaunchKernel(kernel, grid, block, params, shared_mem, stream));
+    cudaError_t err = cudaLaunchKernel(kernel, grid, block, params, shared_mem, stream);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "CUDA error at %s:%d: %s\n",
+                __FILE__, __LINE__, cudaGetErrorString(err));
+        return (int)err;
+    }
+    return 0;
 }
 
 #define CUDA_KERNEL_LAUNCH(kernel, grid, block, shared_mem, stream, ...) \

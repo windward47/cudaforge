@@ -30,17 +30,15 @@ int mul_f32_cuda(const void* inputs[], void* outputs[],
     cudaStream_t s = stream ? (cudaStream_t)stream->cuda_stream : 0;
 
     int64_t N = p->numel;
-    dim3 block(256, 1, 1);
-    dim3 grid((unsigned int)((N + 255) / 256), 1, 1);
+    dim3 block(OPS_THREADS_PER_BLOCK, 1, 1);
+    dim3 grid((unsigned int)((N + OPS_THREADS_PER_BLOCK - 1) / OPS_THREADS_PER_BLOCK), 1, 1);
 
     if (p->B_numel == N) {
-        CUDA_KERNEL_LAUNCH(mul_f32_no_broadcast_kernel, grid, block, 0, s,
-                           a, b, out, N);
-    } else {
-        CUDA_KERNEL_LAUNCH(mul_f32_broadcast_c_kernel, grid, block, 0, s,
-                           a, b, out, N, p->B_numel);
+        return CUDA_KERNEL_LAUNCH(mul_f32_no_broadcast_kernel, grid, block, 0, s,
+                                  a, b, out, N);
     }
-    return 0;
+    return CUDA_KERNEL_LAUNCH(mul_f32_broadcast_c_kernel, grid, block, 0, s,
+                      a, b, out, N, p->B_numel);
 }
 
 extern "C" int register_mul_f32_cuda(void) {

@@ -144,18 +144,30 @@ int conv2d_f32(const void* inputs[], void* outputs[],
     }
     if (ret != 0) return ret;
 
-    /* Add bias if present */
-    if (bias) {
+    /* Add bias + fused activation if enabled */
+    {
         int64_t OH = (p->H + 2 * p->pad_h - p->dilation_h * (p->kernel_h - 1) - 1)
                      / p->stride_h + 1;
         int64_t OW = (p->W + 2 * p->pad_w - p->dilation_w * (p->kernel_w - 1) - 1)
                      / p->stride_w + 1;
         for (int64_t n = 0; n < p->N; n++) {
             for (int64_t k = 0; k < p->K; k++) {
-                float bv = bias[k];
+                float bv = bias ? bias[k] : 0.0f;
                 for (int64_t oh = 0; oh < OH; oh++) {
                     for (int64_t ow = 0; ow < OW; ow++) {
-                        out[((n * p->K + k) * OH + oh) * OW + ow] += bv;
+                        int64_t idx = ((n * p->K + k) * OH + oh) * OW + ow;
+                        float val = out[idx] + bv;
+                        if (p->fuse_activation == 1) {
+                            val = val > 0.0f ? val : 0.0f;
+                        } else if (p->fuse_activation == 2) {
+                            val = 1.0f / (1.0f + expf(-val));
+                        } else if (p->fuse_activation == 3) {
+                            float t = tanhf(0.79788456f * (val + 0.044715f * val * val * val));
+                            val = 0.5f * val * (1.0f + t);
+                        } else if (p->fuse_activation == 13) {
+                            val = val / (1.0f + expf(-val));
+                        }
+                        out[idx] = val;
                     }
                 }
             }
