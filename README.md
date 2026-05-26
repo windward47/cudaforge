@@ -108,6 +108,11 @@ CUDA: enabled (1 device(s))
 | Reshape | `Reshape` | ✓ | — | 零拷贝形状变换 |
 | GlobalAveragePool | `GlobalAveragePool` | ✓ | ✓ | NCHW → NC×1×1 全局平均池化 |
 | Softmax | `Softmax` | ✓ | ✓ | 沿轴 softmax，分类网络输出层 |
+| SiLU | `SiLU` | ✓ | ✓ | Sigmoid 线性单元 |
+| Mul | `Mul` | ✓ | ✓ | 逐元素乘法，支持 broadcast |
+| Concat | `Concat` | ✓ | ✓ | 沿通道轴拼接 |
+| Resize | `Resize` | ✓ | ✓ | 最近邻上采样 |
+| Transpose | `Transpose` | ✓ | ✓ | N 维转置 |
 
 ## API 概览
 

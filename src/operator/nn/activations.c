@@ -39,6 +39,23 @@ int gelu_f32(const void* inputs[], void* outputs[],
     return 0;
 }
 
+/* SiLU (Sigmoid Linear Unit): x * sigmoid(x) */
+int silu_f32(const void* inputs[], void* outputs[],
+             const operator_params_t* params, stream_t* stream) {
+    (void)params; (void)stream;
+    if (!inputs || !inputs[0] || !inputs[1] || !outputs || !outputs[0]) return -1;
+
+    const float* in = (const float*)inputs[0];
+    float* out      = (float*)outputs[0];
+    int64_t n       = *(const int64_t*)inputs[1];
+
+    for (int64_t i = 0; i < n; i++) {
+        float x = in[i];
+        out[i] = x / (1.0f + expf(-x));
+    }
+    return 0;
+}
+
 static const operator_registry_t s_sigmoid_reg = {
     .name = "sigmoid_f32", .data_type = "f32",
     .func = sigmoid_f32, .version = 1, .flags = OP_FLAG_IN_PLACE,
@@ -49,9 +66,15 @@ static const operator_registry_t s_gelu_reg = {
     .func = gelu_f32, .version = 1, .flags = OP_FLAG_IN_PLACE,
 };
 
+static const operator_registry_t s_silu_reg = {
+    .name = "silu_f32", .data_type = "f32",
+    .func = silu_f32, .version = 1, .flags = OP_FLAG_IN_PLACE,
+};
+
 int register_activations(void) {
     int ret = 0;
     ret += operator_register(&s_sigmoid_reg);
     ret += operator_register(&s_gelu_reg);
+    ret += operator_register(&s_silu_reg);
     return ret;
 }

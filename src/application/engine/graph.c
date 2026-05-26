@@ -222,6 +222,11 @@ static const char* op_name(op_type_t type) {
         case OP_RESHAPE:    return "reshape_f32";
         case OP_GLOBALAVGPOOL: return "globalavgpool_f32";
         case OP_SOFTMAX:    return "softmax_f32";
+        case OP_SILU:       return "silu_f32";
+        case OP_MUL:        return "mul_f32";
+        case OP_CONCAT:     return "concat_f32";
+        case OP_RESIZE:     return "resize_f32";
+        case OP_TRANSPOSE:  return "transpose_f32";
         default:            return NULL;
     }
 }
@@ -327,7 +332,8 @@ int graph_execute(inference_graph_t* g, tensor_t* inputs[],
         /* Input slots needed: tensor inputs + weights + extra metadata slots */
         int total_inputs = n->num_inputs + n->num_weights;
         int max_input_idx = total_inputs > 0 ? total_inputs - 1 : 0;
-        if (n->type == OP_RELU || n->type == OP_SIGMOID || n->type == OP_GELU)
+        if (n->type == OP_RELU || n->type == OP_SIGMOID || n->type == OP_GELU
+            || n->type == OP_SILU)
             if (max_input_idx < 1) max_input_idx = 1;
         if (n->type == OP_CONV2D || n->type == OP_MATMUL)
             if (max_input_idx < 2) max_input_idx = 2;  /* reserve for optional bias */
@@ -391,7 +397,8 @@ int graph_execute(inference_graph_t* g, tensor_t* inputs[],
 
         /* Handle ops that need extra metadata via inputs[] slot */
         /* relu/sigmoid/gelu: need numel as inputs[1] */
-        if (n->type == OP_RELU || n->type == OP_SIGMOID || n->type == OP_GELU) {
+        if (n->type == OP_RELU || n->type == OP_SIGMOID || n->type == OP_GELU
+            || n->type == OP_SILU) {
             int tid = n->input_tensors[0];
             if (tid >= 0 && tid < g->num_tensors) {
                 op_inputs[1] = &g->tensors[tid].tensor->numel;

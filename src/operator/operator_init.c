@@ -10,6 +10,10 @@ int register_add_f32(void);
 int register_reshape_f32(void);
 int register_globalavgpool_f32(void);
 int register_softmax_f32(void);
+int register_mul_f32(void);
+int register_concat_f32(void);
+int register_resize_f32(void);
+int register_transpose_f32(void);
 
 /* CUDA operator registration (extern "C" from .cu files) */
 int register_relu_f32_cuda(void);
@@ -22,6 +26,10 @@ int register_add_f32_cuda(void);
 int register_globalavgpool_f32_cuda(void);
 int register_softmax_f32_cuda(void);
 int register_reshape_f32_cuda(void);
+int register_mul_f32_cuda(void);
+int register_concat_f32_cuda(void);
+int register_resize_f32_cuda(void);
+int register_transpose_f32_cuda(void);
 
 int operator_init_all(void) {
     int ret = 0;
@@ -35,6 +43,10 @@ int operator_init_all(void) {
     ret += register_reshape_f32();
     ret += register_globalavgpool_f32();
     ret += register_softmax_f32();
+    ret += register_mul_f32();
+    ret += register_concat_f32();
+    ret += register_resize_f32();
+    ret += register_transpose_f32();
     ret += register_relu_f32_cuda();
     ret += register_matmul_f32_cuda();
     ret += register_conv2d_f32_cuda();
@@ -45,5 +57,9 @@ int operator_init_all(void) {
     ret += register_globalavgpool_f32_cuda();
     ret += register_softmax_f32_cuda();
     ret += register_reshape_f32_cuda();
+    ret += register_mul_f32_cuda();
+    ret += register_concat_f32_cuda();
+    ret += register_resize_f32_cuda();
+    ret += register_transpose_f32_cuda();
     return ret;
 }

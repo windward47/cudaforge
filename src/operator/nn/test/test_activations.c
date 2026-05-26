@@ -42,6 +42,21 @@ void test_gelu_f32(void) {
     TEST_ASSERT(s_out[4] > s_out[3]);                     /* gelu(2) > gelu(1) */
 }
 
+void test_silu_f32(void) {
+    const void* inputs[] = {s_in, &s_n};
+    void* outputs[] = {s_out};
+    const operator_registry_t* op = operator_find("silu_f32");
+    TEST_ASSERT_NOT_NULL(op);
+
+    int ret = op->func(inputs, outputs, NULL, NULL);
+    TEST_ASSERT_EQUAL_INT(0, ret);
+
+    TEST_ASSERT_FLOAT_WITHIN(1e-5, 0.0f, s_out[2]);        /* silu(0) = 0 */
+    TEST_ASSERT(s_out[2] > -0.1f && s_out[2] < 0.1f);      /* silu(0) ≈ 0 */
+    TEST_ASSERT(s_out[4] > s_out[3]);                       /* silu(2) > silu(1) */
+    TEST_ASSERT_FLOAT_WITHIN(0.01f, 1.7616f, s_out[4]);      /* silu(2) = 2/(1+e^(-2)) ≈ 1.7616 */
+}
+
 void test_activation_null_input(void) {
     const operator_registry_t* op = operator_find("sigmoid_f32");
     TEST_ASSERT_NOT_NULL(op);
@@ -54,6 +69,7 @@ int main(void) {
     UNITY_BEGIN();
     RUN_TEST(test_sigmoid_f32);
     RUN_TEST(test_gelu_f32);
+    RUN_TEST(test_silu_f32);
     RUN_TEST(test_activation_null_input);
     return UNITY_END();
 }

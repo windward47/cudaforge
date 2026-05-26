@@ -87,6 +87,10 @@ target_sources(operator PRIVATE
     src/operator/nn/reshape.c
     src/operator/nn/globalavgpool.c
     src/operator/nn/softmax.c
+    src/operator/nn/mul.c
+    src/operator/nn/concat.c
+    src/operator/nn/resize.c
+    src/operator/nn/transpose.c
     src/operator/operator_registry.c
     src/operator/operator_init.c
 )
@@ -102,6 +106,10 @@ if(ENABLE_CUDA)
         src/operator/nn/reshape_cuda.cu
         src/operator/nn/globalavgpool_cuda.cu
         src/operator/nn/softmax_cuda.cu
+        src/operator/nn/mul_cuda.cu
+        src/operator/nn/concat_cuda.cu
+        src/operator/nn/resize_cuda.cu
+        src/operator/nn/transpose_cuda.cu
         src/operator/blas/matmul_cuda.cu
     )
 endif()
@@ -298,6 +306,46 @@ if(ENABLE_TESTS)
     target_link_libraries(test_softmax PRIVATE operator platform unity)
     add_test(NAME test_softmax COMMAND test_softmax)
 
+    add_executable(test_mul
+        src/operator/nn/test/test_mul.c
+    )
+    target_include_directories(test_mul PRIVATE
+        third_party/unity/src
+        src/operator/nn
+    )
+    target_link_libraries(test_mul PRIVATE operator platform unity)
+    add_test(NAME test_mul COMMAND test_mul)
+
+    add_executable(test_concat
+        src/operator/nn/test/test_concat.c
+    )
+    target_include_directories(test_concat PRIVATE
+        third_party/unity/src
+        src/operator/nn
+    )
+    target_link_libraries(test_concat PRIVATE operator platform unity)
+    add_test(NAME test_concat COMMAND test_concat)
+
+    add_executable(test_resize
+        src/operator/nn/test/test_resize.c
+    )
+    target_include_directories(test_resize PRIVATE
+        third_party/unity/src
+        src/operator/nn
+    )
+    target_link_libraries(test_resize PRIVATE operator platform unity)
+    add_test(NAME test_resize COMMAND test_resize)
+
+    add_executable(test_transpose
+        src/operator/nn/test/test_transpose.c
+    )
+    target_include_directories(test_transpose PRIVATE
+        third_party/unity/src
+        src/operator/nn
+    )
+    target_link_libraries(test_transpose PRIVATE operator platform unity)
+    add_test(NAME test_transpose COMMAND test_transpose)
+
     add_executable(test_graph
         src/application/engine/test/test_graph.c
     )
@@ -391,6 +439,27 @@ if(ENABLE_TESTS)
     endif()
     add_test(NAME test_resnet COMMAND test_resnet)
     set_tests_properties(test_resnet PROPERTIES
+        WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+
+    add_executable(test_yolo
+        tests/test_yolo.c
+    )
+    target_include_directories(test_yolo PRIVATE
+        third_party/unity/src
+        src/application/model
+        src/application/engine
+        src/application/include
+        src/operator/include
+        src/operator/blas
+        src/operator/nn
+        src/platform/include
+    )
+    target_link_libraries(test_yolo PRIVATE onnx_model application operator platform unity)
+    if(CMAKE_C_COMPILER_ID STREQUAL "MSVC")
+        target_compile_options(test_yolo PRIVATE /wd4189 /wd4456 /wd4101)
+    endif()
+    add_test(NAME test_yolo COMMAND test_yolo)
+    set_tests_properties(test_yolo PROPERTIES
         WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
 
 endif()

@@ -23,6 +23,11 @@ typedef enum {
     OP_RESHAPE,
     OP_GLOBALAVGPOOL,
     OP_SOFTMAX,
+    OP_SILU,
+    OP_MUL,
+    OP_CONCAT,
+    OP_RESIZE,
+    OP_TRANSPOSE,
     OP_INPUT,
     OP_OUTPUT
 } op_type_t;

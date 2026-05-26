@@ -108,6 +108,11 @@ CUDA: enabled (1 device(s))
 | Reshape | `Reshape` | ✓ | — | Zero-copy shape transformation |
 | GlobalAveragePool | `GlobalAveragePool` | ✓ | ✓ | NCHW → NC×1×1 global average pooling |
 | Softmax | `Softmax` | ✓ | ✓ | Per-axis softmax for classification output |
+| SiLU | `SiLU` | ✓ | ✓ | Sigmoid Linear Unit |
+| Mul | `Mul` | ✓ | ✓ | Element-wise multiply with broadcast |
+| Concat | `Concat` | ✓ | ✓ | Channel-axis concatenation |
+| Resize | `Resize` | ✓ | ✓ | Nearest-neighbor upsampling |
+| Transpose | `Transpose` | ✓ | ✓ | N-D permutation |
 
 ## API at a Glance
 

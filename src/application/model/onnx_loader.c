@@ -9,6 +9,10 @@
 #include "reshape_int.h"
 #include "globalavgpool_int.h"
 #include "softmax_int.h"
+#include "mul_int.h"
+#include "concat_int.h"
+#include "resize_int.h"
+#include "transpose_int.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -472,6 +476,11 @@ static op_type_t map_onnx_op(const char* onnx_op) {
     if (strcmp(onnx_op, "GlobalAveragePool") == 0) return OP_GLOBALAVGPOOL;
     if (strcmp(onnx_op, "ReduceMean") == 0) return OP_GLOBALAVGPOOL;
     if (strcmp(onnx_op, "Softmax")  == 0) return OP_SOFTMAX;
+    if (strcmp(onnx_op, "SiLU")  == 0) return OP_SILU;
+    if (strcmp(onnx_op, "Mul")   == 0) return OP_MUL;
+    if (strcmp(onnx_op, "Concat") == 0) return OP_CONCAT;
+    if (strcmp(onnx_op, "Resize") == 0) return OP_RESIZE;
+    if (strcmp(onnx_op, "Transpose") == 0) return OP_TRANSPOSE;
     return (op_type_t)(-1);
 }
 
@@ -487,8 +496,8 @@ static int infer_output_shape(onnx_node_info_t* node, onnx_parsed_model_t* model
     if (!in0) return 0; /* unknown input shape — skip */
 
     /* Elementwise ops: output = input shape */
-    if (ot == OP_RELU || ot == OP_SIGMOID || ot == OP_GELU || ot == OP_BATCHNORM
-        || ot == OP_ADD || ot == OP_SOFTMAX) {
+    if (ot == OP_RELU || ot == OP_SIGMOID || ot == OP_GELU || ot == OP_SILU
+        || ot == OP_BATCHNORM || ot == OP_ADD || ot == OP_MUL || ot == OP_SOFTMAX) {
         for (int oi = 0; oi < node->num_outputs; oi++) {
             onnx_tensor_info_t* out = find_tensor(model, node->output_names[oi]);
             if (!out) out = add_tensor(model, node->output_names[oi]);
@@ -617,6 +626,84 @@ static int infer_output_shape(onnx_node_info_t* node, onnx_parsed_model_t* model
             if (out) {
                 out->ndim = ndim_out;
                 for (int d = 0; d < ndim_out; d++) out->shape[d] = out_shape[d];
+            }
+        }
+        return 0;
+    }
+
+    /* Transpose: permute dimensions */
+    if (ot == OP_TRANSPOSE) {
+        int64_t perm[8];
+        int ndim_perm = node_attr_ints(node, "perm", perm, 8);
+        int ndim = in0->ndim;
+        if (ndim_perm == 0) {
+            for (int d = 0; d < ndim; d++) perm[d] = ndim - 1 - d;
+            ndim_perm = ndim;
+        }
+        int64_t out_shape[8];
+        for (int d = 0; d < ndim_perm && d < ndim; d++)
+            out_shape[d] = in0->shape[perm[d]];
+        for (int oi = 0; oi < node->num_outputs; oi++) {
+            onnx_tensor_info_t* out = find_tensor(model, node->output_names[oi]);
+            if (!out) out = add_tensor(model, node->output_names[oi]);
+            if (out) {
+                out->ndim = ndim_perm;
+                for (int d = 0; d < ndim_perm; d++) out->shape[d] = out_shape[d];
+            }
+        }
+        return 0;
+    }
+
+    /* Concat: concatenate along axis */
+    if (ot == OP_CONCAT) {
+        int64_t axis = node_attr_int(node, "axis", 1);
+        int64_t out_shape[8];
+        int ndim_out = in0->ndim;
+        for (int d = 0; d < ndim_out; d++) out_shape[d] = in0->shape[d];
+        out_shape[axis] = 0;
+        for (int ii = 0; ii < node->num_inputs && ii < 8; ii++) {
+            if (node->input_names[ii][0] == '\0') continue;
+            onnx_tensor_info_t* in_i = find_tensor(model, node->input_names[ii]);
+            if (in_i && in_i->ndim > axis)
+                out_shape[axis] += in_i->shape[axis];
+        }
+        for (int oi = 0; oi < node->num_outputs; oi++) {
+            onnx_tensor_info_t* out = find_tensor(model, node->output_names[oi]);
+            if (!out) out = add_tensor(model, node->output_names[oi]);
+            if (out) {
+                out->ndim = ndim_out;
+                for (int d = 0; d < ndim_out; d++) out->shape[d] = out_shape[d];
+            }
+        }
+        return 0;
+    }
+
+    /* Resize: nearest-neighbor upsample */
+    if (ot == OP_RESIZE) {
+        onnx_tensor_info_t* scales_info = NULL;
+        if (node->num_inputs >= 3 && node->input_names[2][0] != '\0')
+            scales_info = find_tensor(model, node->input_names[2]);
+        if (!scales_info && node->num_inputs >= 2 && node->input_names[1][0] != '\0')
+            scales_info = find_tensor(model, node->input_names[1]);
+        float scale_h = 1.0f, scale_w = 1.0f;
+        if (scales_info && scales_info->raw_data
+            && scales_info->raw_data_size >= 4 * (int)sizeof(float)) {
+            float* s = (float*)scales_info->raw_data;
+            scale_h = s[2]; scale_w = s[3];
+        }
+        int64_t N  = in0->ndim >= 4 ? in0->shape[0] : 1;
+        int64_t C  = in0->ndim >= 4 ? in0->shape[1] : 1;
+        int64_t H  = in0->ndim >= 4 ? in0->shape[2] : 1;
+        int64_t W  = in0->ndim >= 4 ? in0->shape[3] : 1;
+        int64_t OH = (int64_t)(H * scale_h);
+        int64_t OW = (int64_t)(W * scale_w);
+        int64_t out_shape[4] = {N, C, OH, OW};
+        for (int oi = 0; oi < node->num_outputs; oi++) {
+            onnx_tensor_info_t* out = find_tensor(model, node->output_names[oi]);
+            if (!out) out = add_tensor(model, node->output_names[oi]);
+            if (out) {
+                out->ndim = 4;
+                for (int d = 0; d < 4; d++) out->shape[d] = out_shape[d];
             }
         }
         return 0;
@@ -836,6 +923,81 @@ static inference_graph_t* build_graph_from_onnx(onnx_parsed_model_t* pm) {
                 sp.num_blocks  = num_blocks;
             }
             params = &sp; params_size = sizeof(sp);
+        } else if (ot == OP_MUL) {
+            mul_params_t mp;
+            memset(&mp, 0, sizeof(mp));
+            onnx_tensor_info_t* in_a = find_tensor(pm, node->input_names[0]);
+            onnx_tensor_info_t* in_b = find_tensor(pm, node->input_names[1]);
+            if (in_a) { mp.numel = 1; for (int d = 0; d < in_a->ndim; d++) mp.numel *= in_a->shape[d]; }
+            if (in_b) { mp.B_numel = 1; for (int d = 0; d < in_b->ndim; d++) mp.B_numel *= in_b->shape[d]; }
+            params = &mp; params_size = sizeof(mp);
+        } else if (ot == OP_CONCAT) {
+            concat_params_t cp;
+            memset(&cp, 0, sizeof(cp));
+            cp.axis = (int)node_attr_int(node, "axis", 1);
+            cp.num_inputs = node->num_inputs;
+            onnx_tensor_info_t* in0c = find_tensor(pm, node->input_names[0]);
+            if (in0c && in0c->ndim >= 4) {
+                cp.H = in0c->shape[2]; cp.W = in0c->shape[3];
+            }
+            cp.C_total = 0;
+            for (int ii = 0; ii < node->num_inputs && ii < 8; ii++) {
+                onnx_tensor_info_t* in_i = find_tensor(pm, node->input_names[ii]);
+                int64_t Ci = (in_i && in_i->ndim > cp.axis) ? in_i->shape[cp.axis] : 1;
+                cp.C_offset[ii] = cp.C_total;
+                cp.C_per_input[ii] = Ci;
+                cp.C_total += Ci;
+            }
+            onnx_tensor_info_t* out_tc = find_tensor(pm, node->output_names[0]);
+            if (out_tc) {
+                cp.total_numel = 1;
+                for (int d = 0; d < out_tc->ndim; d++) cp.total_numel *= out_tc->shape[d];
+            }
+            params = &cp; params_size = sizeof(cp);
+        } else if (ot == OP_RESIZE) {
+            resize_params_t rp;
+            memset(&rp, 0, sizeof(rp));
+            onnx_tensor_info_t* in_tr = find_tensor(pm, node->input_names[0]);
+            if (in_tr && in_tr->ndim >= 4) {
+                rp.N = in_tr->shape[0]; rp.C = in_tr->shape[1];
+                rp.H_in = in_tr->shape[2]; rp.W_in = in_tr->shape[3];
+            }
+            onnx_tensor_info_t* scales_info = NULL;
+            if (node->num_inputs >= 3 && node->input_names[2][0] != '\0')
+                scales_info = find_tensor(pm, node->input_names[2]);
+            if (!scales_info && node->num_inputs >= 2 && node->input_names[1][0] != '\0')
+                scales_info = find_tensor(pm, node->input_names[1]);
+            rp.scale_h = 1.0f; rp.scale_w = 1.0f;
+            if (scales_info && scales_info->raw_data
+                && scales_info->raw_data_size >= 4 * (int)sizeof(float)) {
+                float* s = (float*)scales_info->raw_data;
+                rp.scale_h = s[2]; rp.scale_w = s[3];
+            }
+            onnx_tensor_info_t* out_tr = find_tensor(pm, node->output_names[0]);
+            if (out_tr && out_tr->ndim >= 4) {
+                rp.H_out = out_tr->shape[2]; rp.W_out = out_tr->shape[3];
+            }
+            params = &rp; params_size = sizeof(rp);
+        } else if (ot == OP_TRANSPOSE) {
+            transpose_params_t tp;
+            memset(&tp, 0, sizeof(tp));
+            onnx_tensor_info_t* in_tt = find_tensor(pm, node->input_names[0]);
+            if (in_tt) {
+                tp.ndim = in_tt->ndim;
+                for (int d = 0; d < in_tt->ndim && d < 8; d++)
+                    tp.shape[d] = in_tt->shape[d];
+            }
+            int nperm = node_attr_ints(node, "perm", tp.perm, 8);
+            if (nperm == 0) {
+                for (int d = 0; d < tp.ndim; d++)
+                    tp.perm[d] = tp.ndim - 1 - d;
+            }
+            onnx_tensor_info_t* out_tt = find_tensor(pm, node->output_names[0]);
+            if (out_tt) {
+                for (int d = 0; d < out_tt->ndim && d < 8; d++)
+                    tp.out_shape[d] = out_tt->shape[d];
+            }
+            params = &tp; params_size = sizeof(tp);
         }
 
         /* Add the node. Data inputs exclude weight initializers; weights are passed separately. */
@@ -843,7 +1005,7 @@ static inference_graph_t* build_graph_from_onnx(onnx_parsed_model_t* pm) {
                                   num_weights, weights, params, params_size);
 
         /* For activations with no params, mark the node correctly */
-        if (ot == OP_RELU || ot == OP_SIGMOID || ot == OP_GELU) {
+        if (ot == OP_RELU || ot == OP_SIGMOID || ot == OP_GELU || ot == OP_SILU) {
             /* Only input[0] is a data input; num_in should be 1 */
             /* The graph_add_node already has correct num_in */
             (void)nid;
