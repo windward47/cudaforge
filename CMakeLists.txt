@@ -99,6 +99,7 @@ if(ENABLE_CUDA)
         src/operator/nn/pooling_cuda.cu
         src/operator/nn/batchnorm_cuda.cu
         src/operator/nn/add_cuda.cu
+        src/operator/nn/reshape_cuda.cu
         src/operator/nn/globalavgpool_cuda.cu
         src/operator/nn/softmax_cuda.cu
         src/operator/blas/matmul_cuda.cu
@@ -207,6 +208,34 @@ if(ENABLE_TESTS)
     )
     target_link_libraries(test_conv PRIVATE operator platform unity)
     add_test(NAME test_conv COMMAND test_conv)
+
+    if(ENABLE_CUDA)
+    add_executable(test_conv_scale tests/test_conv_scale.c)
+    target_include_directories(test_conv_scale PRIVATE
+        third_party/unity/src
+        src/operator/nn
+        src/operator/blas
+        src/operator/include
+        src/platform/include
+        src/platform/cuda
+    )
+    target_link_libraries(test_conv_scale PRIVATE operator platform)
+    target_compile_definitions(test_conv_scale PRIVATE USE_CUDA)
+    add_test(NAME test_conv_scale COMMAND test_conv_scale)
+
+    add_executable(test_ops_scale tests/test_ops_scale.c)
+    target_include_directories(test_ops_scale PRIVATE
+        third_party/unity/src
+        src/operator/nn
+        src/operator/blas
+        src/operator/include
+        src/platform/include
+        src/platform/cuda
+    )
+    target_link_libraries(test_ops_scale PRIVATE operator platform)
+    target_compile_definitions(test_ops_scale PRIVATE USE_CUDA)
+    add_test(NAME test_ops_scale COMMAND test_ops_scale)
+    endif()
 
     add_executable(test_activations
         src/operator/nn/test/test_activations.c
@@ -341,6 +370,27 @@ if(ENABLE_TESTS)
     endif()
     add_test(NAME test_classification COMMAND test_classification)
     set_tests_properties(test_classification PROPERTIES
+        WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+
+    add_executable(test_resnet
+        tests/test_resnet.c
+    )
+    target_include_directories(test_resnet PRIVATE
+        third_party/unity/src
+        src/application/model
+        src/application/engine
+        src/application/include
+        src/operator/include
+        src/operator/blas
+        src/operator/nn
+        src/platform/include
+    )
+    target_link_libraries(test_resnet PRIVATE onnx_model application operator platform unity)
+    if(CMAKE_C_COMPILER_ID STREQUAL "MSVC")
+        target_compile_options(test_resnet PRIVATE /wd4189 /wd4456 /wd4101)
+    endif()
+    add_test(NAME test_resnet COMMAND test_resnet)
+    set_tests_properties(test_resnet PROPERTIES
         WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
 
 endif()

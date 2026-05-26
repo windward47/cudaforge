@@ -46,7 +46,7 @@ static void bench_matmul(int M, int N, int K) {
     /* --- CPU --- */
     const operator_registry_t* cpu_op = operator_find("matmul_f32");
     {
-        const void* inputs[]  = {h_A, h_B};
+        const void* inputs[]  = {h_A, h_B, NULL};
         void*       outputs[] = {h_C};
         for (int w = 0; w < WARMUP; w++)
             cpu_op->func(inputs, outputs, (const operator_params_t*)&p, NULL);
@@ -60,7 +60,7 @@ static void bench_matmul(int M, int N, int K) {
     /* --- CUDA --- */
     const operator_registry_t* cuda_op = operator_find("matmul_f32_cuda");
     if (cuda_op) {
-        const void* inputs[]  = {d_A, d_B};
+        const void* inputs[]  = {d_A, d_B, NULL};
         void*       outputs[] = {d_C};
         for (int w = 0; w < WARMUP; w++) {
             cuda_op->func(inputs, outputs, (const operator_params_t*)&p, NULL);
@@ -108,7 +108,7 @@ static void bench_conv2d(int H, int W, int C, int K, int KH, int KW) {
     /* --- CPU --- */
     const operator_registry_t* cpu_op = operator_find("conv2d_f32");
     {
-        const void* inputs[]  = {h_in, h_w};
+        const void* inputs[]  = {h_in, h_w, NULL};
         void*       outputs[] = {h_out};
         for (int w = 0; w < WARMUP; w++)
             cpu_op->func(inputs, outputs, (const operator_params_t*)&cp, NULL);
@@ -123,7 +123,7 @@ static void bench_conv2d(int H, int W, int C, int K, int KH, int KW) {
     /* --- CUDA --- */
     const operator_registry_t* cuda_op = operator_find("conv2d_f32_cuda");
     if (cuda_op) {
-        const void* inputs[]  = {d_in, d_w};
+        const void* inputs[]  = {d_in, d_w, NULL};
         void*       outputs[] = {d_out};
         for (int w = 0; w < WARMUP; w++) {
             cuda_op->func(inputs, outputs, (const operator_params_t*)&cp, NULL);

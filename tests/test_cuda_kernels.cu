@@ -53,7 +53,7 @@ void test_matmul_f32_cuda(void) {
     if (g_cuda.memcpy_h2d(d_A, h_A, M*K*sizeof(float), 0) != 0) TEST_FAIL();
     if (g_cuda.memcpy_h2d(d_B, h_B, K*N*sizeof(float), 0) != 0) TEST_FAIL();
     matmul_params_t p = {.M = M, .N = N, .K = K};
-    const void* inputs[]  = {d_A, d_B};
+    const void* inputs[]  = {d_A, d_B, NULL};
     void*       outputs[] = {d_C};
     if (op->func(inputs, outputs, (const operator_params_t*)&p, NULL) != 0) TEST_FAIL();
     if (g_cuda.memcpy_d2h(h_C, d_C, M*N*sizeof(float), 0) != 0) TEST_FAIL();
@@ -75,7 +75,7 @@ void test_conv2d_f32_cuda(void) {
     float cpu_out[4]={0}, gpu_out[4]={0};
 
     conv_params_t cp={.N=N,.C=C,.H=H,.W=W,.K=K,.kernel_h=KH,.kernel_w=KW,.stride_h=1,.stride_w=1,.dilation_h=1,.dilation_w=1};
-    const void* cpu_inputs[]={h_in,h_w}; void* cpu_outputs[]={cpu_out};
+    const void* cpu_inputs[]={h_in,h_w,NULL}; void* cpu_outputs[]={cpu_out};
     if (cpu_op->func(cpu_inputs,cpu_outputs,(const operator_params_t*)&cp,NULL) != 0) TEST_FAIL();
     printf("  conv CPU: [%.1f %.1f %.1f %.1f]\n", cpu_out[0],cpu_out[1],cpu_out[2],cpu_out[3]);
 
@@ -90,7 +90,7 @@ void test_conv2d_f32_cuda(void) {
     if (g_cuda.memcpy_h2d(d_in, h_in, C*H*W*sizeof(float), 0) != 0) TEST_FAIL();
     if (g_cuda.memcpy_h2d(d_w, h_w, K*C*KH*KW*sizeof(float), 0) != 0) TEST_FAIL();
 
-    const void* cuda_inputs[]={d_in,d_w}; void* cuda_outputs[]={d_out};
+    const void* cuda_inputs[]={d_in,d_w,NULL}; void* cuda_outputs[]={d_out};
     if (cuda_op->func(cuda_inputs,cuda_outputs,(const operator_params_t*)&cp,NULL) != 0) TEST_FAIL();
     if (g_cuda.memcpy_d2h(gpu_out, d_out, K*OH*OW*sizeof(float), 0) != 0) TEST_FAIL();
     if (g_cuda.stream_synchronize(0) != 0) TEST_FAIL();

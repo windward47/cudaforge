@@ -41,7 +41,7 @@ void test_conv2d_f32_basic(void) {
         .groups = 1,
     };
 
-    const void* inputs[]  = {s_input, s_weight};
+    const void* inputs[]  = {s_input, s_weight, NULL};
     void*       outputs[] = {s_output};
 
     const operator_registry_t* op = operator_find("conv2d_f32");

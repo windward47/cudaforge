@@ -44,6 +44,7 @@ enum {
     F_TensorProto_data_type     = 2,
     F_TensorProto_float_data    = 6,
     F_TensorProto_raw_data      = 9,
+    F_TensorProto_external_data = 13,
     F_ValueInfoProto_name       = 1,
     F_ValueInfoProto_type       = 5,
     F_TypeProto_tensor_type     = 1,
@@ -84,6 +85,9 @@ typedef struct {
     pb_field_t* attributes[16];
     int      num_attributes;
 } onnx_node_info_t;
+
+/* File-static: model file directory for resolving external data paths */
+static char g_model_dir[512] = "";
 
 /* ============================================================
  * Internal: parsed ONNX model before graph construction
@@ -198,6 +202,74 @@ static int parse_tensor_proto(pb_message_t* msg, onnx_tensor_info_t* info) {
                                   (float*)info->raw_data, (int)nf, &fc);
             info->raw_data_size = (size_t)fc * sizeof(float);
         }
+        return 0;
+    }
+
+    /* external_data: repeated StringStringEntryProto (field 13).
+       Each entry has key (field 1) and value (field 2).
+       Typically: key="location"→filename, key="offset"→byte_offset,
+       key="length"→byte_length. */
+    {
+        pb_field_t** ed_fields = NULL;
+        int ed_count = 0;
+        pb_find_all_fields(msg, F_TensorProto_external_data, &ed_fields, &ed_count);
+        if (ed_count > 0) {
+            char location[256] = "";
+            int64_t offset = 0;
+            int64_t length = 0;
+
+            for (int ei = 0; ei < ed_count; ei++) {
+                pb_message_t* entry = pb_field_as_message(ed_fields[ei], 2);
+                if (entry) {
+                    size_t klen = 0, vlen = 0;
+                    const uint8_t* key = pb_field_get_string(entry, 1, &klen);
+                    const uint8_t* val = pb_field_get_string(entry, 2, &vlen);
+                    if (key && val && klen > 0 && vlen > 0) {
+                        if (klen == 8 && memcmp(key, "location", 8) == 0) {
+                            int cp = (int)(vlen < sizeof(location)-1 ? vlen : sizeof(location)-1);
+                            memcpy(location, val, cp);
+                            location[cp] = '\0';
+                        } else if (klen == 6 && memcmp(key, "offset", 6) == 0) {
+                            char buf[32];
+                            int n = (int)(vlen < sizeof(buf)-1 ? vlen : sizeof(buf)-1);
+                            memcpy(buf, val, n); buf[n] = '\0';
+                            offset = strtoll(buf, NULL, 10);
+                        } else if (klen == 6 && memcmp(key, "length", 6) == 0) {
+                            char buf[32];
+                            int n = (int)(vlen < sizeof(buf)-1 ? vlen : sizeof(buf)-1);
+                            memcpy(buf, val, n); buf[n] = '\0';
+                            length = strtoll(buf, NULL, 10);
+                        }
+                    }
+                    pb_message_destroy(entry);
+                }
+            }
+
+            if (location[0] && length > 0) {
+                char full_path[512];
+                int n = snprintf(full_path, sizeof(full_path), "%s%s",
+                                 g_model_dir, location);
+                if (n > 0 && n < (int)sizeof(full_path)) {
+                    FILE* ext = fopen(full_path, "rb");
+                    if (ext) {
+                        if (fseek(ext, (long)offset, SEEK_SET) == 0) {
+                            info->raw_data = (uint8_t*)malloc((size_t)length);
+                            if (info->raw_data) {
+                                size_t r = fread(info->raw_data, 1, (size_t)length, ext);
+                                if (r == (size_t)length) {
+                                    info->raw_data_size = (size_t)length;
+                                } else {
+                                    free(info->raw_data);
+                                    info->raw_data = NULL;
+                                }
+                            }
+                        }
+                        fclose(ext);
+                    }
+                }
+            }
+        }
+        free(ed_fields);
     }
     return 0;
 }
@@ -398,6 +470,7 @@ static op_type_t map_onnx_op(const char* onnx_op) {
     if (strcmp(onnx_op, "Add")     == 0) return OP_ADD;
     if (strcmp(onnx_op, "Reshape") == 0) return OP_RESHAPE;
     if (strcmp(onnx_op, "GlobalAveragePool") == 0) return OP_GLOBALAVGPOOL;
+    if (strcmp(onnx_op, "ReduceMean") == 0) return OP_GLOBALAVGPOOL;
     if (strcmp(onnx_op, "Softmax")  == 0) return OP_SOFTMAX;
     return (op_type_t)(-1);
 }
@@ -792,6 +865,24 @@ static inference_graph_t* build_graph_from_onnx(onnx_parsed_model_t* pm) {
  * ============================================================ */
 onnx_model_t* onnx_load_from_file(const char* path) {
     if (!path) return NULL;
+
+    /* Extract model directory for resolving external data paths */
+    {
+        const char* last_sep = NULL;
+        const char* p = path;
+        while (*p) {
+            if (*p == '/' || *p == '\\') last_sep = p;
+            p++;
+        }
+        if (last_sep) {
+            size_t dir_len = (size_t)(last_sep - path + 1);
+            if (dir_len >= sizeof(g_model_dir)) dir_len = sizeof(g_model_dir) - 1;
+            memcpy(g_model_dir, path, dir_len);
+            g_model_dir[dir_len] = '\0';
+        } else {
+            g_model_dir[0] = '\0';
+        }
+    }
 
     /* Read entire file */
     FILE* fp = fopen(path, "rb");

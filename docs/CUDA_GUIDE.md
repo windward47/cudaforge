@@ -171,6 +171,31 @@ __global__ void matmul_f16_tc(const half* A, const half* B, float* C,
 }
 ```
 
+### Level 4: Kernel Fusion（算子融合）
+
+适用场景：Conv/MatMul → ReLU/Sigmoid/GELU 连续模式，消除中间张量的显存往返。
+
+**实现方式**: 在 conv/matmul kernel 末尾内联激活函数，避免单独的激活 kernel launch 和中间结果的 global memory 读写。
+
+```cuda
+/* conv kernel 末尾 — 融合激活 */
+float sum = ...;  /* conv 累加结果 */
+
+/* 1. 先加 bias（如果融合了） */
+if (bias) sum += bias[k];
+
+/* 2. 再应用激活函数 */
+if (fuse_activation == 1) {
+    sum = sum > 0.0f ? sum : 0.0f;  /* ReLU */
+} else if (fuse_activation == 2) {
+    sum = 1.0f / (1.0f + expf(-sum));  /* Sigmoid */
+}
+```
+
+**关键注意**：bias 必须在激活函数**之前**应用。错误顺序 `ReLU(conv(x)) + bias` 与正确顺序 `ReLU(conv(x) + bias)` 的语义完全不同。当 bias ≠ 0 时，错误顺序产生静默的数值错误。
+
+**Application 层配合**: `graph_execute` 的 fusion pre-pass 检测拓扑序相邻的 Conv→ReLU 模式，设置 `fuse_activation` 标记并跳过被融合的激活节点。输出张量通过 `effective_output_tids` 重定向到激活节点的输出，保证下游消费者拿到后激活结果。
+
 ---
 
 ## 3. 性能 checklist

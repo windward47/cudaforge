@@ -59,7 +59,7 @@ static int conv2d_im2col(const float* in, const float* w, float* out,
     dim3 grid((unsigned int)((total + 255) / 256), 1, 1);
 
     matmul_params_t mp = {.M = K, .N = col_cols, .K = col_rows};
-    const void* mat_inputs[]  = {w, col_buf};
+    const void* mat_inputs[]  = {w, col_buf, NULL};
     void*       mat_outputs[] = {NULL};
 
     for (int64_t n = 0; n < N; n++) {
@@ -95,6 +95,7 @@ static int conv2d_im2col(const float* in, const float* w, float* out,
 __global__ void conv2d_f32_direct_kernel(
     const float* __restrict__ input,
     const float* __restrict__ weight,
+    const float* __restrict__ bias,
     float* __restrict__ output,
     int64_t C, int64_t H, int64_t W,
     int64_t K, int64_t KH, int64_t KW,
@@ -132,6 +133,9 @@ __global__ void conv2d_f32_direct_kernel(
         }
     }
 
+    /* Bias must be added BEFORE activation */
+    if (bias) sum += bias[k];
+
     /* Inline activation (kernel fusion) */
     if (fuse_activation == 1) {
         sum = sum > 0.0f ? sum : 0.0f;                       /* ReLU */
@@ -153,6 +157,7 @@ __global__ void conv2d_f32_direct_kernel(
 __global__ void conv2d_f32_direct_smem_kernel(
     const float* __restrict__ input,
     const float* __restrict__ weight,
+    const float* __restrict__ bias,
     float* __restrict__ output,
     int64_t C, int64_t H, int64_t W,
     int64_t K, int64_t KH, int64_t KW,
@@ -223,6 +228,9 @@ __global__ void conv2d_f32_direct_smem_kernel(
     }
 
     if (valid_out) {
+        /* Bias must be added BEFORE activation */
+        if (bias) sum += bias[k];
+
         /* Inline activation (kernel fusion) */
         if (fuse_activation == 1) {
             sum = sum > 0.0f ? sum : 0.0f;                       /* ReLU */
@@ -239,6 +247,19 @@ __global__ void conv2d_f32_direct_smem_kernel(
 /* ============================================================
  * Dispatch: chooses direct kernel or im2col fallback
  * ============================================================ */
+/* Bias addition kernel: out[n,k,oh,ow] += bias[k] */
+__global__ void conv_bias_add_kernel(float* out, const float* bias,
+                                      int64_t N, int64_t K, int64_t OH, int64_t OW) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int64_t total = N * K * OH * OW;
+    if (idx >= total) return;
+    /* Unpack flat index: n*K*OH*OW + k*OH*OW + oh*OW + ow */
+    int64_t nk = idx / (OH * OW);
+    int k = (int)(nk % K);
+    float bv = bias[k];
+    out[idx] += bv;
+}
+
 int conv2d_f32_cuda(const void* inputs[], void* outputs[],
                     const operator_params_t* params, stream_t* stream) {
     if (!inputs || !inputs[0] || !inputs[1] || !outputs || !outputs[0])
@@ -246,9 +267,10 @@ int conv2d_f32_cuda(const void* inputs[], void* outputs[],
     if (!params) return -1;
 
     const conv_params_t* p = (const conv_params_t*)params;
-    const float* in  = (const float*)inputs[0];
-    const float* w   = (const float*)inputs[1];
-    float* out       = (float*)outputs[0];
+    const float* in   = (const float*)inputs[0];
+    const float* w    = (const float*)inputs[1];
+    const float* bias = (const float*)inputs[2];
+    float* out        = (float*)outputs[0];
 
     int64_t N = p->N, C = p->C, H = p->H, W = p->W, K = p->K;
     int64_t KH = p->kernel_h, KW = p->kernel_w;
@@ -262,37 +284,25 @@ int conv2d_f32_cuda(const void* inputs[], void* outputs[],
               (unsigned int)((OH + CONV_DIRECT_TILE_H - 1) / CONV_DIRECT_TILE_H),
               (unsigned int)(N * K));
 
-    /* Query max shared memory once (cached across calls) */
-    static int s_max_smem_bytes = 0;
-    if (s_max_smem_bytes == 0) {
-        int val = 0;
-        cudaError_t err = cudaDeviceGetAttribute(&val,
-            cudaDevAttrMaxSharedMemoryPerBlock, 0);
-        s_max_smem_bytes = (err == cudaSuccess && val > 0) ? val : 49152; /* 48KB default */
-    }
+    /* When fusing activation, pass bias to kernel for inline bias+activation.
+     * Otherwise, leave bias for the separate bias-add kernel below. */
+    CUDA_KERNEL_LAUNCH(conv2d_f32_direct_kernel, grid, block, 0, s,
+                       in, w,
+                       p->fuse_activation ? bias : NULL,
+                       out, C, H, W, K, KH, KW,
+                       OH, OW,
+                       p->stride_h, p->stride_w,
+                       p->pad_h, p->pad_w,
+                       p->dilation_h, p->dilation_w,
+                       p->fuse_activation);
 
-    /* Use shared-memory direct kernel when input window fits */
-    int win_h = (CONV_DIRECT_TILE_H - 1) * p->stride_h + (KH - 1) * p->dilation_h + 1;
-    int win_w = (CONV_DIRECT_TILE_W - 1) * p->stride_w + (KW - 1) * p->dilation_w + 1;
-    size_t smem_bytes = (size_t)win_h * win_w * sizeof(float);
-
-    if ((int)smem_bytes <= s_max_smem_bytes) {
-        CUDA_KERNEL_LAUNCH(conv2d_f32_direct_smem_kernel, grid, block, smem_bytes, s,
-                           in, w, out, C, H, W, K, KH, KW,
-                           OH, OW,
-                           p->stride_h, p->stride_w,
-                           p->pad_h, p->pad_w,
-                           p->dilation_h, p->dilation_w,
-                           p->fuse_activation);
-    } else {
-        /* Direct kernel without shared memory — still avoids im2col buffer */
-        CUDA_KERNEL_LAUNCH(conv2d_f32_direct_kernel, grid, block, 0, s,
-                           in, w, out, C, H, W, K, KH, KW,
-                           OH, OW,
-                           p->stride_h, p->stride_w,
-                           p->pad_h, p->pad_w,
-                           p->dilation_h, p->dilation_w,
-                           p->fuse_activation);
+    /* Add bias separately only when NOT already fused into conv kernel */
+    if (bias && p->fuse_activation == 0) {
+        int64_t total = N * K * OH * OW;
+        int block_sz = 256;
+        int grid_sz = (int)((total + block_sz - 1) / block_sz);
+        CUDA_KERNEL_LAUNCH(conv_bias_add_kernel, grid_sz, block_sz, 0, s,
+                           out, bias, N, K, OH, OW);
     }
     return 0;
 }

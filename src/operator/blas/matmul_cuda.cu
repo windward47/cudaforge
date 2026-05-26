@@ -4,6 +4,20 @@
 #include <mma.h>
 
 /* ============================================================
+ * Transpose kernel — used when transpose_a / transpose_b is set.
+ * dst[M][N] = src[N][M]  (row-major)
+ * ============================================================ */
+__global__ void transpose_f32_kernel(const float* src, float* dst,
+                                     int64_t src_rows, int64_t src_cols) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int64_t total = src_rows * src_cols;
+    if (idx >= total) return;
+    int64_t r = idx / src_cols;
+    int64_t c = idx % src_cols;
+    dst[c * src_rows + r] = src[idx];
+}
+
+/* ============================================================
  * Naive: each thread computes one output element
  * ============================================================ */
 __global__ void matmul_f32_naive(const float* A, const float* B, float* C,
@@ -197,6 +211,16 @@ __global__ void matmul_f32_tc_kernel(const float* __restrict__ A,
  * The 32×32 warp kernel uses +1 padding on shared memory columns to
  * avoid bank conflicts between consecutive rows.
  * ============================================================ */
+/* Bias addition kernel: C[i*N + j] += bias[j] for all rows i */
+__global__ void matmul_bias_add_kernel(float* C, const float* bias,
+                                        int64_t M, int64_t N) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int64_t total = M * N;
+    if (idx >= total) return;
+    int j = (int)(idx % N);
+    C[idx] += bias[j];
+}
+
 int matmul_f32_cuda(const void* inputs[], void* outputs[],
                     const operator_params_t* params, stream_t* stream) {
     if (!inputs || !inputs[0] || !inputs[1] || !outputs || !outputs[0])
@@ -204,17 +228,46 @@ int matmul_f32_cuda(const void* inputs[], void* outputs[],
     if (!params) return -1;
 
     const matmul_params_t* p = (const matmul_params_t*)params;
-    const float* A = (const float*)inputs[0];
-    const float* B = (const float*)inputs[1];
-    float* C       = (float*)outputs[0];
+    const float* A    = (const float*)inputs[0];
+    const float* B    = (const float*)inputs[1];
+    const float* bias = (const float*)inputs[2];
+    float* C          = (float*)outputs[0];
 
     cudaStream_t s = stream ? (cudaStream_t)stream->cuda_stream : 0;
 
     int64_t M = p->M, N = p->N, K = p->K;
-    dim3 block, grid;
+    float* A_trans = NULL;
+    float* B_trans = NULL;
+    dim3 block(1, 1, 1), grid(1, 1, 1);
+    int ret = 0;
+
+    /* Transpose A if needed (A is K×M, need M×K for standard kernel) */
+    if (p->transpose_a) {
+        size_t bytes = (size_t)M * K * sizeof(float);
+        A_trans = (float*)g_cuda.device_alloc(bytes);
+        if (!A_trans) { ret = -1; goto matmul_cleanup; }
+        int64_t total = M * K;
+        dim3 tb(256, 1, 1);
+        dim3 tg((unsigned int)((total + 255) / 256), 1, 1);
+        CUDA_KERNEL_LAUNCH(transpose_f32_kernel, tg, tb, 0, s,
+                           A, A_trans, K, M);
+        A = A_trans;
+    }
+
+    /* Transpose B if needed (B is N×K, need K×N for standard kernel) */
+    if (p->transpose_b) {
+        size_t bytes = (size_t)K * N * sizeof(float);
+        B_trans = (float*)g_cuda.device_alloc(bytes);
+        if (!B_trans) { ret = -1; goto matmul_cleanup; }
+        int64_t total = K * N;
+        dim3 tb(256, 1, 1);
+        dim3 tg((unsigned int)((total + 255) / 256), 1, 1);
+        CUDA_KERNEL_LAUNCH(transpose_f32_kernel, tg, tb, 0, s,
+                           B, B_trans, N, K);
+        B = B_trans;
+    }
 
     if (M <= 32 && N <= 32) {
-        /* Tiny matrices: single-thread-per-output, no shared memory overhead */
         block = dim3(16, 16, 1);
         grid  = dim3((unsigned int)((N + 15) / 16),
                      (unsigned int)((M + 15) / 16), 1);
@@ -222,10 +275,7 @@ int matmul_f32_cuda(const void* inputs[], void* outputs[],
                            A, B, C, M, N, K);
     } else if (M >= 512 && N >= 512 && K >= 512
                && M % TC_TILE == 0 && N % TC_TILE == 0) {
-        /* Tensor Core path: FP16→FP32 MMA for large, aligned matrices.
-         * Requires M and N to be multiples of 16 so wmma::store_matrix_sync
-         * never writes out of bounds. */
-        block = dim3(32, 1, 1);  /* 1 warp = 32 threads */
+        block = dim3(32, 1, 1);
         grid  = dim3((unsigned int)((N + TC_TILE - 1) / TC_TILE),
                      (unsigned int)((M + TC_TILE - 1) / TC_TILE), 1);
         CUDA_KERNEL_LAUNCH(matmul_f32_tc_kernel, grid, block, 0, s,
@@ -243,7 +293,20 @@ int matmul_f32_cuda(const void* inputs[], void* outputs[],
         CUDA_KERNEL_LAUNCH(matmul_f32_tiled, grid, block, 0, s,
                            A, B, C, M, N, K);
     }
-    return 0;
+
+    /* Add bias if present */
+    if (bias) {
+        int64_t total = M * N;
+        int block_sz = 256;
+        int grid_sz = (int)((total + block_sz - 1) / block_sz);
+        CUDA_KERNEL_LAUNCH(matmul_bias_add_kernel, grid_sz, block_sz, 0, s,
+                           C, bias, M, N);
+    }
+
+matmul_cleanup:
+    if (A_trans) g_cuda.device_free(A_trans);
+    if (B_trans) g_cuda.device_free(B_trans);
+    return ret;
 }
 
 extern "C" int register_matmul_f32_cuda(void) {

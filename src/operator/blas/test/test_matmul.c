@@ -26,7 +26,7 @@ void tearDown(void) {}
 void test_matmul_f32_basic(void) {
     matmul_params_t p = {.M = TEST_M, .N = TEST_N, .K = TEST_K};
 
-    const void* inputs[]  = {s_A, s_B};
+    const void* inputs[]  = {s_A, s_B, NULL};
     void*       outputs[] = {s_C};
 
     const operator_registry_t* op = operator_find("matmul_f32");
@@ -45,7 +45,7 @@ void test_matmul_f32_1x1(void) {
     float a = 2.0f, b = 3.0f, c = 0.0f;
     matmul_params_t p = {.M = 1, .N = 1, .K = 1};
 
-    const void* inputs[]  = {&a, &b};
+    const void* inputs[]  = {&a, &b, NULL};
     void*       outputs[] = {&c};
 
     const operator_registry_t* op = operator_find("matmul_f32");

@@ -18,9 +18,10 @@ int matmul_f32(const void* inputs[], void* outputs[],
 
     const matmul_params_t* p = (const matmul_params_t*)params;
 
-    const float* A = (const float*)inputs[0];
-    const float* B = (const float*)inputs[1];
-    float* C       = (float*)outputs[0];
+    const float* A    = (const float*)inputs[0];
+    const float* B    = (const float*)inputs[1];
+    const float* bias = (const float*)inputs[2];
+    float* C          = (float*)outputs[0];
 
     int64_t M = p->M, N = p->N, K = p->K;
 
@@ -33,7 +34,7 @@ int matmul_f32(const void* inputs[], void* outputs[],
                 float b = p->transpose_b ? B[j * K + k] : B[k * N + j];
                 sum += a * b;
             }
-            C[i * N + j] = sum;
+            C[i * N + j] = sum + (bias ? bias[j] : 0.0f);
         }
     }
     return 0;

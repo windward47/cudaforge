@@ -21,6 +21,7 @@ int register_batchnorm_f32_cuda(void);
 int register_add_f32_cuda(void);
 int register_globalavgpool_f32_cuda(void);
 int register_softmax_f32_cuda(void);
+int register_reshape_f32_cuda(void);
 
 int operator_init_all(void) {
     int ret = 0;
@@ -43,5 +44,6 @@ int operator_init_all(void) {
     ret += register_add_f32_cuda();
     ret += register_globalavgpool_f32_cuda();
     ret += register_softmax_f32_cuda();
+    ret += register_reshape_f32_cuda();
     return ret;
 }

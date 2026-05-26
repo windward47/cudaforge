@@ -3,6 +3,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#include <math.h>
 
 #ifdef USE_CUDA
 #include "cuda_ops.h"
@@ -152,14 +153,21 @@ int graph_build(inference_graph_t* g) {
         int node = queue[head++];
         order[ordered++] = node;
 
-        /* Decrement in-degree of successors */
+        /* Decrement in-degree of all nodes that consume this node's output tensors.
+           Scan all nodes because a tensor can have multiple consumers (e.g. residual
+           skip connections in ResNet). */
         for (int j = 0; j < g->nodes[node].num_outputs; j++) {
             int tid = g->nodes[node].output_tensors[j];
             if (tid >= 0 && tid < g->num_tensors) {
-                int cons = g->tensors[tid].consumer;
-                if (cons >= 0 && cons < g->num_nodes) {
-                    in_degree[cons]--;
-                    if (in_degree[cons] == 0) queue[tail++] = cons;
+                for (int k = 0; k < g->num_nodes; k++) {
+                    if (in_degree[k] <= 0) continue;
+                    for (int l = 0; l < g->nodes[k].num_inputs; l++) {
+                        if (g->nodes[k].input_tensors[l] == tid) {
+                            in_degree[k]--;
+                            if (in_degree[k] == 0) queue[tail++] = k;
+                            break; /* node found; no need to check remaining inputs */
+                        }
+                    }
                 }
             }
         }
@@ -261,7 +269,6 @@ int graph_execute(inference_graph_t* g, tensor_t* inputs[],
                 graph_node_t* n = &g->nodes[nid];
                 graph_node_t* next_n = &g->nodes[next_nid];
 
-                /* Check for Conv/MatMul followed by element-wise activation */
                 if ((n->type == OP_CONV2D || n->type == OP_MATMUL)
                     && next_n->num_inputs == 1
                     && n->num_outputs == 1
@@ -270,11 +277,10 @@ int graph_execute(inference_graph_t* g, tensor_t* inputs[],
                         || next_n->type == OP_SIGMOID
                         || next_n->type == OP_GELU)) {
 
-                    /* Set fuse_activation on the compute node's params */
                     if (n->type == OP_CONV2D && n->params
                         && n->params_size >= sizeof(conv_params_t)) {
                         conv_params_t* cp = (conv_params_t*)n->params;
-                        cp->fuse_activation = (int64_t)next_n->type;
+                        cp->fuse_activation = (int64_t)(next_n->type + 1);
                         fused_skip[next_nid] = 1;
                         fused_count++;
                     }
@@ -289,7 +295,9 @@ int graph_execute(inference_graph_t* g, tensor_t* inputs[],
         graph_node_t* n = &g->nodes[node_id];
 
         /* Skip fused activation nodes */
-        if (fused_skip && fused_skip[node_id]) continue;
+        if (fused_skip && fused_skip[node_id]) {
+            continue;
+        }
 
         /* Input: copy tensor data from earlier node outputs */
         if (n->type == OP_INPUT) continue;
@@ -321,6 +329,8 @@ int graph_execute(inference_graph_t* g, tensor_t* inputs[],
         int max_input_idx = total_inputs > 0 ? total_inputs - 1 : 0;
         if (n->type == OP_RELU || n->type == OP_SIGMOID || n->type == OP_GELU)
             if (max_input_idx < 1) max_input_idx = 1;
+        if (n->type == OP_CONV2D || n->type == OP_MATMUL)
+            if (max_input_idx < 2) max_input_idx = 2;  /* reserve for optional bias */
         if (n->type == OP_BATCHNORM)
             if (max_input_idx < 5) max_input_idx = 5;
         int input_slots = max_input_idx + 1;
@@ -347,6 +357,10 @@ int graph_execute(inference_graph_t* g, tensor_t* inputs[],
                 op_inputs[n->num_inputs + w] = n->weights[w]->data;
             else
                 op_inputs[n->num_inputs + w] = NULL;
+        }
+        /* NULL-fill any remaining input slots (e.g. reserved bias slot for Conv/Gemm) */
+        for (int i = n->num_inputs + n->num_weights; i < input_slots; i++) {
+            op_inputs[i] = NULL;
         }
 
         /* Effective output tensor IDs: for fused Conv/MatMul nodes,
@@ -429,9 +443,12 @@ int graph_execute(inference_graph_t* g, tensor_t* inputs[],
         ret = op->func(op_inputs, op_outputs,
                        (const operator_params_t*)n->params,
                        use_cuda ? &stream : NULL);
-        if (op_inputs != local_buf) free((void*)op_inputs);
+        if (ret != 0) {
+            if (op_inputs != local_buf) free((void*)op_inputs);
+            goto cleanup;
+        }
 
-        /* Copy back to host if CUDA */
+        /* Copy back to host if CUDA — must happen BEFORE any host-side verify */
         if (use_cuda) {
             for (int i = 0; i < n->num_outputs; i++) {
                 int tid = effective_output_tids[i] ? effective_output_tids[i]
@@ -441,7 +458,7 @@ int graph_execute(inference_graph_t* g, tensor_t* inputs[],
             g_cuda.stream_synchronize(0);
         }
 
-        if (ret != 0) goto cleanup;
+        if (op_inputs != local_buf) free((void*)op_inputs);
     }
 
     /* Copy final outputs (skip self-copy when user passes graph tensors as outputs) */

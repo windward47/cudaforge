@@ -110,7 +110,7 @@ static int conv2d_f32_im2col(const float* input, const float* weight, float* out
 
         /* matmul: weight (K × col_rows) * col_buf (col_rows × col_cols) = output (K × col_cols) */
         matmul_params_t mp = {.M = K, .N = col_cols, .K = col_rows};
-        const void* mat_inputs[]  = {weight, col_buf};
+        const void* mat_inputs[]  = {weight, col_buf, NULL};
         void*       mat_outputs[] = {out_n};
         const operator_registry_t* mm = operator_find("matmul_f32");
         if (mm) mm->func(mat_inputs, mat_outputs, (const operator_params_t*)&mp, NULL);
@@ -131,15 +131,37 @@ int conv2d_f32(const void* inputs[], void* outputs[],
     if (!params) return -1;
 
     const conv_params_t* p = (const conv_params_t*)params;
-    const float* in  = (const float*)inputs[0];
-    const float* w   = (const float*)inputs[1];
-    float* out       = (float*)outputs[0];
+    const float* in   = (const float*)inputs[0];
+    const float* w    = (const float*)inputs[1];
+    const float* bias = (const float*)inputs[2];
+    float* out        = (float*)outputs[0];
 
-    /* Use im2col path for most cases, naive for very small kernels */
+    int ret;
     if (p->kernel_h * p->kernel_w <= 9) {
-        return conv2d_f32_ref(in, w, out, p);
+        ret = conv2d_f32_ref(in, w, out, p);
+    } else {
+        ret = conv2d_f32_im2col(in, w, out, p);
     }
-    return conv2d_f32_im2col(in, w, out, p);
+    if (ret != 0) return ret;
+
+    /* Add bias if present */
+    if (bias) {
+        int64_t OH = (p->H + 2 * p->pad_h - p->dilation_h * (p->kernel_h - 1) - 1)
+                     / p->stride_h + 1;
+        int64_t OW = (p->W + 2 * p->pad_w - p->dilation_w * (p->kernel_w - 1) - 1)
+                     / p->stride_w + 1;
+        for (int64_t n = 0; n < p->N; n++) {
+            for (int64_t k = 0; k < p->K; k++) {
+                float bv = bias[k];
+                for (int64_t oh = 0; oh < OH; oh++) {
+                    for (int64_t ow = 0; ow < OW; ow++) {
+                        out[((n * p->K + k) * OH + oh) * OW + ow] += bv;
+                    }
+                }
+            }
+        }
+    }
+    return 0;
 }
 
 static const operator_registry_t s_conv_reg = {
