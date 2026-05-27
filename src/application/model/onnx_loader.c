@@ -20,6 +20,9 @@
 #include "layernorm_int.h"
 #include "gather_int.h"
 #include "squeeze_unsqueeze_int.h"
+#include "reduce_int.h"
+#include "cast_int.h"
+#include "argmax_int.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -510,6 +513,11 @@ static op_type_t map_onnx_op(const char* onnx_op) {
     if (strcmp(onnx_op, "Gather") == 0) return OP_GATHER;
     if (strcmp(onnx_op, "Squeeze") == 0) return OP_SQUEEZE_UNSQUEEZE;
     if (strcmp(onnx_op, "Unsqueeze") == 0) return OP_SQUEEZE_UNSQUEEZE;
+    if (strcmp(onnx_op, "Exp")   == 0) return OP_EXP;
+    if (strcmp(onnx_op, "ReduceSum")  == 0) return OP_REDUCE;
+    if (strcmp(onnx_op, "ReduceMax")  == 0) return OP_REDUCE;
+    if (strcmp(onnx_op, "Cast")       == 0) return OP_CAST;
+    if (strcmp(onnx_op, "ArgMax")     == 0) return OP_ARGMAX;
     return (op_type_t)(-1);
 }
 
@@ -527,7 +535,7 @@ static int infer_output_shape(onnx_node_info_t* node, onnx_parsed_model_t* model
     /* Elementwise ops: output = input shape */
     if (ot == OP_RELU || ot == OP_SIGMOID || ot == OP_GELU || ot == OP_SILU
         || ot == OP_BATCHNORM || ot == OP_ADD || ot == OP_MUL || ot == OP_SOFTMAX
-        || ot == OP_SUB || ot == OP_DIV) {
+        || ot == OP_SUB || ot == OP_DIV || ot == OP_EXP || ot == OP_CAST) {
         for (int oi = 0; oi < node->num_outputs; oi++) {
             onnx_tensor_info_t* out = find_tensor(model, node->output_names[oi]);
             if (!out) out = add_tensor(model, node->output_names[oi]);
@@ -614,6 +622,101 @@ static int infer_output_shape(onnx_node_info_t* node, onnx_parsed_model_t* model
             if (out) {
                 out->ndim = 4;
                 for (int d = 0; d < 4; d++) out->shape[d] = out_shape[d];
+            }
+        }
+        return 0;
+    }
+
+    /* ReduceSum / ReduceMax: output shape = input shape with axes reduced */
+    if (ot == OP_REDUCE) {
+        int64_t axes[8];
+        int num_axes = node_attr_ints(node, "axes", axes, 8);
+        int64_t keepdims = node_attr_int(node, "keepdims", 1);
+
+        /* If no axes attribute, read from input[1] initializer */
+        if (num_axes == 0 && node->num_inputs >= 2 && node->input_names[1][0] != '\0') {
+            onnx_tensor_info_t* ax_info = find_tensor(model, node->input_names[1]);
+            if (ax_info && ax_info->raw_data) {
+                int64_t* av = (int64_t*)ax_info->raw_data;
+                num_axes = (int)(ax_info->raw_data_size / sizeof(int64_t));
+                for (int i = 0; i < num_axes && i < 8; i++) axes[i] = av[i];
+            }
+        }
+
+        /* Normalize negative axes */
+        for (int i = 0; i < num_axes; i++) {
+            if (axes[i] < 0) axes[i] += in0->ndim;
+        }
+
+        /* Build boolean mask of which axes are reduced */
+        int reduced[8] = {0};
+        for (int i = 0; i < num_axes && i < 8; i++) {
+            if (axes[i] >= 0 && axes[i] < 8) reduced[axes[i]] = 1;
+        }
+
+        if (keepdims) {
+            int64_t out_shape[8];
+            int ndim_out = in0->ndim;
+            for (int d = 0; d < in0->ndim; d++)
+                out_shape[d] = reduced[d] ? 1 : in0->shape[d];
+            for (int oi = 0; oi < node->num_outputs; oi++) {
+                onnx_tensor_info_t* out = find_tensor(model, node->output_names[oi]);
+                if (!out) out = add_tensor(model, node->output_names[oi]);
+                if (out) {
+                    out->ndim = ndim_out;
+                    for (int d = 0; d < ndim_out; d++) out->shape[d] = out_shape[d];
+                }
+            }
+        } else {
+            int64_t out_shape[8];
+            int ndim_out = 0;
+            for (int d = 0; d < in0->ndim; d++) {
+                if (!reduced[d]) out_shape[ndim_out++] = in0->shape[d];
+            }
+            for (int oi = 0; oi < node->num_outputs; oi++) {
+                onnx_tensor_info_t* out = find_tensor(model, node->output_names[oi]);
+                if (!out) out = add_tensor(model, node->output_names[oi]);
+                if (out) {
+                    out->ndim = ndim_out;
+                    for (int d = 0; d < ndim_out; d++) out->shape[d] = out_shape[d];
+                }
+            }
+        }
+        return 0;
+    }
+
+    /* ArgMax: output = input shape with axis removed (or set to 1 if keepdims) */
+    if (ot == OP_ARGMAX) {
+        int64_t axis = node_attr_int(node, "axis", 0);
+        int64_t keepdims = node_attr_int(node, "keepdims", 1);
+        if (axis < 0) axis += in0->ndim;
+
+        if (keepdims) {
+            int64_t out_shape[8];
+            int ndim_out = in0->ndim;
+            for (int d = 0; d < in0->ndim; d++)
+                out_shape[d] = (d == axis) ? 1 : in0->shape[d];
+            for (int oi = 0; oi < node->num_outputs; oi++) {
+                onnx_tensor_info_t* out = find_tensor(model, node->output_names[oi]);
+                if (!out) out = add_tensor(model, node->output_names[oi]);
+                if (out) {
+                    out->ndim = ndim_out;
+                    for (int d = 0; d < ndim_out; d++) out->shape[d] = out_shape[d];
+                }
+            }
+        } else {
+            int64_t out_shape[8];
+            int ndim_out = 0;
+            for (int d = 0; d < in0->ndim; d++) {
+                if (d != axis) out_shape[ndim_out++] = in0->shape[d];
+            }
+            for (int oi = 0; oi < node->num_outputs; oi++) {
+                onnx_tensor_info_t* out = find_tensor(model, node->output_names[oi]);
+                if (!out) out = add_tensor(model, node->output_names[oi]);
+                if (out) {
+                    out->ndim = ndim_out;
+                    for (int d = 0; d < ndim_out; d++) out->shape[d] = out_shape[d];
+                }
             }
         }
         return 0;
@@ -1087,7 +1190,8 @@ static inference_graph_t* build_graph_from_onnx(onnx_parsed_model_t* pm) {
 
             /* Slice, Split, and Squeeze/Unsqueeze have int64 initializer inputs
                (starts/ends/axes/steps). Skip them here — already extracted to params. */
-            if ((ot == OP_SLICE || ot == OP_SPLIT || ot == OP_SQUEEZE_UNSQUEEZE)
+            if ((ot == OP_SLICE || ot == OP_SPLIT || ot == OP_SQUEEZE_UNSQUEEZE
+                 || ot == OP_REDUCE)
                 && t && t->is_initializer)
                 continue;
 
@@ -1247,10 +1351,12 @@ static inference_graph_t* build_graph_from_onnx(onnx_parsed_model_t* pm) {
             onnx_tensor_info_t* in_t = find_tensor(pm, node->input_names[0]);
             if (in_t) {
                 /* Determine num_classes (axis dim) and num_blocks (product of other dims) */
-                int64_t num_classes = (axis < in_t->ndim) ? in_t->shape[axis] : 1;
+                int64_t eff_axis = axis;
+                if (eff_axis < 0) eff_axis += in_t->ndim;
+                int64_t num_classes = (eff_axis >= 0 && eff_axis < in_t->ndim) ? in_t->shape[eff_axis] : 1;
                 int64_t num_blocks = 1;
                 for (int d = 0; d < in_t->ndim; d++) {
-                    if (d != axis) num_blocks *= in_t->shape[d];
+                    if (d != eff_axis) num_blocks *= in_t->shape[d];
                 }
                 sp.num_classes = num_classes;
                 sp.num_blocks  = num_blocks;
@@ -1523,6 +1629,69 @@ static inference_graph_t* build_graph_from_onnx(onnx_parsed_model_t* pm) {
             onnx_tensor_info_t* in_sq = find_tensor(pm, node->input_names[0]);
             if (in_sq) { sup.numel = 1; for (int d = 0; d < in_sq->ndim; d++) sup.numel *= in_sq->shape[d]; }
             params = &sup; params_size = sizeof(sup);
+        } else if (ot == OP_REDUCE) {
+            reduce_params_t rp;
+            memset(&rp, 0, sizeof(rp));
+            /* Determine op type from ONNX op name */
+            rp.op = (strcmp(node->op_type, "ReduceMax") == 0) ? REDUCE_MAX : REDUCE_SUM;
+            onnx_tensor_info_t* in_r = find_tensor(pm, node->input_names[0]);
+            int64_t axes[8];
+            int num_axes = node_attr_ints(node, "axes", axes, 8);
+            if (num_axes == 0 && node->num_inputs >= 2 && node->input_names[1][0] != '\0') {
+                onnx_tensor_info_t* ax_info = find_tensor(pm, node->input_names[1]);
+                if (ax_info && ax_info->raw_data) {
+                    int64_t* av = (int64_t*)ax_info->raw_data;
+                    num_axes = (int)(ax_info->raw_data_size / sizeof(int64_t));
+                    for (int i = 0; i < num_axes && i < 8; i++) axes[i] = av[i];
+                }
+            }
+            /* Normalize negative axes */
+            for (int i = 0; i < num_axes; i++)
+                if (axes[i] < 0 && in_r) axes[i] += in_r->ndim;
+            /* Compute reduce_size (product of reduced dims) and num_blocks (product of others) */
+            int reduced[8] = {0};
+            for (int i = 0; i < num_axes && i < 8; i++)
+                if (axes[i] >= 0 && axes[i] < 8) reduced[axes[i]] = 1;
+            if (in_r) {
+                rp.reduce_size = 1;
+                rp.num_blocks  = 1;
+                rp.total_elems = 1;
+                for (int d = 0; d < in_r->ndim; d++) {
+                    rp.total_elems *= in_r->shape[d];
+                    if (reduced[d]) rp.reduce_size *= in_r->shape[d];
+                    else            rp.num_blocks  *= in_r->shape[d];
+                }
+            }
+            params = &rp; params_size = sizeof(rp);
+        } else if (ot == OP_CAST) {
+            cast_params_t cp;
+            memset(&cp, 0, sizeof(cp));
+            int64_t to_type = node_attr_int(node, "to", ONNX_DTYPE_FLOAT);
+            cp.dst_dtype = (int)to_type;
+            onnx_tensor_info_t* in_c = find_tensor(pm, node->input_names[0]);
+            /* Infer src_dtype from input tensor; default to INT64 for weights,
+               FLOAT otherwise (since we store everything as F32) */
+            cp.src_dtype = ONNX_DTYPE_FLOAT;
+            if (in_c && in_c->is_initializer && in_c->raw_data) {
+                /* Check if the raw_data looks like int64 */
+                cp.src_dtype = ONNX_DTYPE_INT64;
+            }
+            cp.numel = 1;
+            if (in_c) for (int d = 0; d < in_c->ndim; d++) cp.numel *= in_c->shape[d];
+            params = &cp; params_size = sizeof(cp);
+        } else if (ot == OP_ARGMAX) {
+            argmax_params_t ap;
+            memset(&ap, 0, sizeof(ap));
+            int64_t axis = node_attr_int(node, "axis", 0);
+            onnx_tensor_info_t* in_am = find_tensor(pm, node->input_names[0]);
+            if (in_am) {
+                if (axis < 0) axis += in_am->ndim;
+                ap.reduce_size = (axis < in_am->ndim) ? in_am->shape[axis] : 1;
+                ap.num_blocks = 1;
+                for (int d = 0; d < in_am->ndim; d++)
+                    if (d != axis) ap.num_blocks *= in_am->shape[d];
+            }
+            params = &ap; params_size = sizeof(ap);
         }
 
         /* Add the node. Data inputs exclude weight initializers; weights are passed separately. */
@@ -1745,13 +1914,20 @@ onnx_model_t* onnx_load_from_file(const char* path) {
         infer_output_shape(&pm->nodes[i], pm);
     }
 
-    /* Second pass: ensure all tensor edges have shapes (fill gaps) */
+    /* Second pass: ensure all tensor edges have shapes (fill gaps).
+       Only apply to elementwise ops where output shape = input shape.
+       Ops like ArgMax/Reduce/Cast can legitimately produce 0D outputs. */
     for (int ni = 0; ni < pm->num_nodes; ni++) {
         onnx_node_info_t* node = &pm->nodes[ni];
+        op_type_t ot = map_onnx_op(node->op_type);
+        int is_elem = (ot == OP_RELU || ot == OP_SIGMOID || ot == OP_GELU
+                       || ot == OP_SILU || ot == OP_BATCHNORM || ot == OP_ADD
+                       || ot == OP_MUL || ot == OP_SOFTMAX || ot == OP_SUB
+                       || ot == OP_DIV || ot == OP_EXP || ot == OP_CAST);
+        if (!is_elem) continue;
         for (int oi = 0; oi < node->num_outputs; oi++) {
             onnx_tensor_info_t* t = find_tensor(pm, node->output_names[oi]);
             if (t && t->ndim == 0) {
-                /* Use input shape as fallback for elementwise ops */
                 onnx_tensor_info_t* in0 = find_tensor(pm, node->input_names[0]);
                 if (in0 && in0->ndim > 0) {
                     t->ndim = in0->ndim;

@@ -35,6 +35,10 @@ typedef enum {
     OP_LAYERNORM,
     OP_GATHER,
     OP_SQUEEZE_UNSQUEEZE,
+    OP_EXP,
+    OP_REDUCE,
+    OP_CAST,
+    OP_ARGMAX,
     OP_INPUT,
     OP_OUTPUT
 } op_type_t;

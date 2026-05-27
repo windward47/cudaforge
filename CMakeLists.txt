@@ -98,6 +98,9 @@ target_sources(operator PRIVATE
     src/operator/nn/layernorm.c
     src/operator/nn/gather.c
     src/operator/nn/squeeze_unsqueeze.c
+    src/operator/nn/reduce.c
+    src/operator/nn/cast.c
+    src/operator/nn/argmax.c
     src/operator/operator_registry.c
     src/operator/operator_init.c
 )
@@ -124,6 +127,9 @@ if(ENABLE_CUDA)
         src/operator/nn/layernorm_cuda.cu
         src/operator/nn/gather_cuda.cu
         src/operator/nn/squeeze_unsqueeze_cuda.cu
+        src/operator/nn/reduce_cuda.cu
+        src/operator/nn/cast_cuda.cu
+        src/operator/nn/argmax_cuda.cu
         src/operator/blas/matmul_cuda.cu
     )
 endif()
@@ -535,6 +541,22 @@ if(ENABLE_TESTS)
     add_test(NAME test_yolo COMMAND test_yolo)
     set_tests_properties(test_yolo PROPERTIES
         WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+
+    add_executable(test_reduce
+        tests/test_reduce.c
+    )
+    target_include_directories(test_reduce PRIVATE
+        third_party/unity/src
+        src/operator/include
+        src/operator/nn
+        src/platform/include
+    )
+    target_link_libraries(test_reduce PRIVATE operator platform unity)
+    target_compile_definitions(test_reduce PRIVATE USE_CUDA)
+    if(CMAKE_C_COMPILER_ID STREQUAL "MSVC")
+        target_compile_options(test_reduce PRIVATE /wd4189 /wd4456 /wd4101)
+    endif()
+    add_test(NAME test_reduce COMMAND test_reduce)
 
     add_executable(test_bert
         tests/test_bert.c

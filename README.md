@@ -77,7 +77,7 @@ cmake --build build -j$(nproc)
 # 快速验证 — 打印平台信息
 ./build/Release/cudaforge.exe
 
-# 完整测试套件（26 个测试程序）
+# 完整测试套件（30 个测试程序）
 ctest --test-dir build -C Release -j$(nproc)
 
 # GPU 内存安全检查
@@ -113,6 +113,17 @@ CUDA: enabled (1 device(s))
 | Concat | `Concat` | ✓ | ✓ | 沿通道轴拼接 |
 | Resize | `Resize` | ✓ | ✓ | 最近邻上采样 |
 | Transpose | `Transpose` | ✓ | ✓ | N 维转置 |
+| Sub | `Sub` | ✓ | ✓ | 逐元素减法，支持 broadcast |
+| Div | `Div` | ✓ | ✓ | 逐元素除法，支持 broadcast |
+| Slice | `Slice` | ✓ | ✓ | 沿多轴切片 |
+| Split | `Split` | ✓ | ✓ | 沿指定轴拆分 |
+| LayerNorm | `LayerNormalization` | ✓ | ✓ | 共享内存归约，最后一维归一化 |
+| Gather | `Gather` | ✓ | ✓ | 沿轴按索引查表，支持 float 索引 |
+| Squeeze/Unsqueeze | `Squeeze` / `Unsqueeze` | ✓ | ✓ | 设备端 memcpy，零拷贝 reshape |
+| Exp | `Exp` | ✓ | ✓ | 逐元素指数，融入 activations 框架 |
+| ReduceSum/Max | `ReduceSum` / `ReduceMax` | ✓ | ✓ | 共享内存 stride 归约，沿指定轴求和/取最大 |
+| Cast | `Cast` | ✓ | ✓ | int64↔F32 类型转换，支持 ONNX `to` 属性 |
+| ArgMax | `ArgMax` | ✓ | ✓ | 共享内存 (value,index) 对归约，返回最大值索引 |
 
 ## API 概览
 
@@ -247,7 +258,7 @@ CudaForge 内置了一个**手写的 protobuf wire-format 解析器**（约 200 
 CudaForge 的初衷是学习推理引擎的底层原理。通读全部代码只需一个下午。同时适用于无法承载 100+ MB 依赖的嵌入式场景。
 
 **Q: 能跑 ResNet / YOLO / BERT 吗？**
-已通过三层验证：(1) MNIST CNN（Conv×2 + ReLU + MaxPool + Reshape + Gemm + Softmax）；(2) **ResNet-18**（1×3×224×224 → 1×1000，50 节点，CUDA 推理与 PyTorch 对比 max_diff = 5.25e-06，Top-1 一致）；(3) **YOLOv8n**（1×3×640×640 → 1×84×8400，234 节点，CPU/CUDA 推理 max_diff < 1e-3，compute-sanitizer 零错误）。BERT 等 Transformer 模型尚不支持。
+已通过五层验证：(1) MNIST CNN（Conv×2 + ReLU + MaxPool + Reshape + Gemm + Softmax）；(2) **ResNet-18**（1×3×224×224 → 1×1000，50 节点，CUDA 推理与 PyTorch 对比 max_diff = 5.25e-06，Top-1 一致）；(3) **YOLOv8n**（1×3×640×640 → 1×84×8400，234 节点，CPU/CUDA 推理 max_diff < 1e-3，compute-sanitizer 零错误）；(4) **BERT-like Phase A**（Embedding + LayerNorm + FFN + SiLU，CPU/CUDA 推理与 ONNX Runtime 对比 max_diff = 5.96e-07）；(5) **BERT-base Phase B**（Embedding + LayerNorm + FFN + Exp + ReduceSum/Max + ArgMax + Cast + Softmax + Concat，CPU max_diff=2.24e-08，CUDA max_diff=7.45e-09，compute-sanitizer 零错误）。覆盖 30 种算子，30 项测试全部通过。
 
 **Q: 支持 FP16 或 INT8 推理吗？**
 当前仅支持 FP32。混合精度和量化推理在后续计划中。

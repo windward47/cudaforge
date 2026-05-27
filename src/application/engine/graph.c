@@ -234,6 +234,10 @@ static const char* op_name(op_type_t type) {
         case OP_LAYERNORM:          return "layernorm_f32";
         case OP_GATHER:             return "gather_f32";
         case OP_SQUEEZE_UNSQUEEZE:  return "squeeze_unsqueeze_f32";
+        case OP_EXP:                return "exp_f32";
+        case OP_REDUCE:             return "reduce_f32";
+        case OP_CAST:               return "cast_f32";
+        case OP_ARGMAX:             return "argmax_f32";
         default:                    return NULL;
     }
 }
@@ -288,7 +292,8 @@ int graph_execute(inference_graph_t* g, tensor_t* inputs[],
                     && (next_n->type == OP_RELU
                         || next_n->type == OP_SIGMOID
                         || next_n->type == OP_GELU
-                        || next_n->type == OP_SILU)) {
+                        || next_n->type == OP_SILU
+                        || next_n->type == OP_EXP)) {
 
                     /* Do not fuse if the compute node's output has other
                      * consumers (e.g. SiLU = Conv→Sigmoid→Mul: the Conv
@@ -354,7 +359,7 @@ int graph_execute(inference_graph_t* g, tensor_t* inputs[],
         int total_inputs = n->num_inputs + n->num_weights;
         int max_input_idx = total_inputs > 0 ? total_inputs - 1 : 0;
         if (n->type == OP_RELU || n->type == OP_SIGMOID || n->type == OP_GELU
-            || n->type == OP_SILU)
+            || n->type == OP_SILU || n->type == OP_EXP)
             if (max_input_idx < 1) max_input_idx = 1;
         if (n->type == OP_CONV2D || n->type == OP_MATMUL)
             if (max_input_idx < 2) max_input_idx = 2;  /* reserve for optional bias */
@@ -419,7 +424,7 @@ int graph_execute(inference_graph_t* g, tensor_t* inputs[],
         /* Handle ops that need extra metadata via inputs[] slot */
         /* relu/sigmoid/gelu: need numel as inputs[1] */
         if (n->type == OP_RELU || n->type == OP_SIGMOID || n->type == OP_GELU
-            || n->type == OP_SILU) {
+            || n->type == OP_SILU || n->type == OP_EXP) {
             int tid = n->input_tensors[0];
             if (tid >= 0 && tid < g->num_tensors) {
                 op_inputs[1] = &g->tensors[tid].tensor->numel;

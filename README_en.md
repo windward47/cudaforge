@@ -77,7 +77,7 @@ cmake --build build -j$(nproc)
 # Smoke test — prints platform info
 ./build/Release/cudaforge.exe
 
-# Full test suite (26 test executables)
+# Full test suite (30 test executables)
 ctest --test-dir build -C Release -j$(nproc)
 
 # GPU memory safety check
@@ -113,6 +113,17 @@ CUDA: enabled (1 device(s))
 | Concat | `Concat` | ✓ | ✓ | Channel-axis concatenation |
 | Resize | `Resize` | ✓ | ✓ | Nearest-neighbor upsampling |
 | Transpose | `Transpose` | ✓ | ✓ | N-D permutation |
+| Sub | `Sub` | ✓ | ✓ | Element-wise subtract with broadcast |
+| Div | `Div` | ✓ | ✓ | Element-wise divide with broadcast |
+| Slice | `Slice` | ✓ | ✓ | Multi-axis slicing |
+| Split | `Split` | ✓ | ✓ | Split along given axis |
+| LayerNorm | `LayerNormalization` | ✓ | ✓ | Shared-memory reduction, last-dim norm |
+| Gather | `Gather` | ✓ | ✓ | Index-based lookup along axis, float indices |
+| Squeeze/Unsqueeze | `Squeeze` / `Unsqueeze` | ✓ | ✓ | Device memcpy, zero-copy reshape |
+| Exp | `Exp` | ✓ | ✓ | Element-wise exponential, in activations framework |
+| ReduceSum/Max | `ReduceSum` / `ReduceMax` | ✓ | ✓ | Shared-memory stride reduction along axes |
+| Cast | `Cast` | ✓ | ✓ | int64↔F32 type conversion, supports ONNX `to` attr |
+| ArgMax | `ArgMax` | ✓ | ✓ | Shared-memory (value,index) pair reduction |
 
 ## API at a Glance
 
@@ -246,7 +257,7 @@ CudaForge includes a **hand-written protobuf wire-format parser** (~200 lines of
 CudaForge is for learning how inference engines work under the hood. Reading its entire codebase takes an afternoon. It's also useful for embedded scenarios where you can't afford 100+ MB of dependencies.
 
 **Q: Can I run ResNet / YOLO / BERT?**
-Three tiers verified: (1) MNIST CNN (Conv×2 + ReLU + MaxPool + Reshape + Gemm + Softmax); (2) **ResNet-18** (1×3×224×224 → 1×1000, 50 nodes, CUDA vs PyTorch max_diff = 5.25e-06, Top-1 matches); (3) **YOLOv8n** (1×3×640×640 → 1×84×8400, 234 nodes, CPU/CUDA max_diff < 1e-3, compute-sanitizer 0 errors). BERT-style Transformers are beyond current scope.
+Five tiers verified: (1) MNIST CNN (Conv×2 + ReLU + MaxPool + Reshape + Gemm + Softmax); (2) **ResNet-18** (1×3×224×224 → 1×1000, 50 nodes, CUDA vs PyTorch max_diff = 5.25e-06, Top-1 matches); (3) **YOLOv8n** (1×3×640×640 → 1×84×8400, 234 nodes, CPU/CUDA max_diff < 1e-3, compute-sanitizer 0 errors); (4) **BERT-like Phase A** (Embedding + LayerNorm + FFN + SiLU, CPU/CUDA vs ONNX Runtime max_diff = 5.96e-07); (5) **BERT-base Phase B** (Embedding + LayerNorm + FFN + Exp + ReduceSum/Max + ArgMax + Cast + Softmax + Concat, CPU max_diff=2.24e-08, CUDA max_diff=7.45e-09, compute-sanitizer 0 errors). 30 operators covered, 30 tests all passing.
 
 **Q: Does it support FP16 or INT8?**
 Currently FP32 only. Mixed-precision and quantization are planned for future releases.

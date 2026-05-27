@@ -131,6 +131,72 @@ __global__ void matmul_f32_kernel(const float* A, const float* B, float* C,
 }
 ```
 
+### Level 1.5: 共享内存归约（Shared-Memory Reduction）
+
+适用场景：LayerNorm、Softmax 沿轴计算均值/方差/最大值
+- pow2 对齐 block 尺寸，stride-based 并行归约
+- 动态共享内存分配（`extern __shared__`）
+- 与 warp-level 不同，在 block 级做数据聚合
+
+```cuda
+/* LayerNorm CUDA kernel — shared-memory mean/variance reduction */
+__global__ void layernorm_f32_kernel(const float* input, float* output,
+                                       const float* gamma, const float* beta,
+                                       int64_t N, int64_t normalized_size,
+                                       float epsilon) {
+    extern __shared__ float s_buf[];
+    float* s_mean = s_buf;
+    float* s_var  = s_buf + blockDim.x;
+
+    int64_t row = blockIdx.x;
+    if (row >= N) return;
+    const float* in_row = input + row * normalized_size;
+    float* out_row       = output + row * normalized_size;
+
+    /* 1. 并行归约计算均值 */
+    float sum = 0.0f;
+    for (int i = threadIdx.x; i < normalized_size; i += blockDim.x)
+        sum += in_row[i];
+    s_mean[threadIdx.x] = sum;
+    __syncthreads();
+
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride)
+            s_mean[threadIdx.x] += s_mean[threadIdx.x + stride];
+        __syncthreads();
+    }
+    float mean = s_mean[0] / (float)normalized_size;
+
+    /* 2. 并行归约计算方差 */
+    float sq = 0.0f;
+    for (int i = threadIdx.x; i < normalized_size; i += blockDim.x) {
+        float d = in_row[i] - mean;
+        sq += d * d;
+    }
+    s_var[threadIdx.x] = sq;
+    __syncthreads();
+
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride)
+            s_var[threadIdx.x] += s_var[threadIdx.x + stride];
+        __syncthreads();
+    }
+    float inv_std = rsqrtf(s_var[0] / (float)normalized_size + epsilon);
+
+    /* 3. 归一化 + 仿射变换 */
+    for (int i = threadIdx.x; i < normalized_size; i += blockDim.x) {
+        float val = (in_row[i] - mean) * inv_std;
+        if (gamma) val = val * gamma[i] + beta[i];
+        out_row[i] = val;
+    }
+}
+```
+
+**关键点**：
+- block 尺寸取 2 的幂（256 / 512），保证 stride 归约无分支发散
+- `__syncthreads()` 在每次归约迭代时必须调用（共享内存读写之间）
+- `extern __shared__` 通过 kernel launch 第三个参数动态分配大小
+
 ### Level 2: Warp-level 原语
 
 适用场景：reduce、scan、softmax

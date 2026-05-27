@@ -361,9 +361,8 @@ BERT 管线打通后，可探索 GPT-2/LLaMA 等 decoder-only 架构：
 
 | 状态 | 数量 | 内容 |
 |------|------|------|
-| 已完成 | 14 | R1-R3（可靠性）、Q1-Q4（质量）、P1-P3（性能）、A1-A4（BERT Phase A） |
-| 进行中 | 0 | — |
-| 待开始 | 5 | B1-B5（BERT Phase B，完整推理） |
+| 已完成 | 19 | R1-R3（可靠性）、Q1-Q4（质量）、P1-P3（性能）、A1-A4（BERT Phase A）、B1-B5（BERT Phase B 完整） |
+| 待开始 | 1 | Phase C（MHA 融合优化） |
 
 ### 第三步性能提升实测
 
@@ -392,4 +391,24 @@ BERT 管线打通后，可探索 GPT-2/LLaMA 等 decoder-only 架构：
 
 **关键修复**: Gather 算子输入顺序 bug — ONNX Gather(data, indices) 中 data 为 initializer 时被错误地推到 weights[] 末尾，导致 inputs[0]=indices, inputs[1]=data（顺序颠倒），修复后 BERT E2E 测试 max_diff=5.96e-07。
 
-> **最后更新**: 2026-05-27。第十二轮：Phase A (BERT 基础算子) 全部完成。29/29 测试通过。
+### Phase B BERT 完整推理算子
+
+| 算子 | CPU | CUDA | 测试 | ONNX |
+|------|-----|------|------|------|
+| B1 Exp | ✓ (expf) | ✓ (\_\_expf) | 融入 activations | ✓ (opset 11+) |
+| B2 ReduceSum/ReduceMax | ✓ (shared op) | ✓ (shared-mem reduction) | ✓ (5 tests) | ✓ |
+| B3 Cast | ✓ (int64↔F32 + memcpy fallback) | ✓ (\_\_int2float_rz + memcpy fallback) | ✓ | ✓ |
+| B4 ArgMax | ✓ (value+index) | ✓ (shared-mem pair reduce) | ✓ | ✓ |
+| B5 BERT-base E2E | ✓ (max_diff=2.24e-08) | ✓ (max_diff=7.45e-09) | ✓ (CPU+CUDA, compute-sanitizer=0 errors) | — |
+
+**设计决策**:
+- **Exp 融入 activations 框架**：与 Sigmoid/GELU/SiLU 共用 `inputs[1]=&numel` 模式，零额外文件
+- **ReduceSum + ReduceMax 合并**：单一 reduce 算子通过 `op` 字段区分（REDUCE_SUM=0, REDUCE_MAX=1）
+- **Cast 类型判断**：ONNX loader 从 input tensor 的 `is_initializer`+`raw_data` 推 src_dtype
+
+**Phase B bug 修复 (3 fixes)**:
+1. **Softmax 负轴未调整** (`onnx_loader.c:1373`): `axis=-1` 时直接用 `in_t->shape[axis]` 访问越界（shape[-1]），读出 tensor_id=2 导致 num_classes=2 而非 256。修复：加 `if (eff_axis < 0) eff_axis += in_t->ndim;`。
+2. **第二遍 shape fill 覆盖合法 0D 张量** (`onnx_loader.c:1938-1952`): 对 ArgMax 等非逐元素算子，ndim=0 的输出被错误地用输入 shape 覆盖（argmax 从 0D 变 1D→Cast 输出变 1D→Unsqueeze 拿到 numel=8 而非 1→cudaMemcpyAsync 越界）。修复：第二遍仅对逐元素算子执行 fallback。
+3. **Cast CUDA 无运算时无 memcpy** (`cast_cuda.cu:29-37`): F32→F32 Cast 是 no-op，但输出 device buffer 未填充（CPU 版有 memcpy fallback）。导致后续 Unsqueeze cudaMemcpy 复制未初始化数据。修复：增加 cudaMemcpyAsync fallback。
+
+> **最后更新**: 2026-05-28。第十三轮：Phase B (BERT 完整推理算子) 全部完成，CPU+CUDA 双后端验证通过，compute-sanitizer 零错误。30/30 测试全绿。

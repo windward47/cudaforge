@@ -66,7 +66,7 @@ extern const platform_t* g_platform;  /* set by platform_init() to &s_platform_x
 
 | 模块目录 | 说明 |
 | --- | --- |
-| `src/operator/nn/` | 神经网络算子（conv/pool/batchnorm/relu/sigmoid/gelu/silu/add/sub/div/mul/concat/resize/transpose/slice/split/softmax/reshape 等） |
+| `src/operator/nn/` | 神经网络算子（conv/pool/batchnorm/relu/sigmoid/gelu/silu/exp/add/sub/div/mul/concat/resize/transpose/slice/split/softmax/reshape/layernorm/gather/squeeze_unsqueeze/reduce/cast/argmax 等） |
 | `src/operator/blas/` | 矩阵运算（matmul） |
 
 **算子接口规范**：
@@ -379,6 +379,32 @@ CUDA_CHECK(cudaEventElapsedTime(&ms, start, stop));
 - 默认使用 default stream（`cudaStreamPerThread`），性能关键路径使用独立 Stream 实现 overlap
 - 同一个 Stream 内的操作保序，不同 Stream 间不保序
 - Host 端同步优先使用 `cudaEventSynchronize` 而非 `cudaStreamSynchronize`（更精细）
+
+### 共享内存归约（Shared-Memory Reduction）
+
+LayerNorm、Softmax 等需要计算均值/方差的算子使用共享内存归约模式：
+
+```cuda
+/* pow2 对齐的 block 尺寸，stride-based 并行归约 */
+extern __shared__ float s_buf[];  /* 动态共享内存 */
+float* s_mean = s_buf;
+float* s_var  = s_buf + blockDim.x;
+
+/* 1. 每线程加载，并行归约到 s_mean[0] */
+for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+    __syncthreads();
+    if (threadIdx.x < stride)
+        s_mean[threadIdx.x] += s_mean[threadIdx.x + stride];
+}
+__syncthreads();
+
+/* 2. 广播归约结果到所有线程 */
+float mean = s_mean[0];
+
+/* 3. 同理计算方差、归一化并写回 */
+```
+
+与 warp-level reduction 不同，共享内存归约在 block 级（非 warp 级）做数据聚合，适合每个 block 负责一个归约单元的算子（如 LayerNorm 沿最后一维归约）。
 
 ## 8. 构建系统
 

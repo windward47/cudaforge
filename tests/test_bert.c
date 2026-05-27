@@ -192,6 +192,156 @@ cu_cleanup_sess:
 }
 
 /* --------------------------------------------------------------------------
+ * Phase B: BERT-base CPU inference test
+ * Exercises Exp, ReduceSum, ReduceMax, Cast, ArgMax + all Phase A ops.
+ * Input:  1×8 INT64 token IDs (stored as F32)
+ * Output: 1×257 F32 (256 vocab softmax + 1 argmax index)
+ * Reference: ONNX Runtime output
+ * -------------------------------------------------------------------------- */
+static void test_bert_base_cpu(void) {
+    fprintf(stderr, "\n=== BERT-base CPU Inference (Phase B) ===\n");
+
+    inference_session_t* sess = inference_session_load("tests/bert_base_test.onnx");
+    if (!sess) { fprintf(stderr, "FAIL: model load returned NULL\n"); return; }
+    fprintf(stderr, "Model loaded: %zu inputs, %zu outputs\n",
+           (size_t)inference_session_num_inputs(sess),
+           (size_t)inference_session_num_outputs(sess));
+
+    int64_t input_shape[] = {1, 8};
+    tensor_t* input = tensor_create(DATA_TYPE_F32, 2, input_shape);
+    if (!input) { fprintf(stderr, "FAIL: tensor_create input\n"); goto base_cpu_cleanup_sess; }
+    if (load_binary("tests/bert_base_input.bin", input->data,
+                    1 * 8 * sizeof(float)) != 0) {
+        fprintf(stderr, "FAIL: load input binary\n"); goto base_cpu_cleanup_input;
+    }
+
+    int64_t output_shape[] = {1, 257};
+    tensor_t* output = tensor_create(DATA_TYPE_F32, 2, output_shape);
+    if (!output) { fprintf(stderr, "FAIL: tensor_create output\n"); goto base_cpu_cleanup_input; }
+
+    {
+        tensor_t* inputs[]  = {input};
+        tensor_t* outputs[] = {output};
+        int rc = inference_session_run(sess, inputs, outputs, 0);
+        if (rc != 0) {
+            fprintf(stderr, "FAIL: inference_session_run = %d\n", rc);
+            goto base_cpu_cleanup_output;
+        }
+    }
+
+    {
+        int64_t n_elem = 1 * 257;
+        float* ref = (float*)malloc(n_elem * sizeof(float));
+        if (!ref) goto base_cpu_cleanup_output;
+        if (load_binary("tests/bert_base_ref_output.bin", ref,
+                        n_elem * sizeof(float)) != 0) {
+            free(ref); goto base_cpu_cleanup_output;
+        }
+
+        float max_diff = max_abs_diff((float*)output->data, ref, n_elem);
+        int mismatch = 0;
+        for (int64_t i = 0; i < n_elem; i++) {
+            if (fabsf(((float*)output->data)[i] - ref[i]) > 1e-3f) mismatch++;
+        }
+        fprintf(stderr, "CPU  max_diff=%.2e  mismatches>1e-3: %d/%lld\n",
+               max_diff, mismatch, (long long)n_elem);
+
+        fprintf(stderr, "\n");
+
+        int non_zero = 0;
+        for (int64_t i = 0; i < n_elem; i++)
+            if (fabsf(((float*)output->data)[i]) > 1e-6f) non_zero++;
+        fprintf(stderr, "CPU  non_zero outputs: %d/%lld\n", non_zero, (long long)n_elem);
+
+        if (max_diff < 1e-3f) {
+            fprintf(stderr, "BERT-base CPU: PASS (max_diff=%.2e)\n", max_diff);
+        } else {
+            fprintf(stderr, "BERT-base CPU: max_diff=%.2e > 1e-3 (CHECK)\n", max_diff);
+        }
+
+        free(ref);
+    }
+
+base_cpu_cleanup_output:
+    tensor_destroy(output);
+base_cpu_cleanup_input:
+    tensor_destroy(input);
+base_cpu_cleanup_sess:
+    inference_session_destroy(sess);
+}
+
+/* --------------------------------------------------------------------------
+ * Phase B: BERT-base CUDA inference test
+ * -------------------------------------------------------------------------- */
+static void test_bert_base_cuda(void) {
+#ifdef USE_CUDA
+    fprintf(stderr, "\n=== BERT-base CUDA Inference (Phase B) ===\n");
+
+    inference_session_t* sess = inference_session_load("tests/bert_base_test.onnx");
+    if (!sess) { fprintf(stderr, "FAIL: CUDA model load NULL\n"); return; }
+
+    int64_t input_shape[] = {1, 8};
+    tensor_t* input = tensor_create(DATA_TYPE_F32, 2, input_shape);
+    if (!input) { fprintf(stderr, "FAIL: CUDA tensor_create input\n"); goto base_cu_cleanup_sess; }
+    if (load_binary("tests/bert_base_input.bin", input->data,
+                    1 * 8 * sizeof(float)) != 0) {
+        fprintf(stderr, "FAIL: CUDA load input\n"); goto base_cu_cleanup_input;
+    }
+
+    int64_t output_shape[] = {1, 257};
+    tensor_t* output = tensor_create(DATA_TYPE_F32, 2, output_shape);
+    if (!output) { fprintf(stderr, "FAIL: CUDA tensor_create output\n"); goto base_cu_cleanup_input; }
+
+    {
+        tensor_t* inputs[]  = {input};
+        tensor_t* outputs[] = {output};
+        fprintf(stderr, "CUDA: running inference...\n");
+        int rc = inference_session_run(sess, inputs, outputs, 1);
+        fprintf(stderr, "CUDA: inference result=%d\n", rc);
+        if (rc != 0) {
+            fprintf(stderr, "FAIL: CUDA inference_session_run\n"); goto base_cu_cleanup_output;
+        }
+    }
+
+    {
+        int64_t n_elem = 1 * 257;
+        float* ref = (float*)malloc(n_elem * sizeof(float));
+        if (!ref) goto base_cu_cleanup_output;
+        if (load_binary("tests/bert_base_ref_output.bin", ref,
+                        n_elem * sizeof(float)) != 0) {
+            free(ref); goto base_cu_cleanup_output;
+        }
+
+        float max_diff = max_abs_diff((float*)output->data, ref, n_elem);
+        fprintf(stderr, "CUDA max_diff=%.2e\n", max_diff);
+
+        int mismatch = 0;
+        for (int64_t i = 0; i < n_elem; i++) {
+            if (fabsf(((float*)output->data)[i] - ref[i]) > 5e-3f) mismatch++;
+        }
+        fprintf(stderr, "CUDA mismatches>5e-3: %d/%lld\n", mismatch, (long long)n_elem);
+
+        if (max_diff < 5e-3f) {
+            fprintf(stderr, "BERT-base CUDA: PASS (max_diff=%.2e)\n", max_diff);
+        } else {
+            fprintf(stderr, "BERT-base CUDA: max_diff=%.2e > 5e-3 (CHECK)\n", max_diff);
+        }
+
+        free(ref);
+    }
+
+base_cu_cleanup_output:
+    tensor_destroy(output);
+base_cu_cleanup_input:
+    tensor_destroy(input);
+base_cu_cleanup_sess:
+    inference_session_destroy(sess);
+#else
+    (void)0;
+#endif
+}
+
+/* --------------------------------------------------------------------------
  * Main
  * -------------------------------------------------------------------------- */
 int main(void) {
@@ -201,12 +351,21 @@ int main(void) {
     cuda_platform_init(0);
 #endif
 
+    /* Phase A: BERT-like test */
     test_bert_cpu();
     fprintf(stderr, "\n=== BERT CPU: DONE ===\n");
+
+    /* Phase B: BERT-base test */
+    test_bert_base_cpu();
+    fprintf(stderr, "\n=== BERT-base CPU: DONE ===\n");
 
 #ifdef USE_CUDA
     test_bert_cuda();
     fprintf(stderr, "\n=== BERT CUDA: DONE ===\n");
+
+    test_bert_base_cuda();
+    fprintf(stderr, "\n=== BERT-base CUDA: DONE ===\n");
+
     cuda_platform_finalize();
 #endif
     platform_finalize();
