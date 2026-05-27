@@ -95,6 +95,9 @@ target_sources(operator PRIVATE
     src/operator/nn/div.c
     src/operator/nn/slice.c
     src/operator/nn/split.c
+    src/operator/nn/layernorm.c
+    src/operator/nn/gather.c
+    src/operator/nn/squeeze_unsqueeze.c
     src/operator/operator_registry.c
     src/operator/operator_init.c
 )
@@ -118,6 +121,9 @@ if(ENABLE_CUDA)
         src/operator/nn/div_cuda.cu
         src/operator/nn/slice_cuda.cu
         src/operator/nn/split_cuda.cu
+        src/operator/nn/layernorm_cuda.cu
+        src/operator/nn/gather_cuda.cu
+        src/operator/nn/squeeze_unsqueeze_cuda.cu
         src/operator/blas/matmul_cuda.cu
     )
 endif()
@@ -394,6 +400,26 @@ if(ENABLE_TESTS)
     target_link_libraries(test_split PRIVATE operator platform unity)
     add_test(NAME test_split COMMAND test_split)
 
+    add_executable(test_layernorm
+        src/operator/nn/test/test_layernorm.c
+    )
+    target_include_directories(test_layernorm PRIVATE
+        third_party/unity/src
+        src/operator/nn
+    )
+    target_link_libraries(test_layernorm PRIVATE operator platform unity)
+    add_test(NAME test_layernorm COMMAND test_layernorm)
+
+    add_executable(test_gather
+        src/operator/nn/test/test_gather.c
+    )
+    target_include_directories(test_gather PRIVATE
+        third_party/unity/src
+        src/operator/nn
+    )
+    target_link_libraries(test_gather PRIVATE operator platform unity)
+    add_test(NAME test_gather COMMAND test_gather)
+
     add_executable(test_graph
         src/application/engine/test/test_graph.c
     )
@@ -508,6 +534,27 @@ if(ENABLE_TESTS)
     endif()
     add_test(NAME test_yolo COMMAND test_yolo)
     set_tests_properties(test_yolo PROPERTIES
+        WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+
+    add_executable(test_bert
+        tests/test_bert.c
+    )
+    target_include_directories(test_bert PRIVATE
+        third_party/unity/src
+        src/application/model
+        src/application/engine
+        src/application/include
+        src/operator/include
+        src/operator/blas
+        src/operator/nn
+        src/platform/include
+    )
+    target_link_libraries(test_bert PRIVATE onnx_model application operator platform unity)
+    if(CMAKE_C_COMPILER_ID STREQUAL "MSVC")
+        target_compile_options(test_bert PRIVATE /wd4189 /wd4456 /wd4101)
+    endif()
+    add_test(NAME test_bert COMMAND test_bert)
+    set_tests_properties(test_bert PROPERTIES
         WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
 
 endif()

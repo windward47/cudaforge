@@ -18,6 +18,9 @@ int register_sub_f32(void);
 int register_div_f32(void);
 int register_slice_f32(void);
 int register_split_f32(void);
+int register_layernorm_f32(void);
+int register_gather_f32(void);
+int register_squeeze_unsqueeze_f32(void);
 
 /* CUDA operator registration (extern "C" from .cu files) */
 int register_relu_f32_cuda(void);
@@ -38,6 +41,9 @@ int register_sub_f32_cuda(void);
 int register_div_f32_cuda(void);
 int register_slice_f32_cuda(void);
 int register_split_f32_cuda(void);
+int register_layernorm_f32_cuda(void);
+int register_gather_f32_cuda(void);
+int register_squeeze_unsqueeze_f32_cuda(void);
 
 int operator_init_all(void) {
     int ret = 0;
@@ -59,6 +65,9 @@ int operator_init_all(void) {
     ret += register_div_f32();
     ret += register_slice_f32();
     ret += register_split_f32();
+    ret += register_layernorm_f32();
+    ret += register_gather_f32();
+    ret += register_squeeze_unsqueeze_f32();
     ret += register_relu_f32_cuda();
     ret += register_matmul_f32_cuda();
     ret += register_conv2d_f32_cuda();
@@ -77,5 +86,8 @@ int operator_init_all(void) {
     ret += register_div_f32_cuda();
     ret += register_slice_f32_cuda();
     ret += register_split_f32_cuda();
+    ret += register_layernorm_f32_cuda();
+    ret += register_gather_f32_cuda();
+    ret += register_squeeze_unsqueeze_f32_cuda();
     return ret;
 }

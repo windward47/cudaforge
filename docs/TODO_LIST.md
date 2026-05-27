@@ -361,9 +361,9 @@ BERT 管线打通后，可探索 GPT-2/LLaMA 等 decoder-only 架构：
 
 | 状态 | 数量 | 内容 |
 |------|------|------|
-| 已完成 | 10 | R1-R3（可靠性）、Q1-Q4（质量）、P1-P3（性能） |
+| 已完成 | 14 | R1-R3（可靠性）、Q1-Q4（质量）、P1-P3（性能）、A1-A4（BERT Phase A） |
 | 进行中 | 0 | — |
-| 待开始 | 4 | A1-A4（BERT 最小可行，Phase A） |
+| 待开始 | 5 | B1-B5（BERT Phase B，完整推理） |
 
 ### 第三步性能提升实测
 
@@ -381,4 +381,15 @@ BERT 管线打通后，可探索 GPT-2/LLaMA 等 decoder-only 架构：
 | CUDA (direct) | 176 ms (69× vs CPU) |
 | CUDA (Winograd) | 128 ms (95× vs CPU) |
 
-> **最后更新**: 2026-05-27。第十一轮：前三步全部完成。26/26 测试通过，compute-sanitizer 0 errors。
+### Phase A BERT 基础算子
+
+| 算子 | CPU | CUDA | 测试 | ONNX |
+|------|-----|------|------|------|
+| A1 LayerNormalization | ✓ | ✓ (shared-mem reduction) | ✓ (3 tests) | ✓ |
+| A2 Gather | ✓ (float indices) | ✓ | ✓ (3 tests) | ✓ |
+| A3 Squeeze/Unsqueeze | ✓ (memcpy) | ✓ (cudaMemcpyAsync) | — (shape-only) | ✓ |
+| A4 BERT E2E | CPU max_diff=5.96e-07 | CUDA max_diff=5.96e-07 | ✓ (BERT-like model) | — |
+
+**关键修复**: Gather 算子输入顺序 bug — ONNX Gather(data, indices) 中 data 为 initializer 时被错误地推到 weights[] 末尾，导致 inputs[0]=indices, inputs[1]=data（顺序颠倒），修复后 BERT E2E 测试 max_diff=5.96e-07。
+
+> **最后更新**: 2026-05-27。第十二轮：Phase A (BERT 基础算子) 全部完成。29/29 测试通过。

@@ -32,6 +32,9 @@ typedef enum {
     OP_DIV,
     OP_SLICE,
     OP_SPLIT,
+    OP_LAYERNORM,
+    OP_GATHER,
+    OP_SQUEEZE_UNSQUEEZE,
     OP_INPUT,
     OP_OUTPUT
 } op_type_t;

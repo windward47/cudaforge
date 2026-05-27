@@ -230,8 +230,11 @@ static const char* op_name(op_type_t type) {
         case OP_SUB:        return "sub_f32";
         case OP_DIV:        return "div_f32";
         case OP_SLICE:      return "slice_f32";
-        case OP_SPLIT:      return "split_f32";
-        default:            return NULL;
+        case OP_SPLIT:              return "split_f32";
+        case OP_LAYERNORM:          return "layernorm_f32";
+        case OP_GATHER:             return "gather_f32";
+        case OP_SQUEEZE_UNSQUEEZE:  return "squeeze_unsqueeze_f32";
+        default:                    return NULL;
     }
 }
 
