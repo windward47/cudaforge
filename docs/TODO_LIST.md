@@ -30,18 +30,17 @@
 - **实现方式**: Option B（kernel 侧优化），无需修改 fusion pass 或权重布局
 - **共享内存**: 48KB（K_smem + V_smem），在 sm_86 默认限制内
 
-### M3. Tensor Core FP16 MHA（部分完成）
+### ~~M3. Tensor Core FP16 MHA~~ ✅
 
 **文件**: `src/operator/nn/mha_fused_f16_cuda.cu`（独立文件，避免 shared memory 类型冲突）
 
-- **混合 FP16 kernel**: 标量 FP16 QKV 投影 + WMMA 16×16×16 输出投影
-- **Shared memory**: K(S×d) + V(S×d) + merged(S_pad×d) + W_tile(WMMA_K×WMMA_N) + tbuf(16×16) = ~8KB
-- **精度**: max_rel=2.87e-04（远低于 1e-2 阈值）
-- **性能**: 29.95 ms/iter（FP32 25.88 ms，慢 16% — QKV 标量转换开销主导）
-- **瓶颈分析**: QKV 投影占总计算 95%，标量 `__float2half`/`__hmul`/`__half2float` 转换链开销抵消了 WMMA 输出投影的收益
-- **待优化**: WMMA 用于 QKV 投影（需将 X 和权重预加载到 shared memory，避免大局部数组）
+- **全 WMMA kernel**: X 一次性加载为 FP16 到 shared memory，QKV 投影和输出投影全部使用 WMMA 16×16×16 Tensor Cores
+- **WO 分 tile 加载**: 每次加载 WMMA_K×WMMA_N = 256 个 FP16 元素到 W_tile，避免 WO 全量加载超出 shared memory 限制
+- **Shared memory**: X_h(24KB) + K(1KB) + V(1KB) + M(2KB) + W_tile(1KB) + tbuf(1KB) = ~30KB
+- **精度**: max_rel=1.27e-06（与 FP32 一致）
+- **性能**: **4.66 ms/iter**（FP32 25.97 ms，**5.57× 加速**）
 - **算子注册**: `mha_fused_f16_cuda`，CPU stub 返回 -1
-- **compute-sanitizer**: 0 错误
+- **compute-sanitizer**: 0 错误，31/31 测试全通过
 
 ---
 
@@ -100,8 +99,7 @@ BERT 管线打通后，可探索 GPT-2/LLaMA 等 decoder-only 架构：
 
 | 状态 | 数量 | 内容 |
 | --- | --- | --- |
-| 已完成 | 5 | O1（外部数据加载错误日志）、O2（opset≥13 属性兼容）、M1（FlashAttention 风格 tiled 注意力）、M2（QKV 投影融合）、M3（FP16 标量 kernel 框架） |
-| 待优化 | 1 | M3 WMMA Tensor Core 版本（需解决 store_matrix_sync 类型匹配） |
+| 已完成 | 5 | O1（外部数据加载错误日志）、O2（opset≥13 属性兼容）、M1（FlashAttention 风格 tiled 注意力）、M2（QKV 投影融合）、M3（Tensor Core FP16 MHA） |
 | 远期 | 2 | F1（FP16 推理）、F2（LLM 推理探索） |
 
-> **最后更新**: 2026-05-29。M1-M3 已完成（M3 为 FP16 标量 kernel，WMMA 版本待优化），31/31 测试全绿，compute-sanitizer 零错误。
+> **最后更新**: 2026-05-29。M1-M3 全部完成（M3: 全 WMMA FP16 kernel，5.57× 加速），31/31 测试全绿，compute-sanitizer 零错误。BERT-base 单层 CUDA 推理 4.66 ms/iter。
