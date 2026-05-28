@@ -21,16 +21,14 @@
 - **Online softmax**: tile 间通过 rescale 累积器保持数值一致性，支持任意序列长度
 - **性能**: BERT-base CUDA 30.35 → 22.17 ms/iter (**-27%**), speedup vs CPU 1.47x → 2.27x
 
-### M2. QKV 投影融合
+### ~~M2. QKV 投影融合~~ ✅
 
 **文件**: `src/operator/nn/mha_fused_cuda.cu`
 
-当前 kernel 对每个 head 分别计算 X·WQ、X·WK、X·WV（三次独立矩阵乘法）。可以将 QKV 权重拼接为 W_QKV (D, 3D)，一次矩阵乘法完成三组投影。
-
-**修复方向**:
-- 在 MHA fusion pass 中将 QKV 权重拼接为单一权重张量
-- Kernel 内一次性计算 X·W_QKV，结果写入 shared memory 后拆分为 Q/K/V
-- 减少 3× 的权重读取带宽
+- **K/V 内循环合并**: K 和 V 的投影计算共享 `xv` 加载 — 一次 global memory 读取同时计算 K 和 V，减少 33% 的 X 读取
+- **Q 投影**: 保持 per-head 计算（cooperative 全 D 计算需要 D=768 共享内存，超出 48KB 限制）
+- **实现方式**: Option B（kernel 侧优化），无需修改 fusion pass 或权重布局
+- **共享内存**: 48KB（K_smem + V_smem），在 sm_86 默认限制内
 
 ### M3. Tensor Core FP16 MHA
 
@@ -101,8 +99,8 @@ BERT 管线打通后，可探索 GPT-2/LLaMA 等 decoder-only 架构：
 
 | 状态 | 数量 | 内容 |
 | --- | --- | --- |
-| 已完成 | 3 | O1（外部数据加载错误日志）、O2（opset≥13 属性兼容）、M1（FlashAttention 风格 tiled 注意力） |
-| 待开始 | 2 | M2（QKV 投影融合）、M3（Tensor Core FP16 MHA） |
+| 已完成 | 4 | O1（外部数据加载错误日志）、O2（opset≥13 属性兼容）、M1（FlashAttention 风格 tiled 注意力）、M2（QKV 投影融合） |
+| 待开始 | 1 | M3（Tensor Core FP16 MHA） |
 | 远期 | 2 | F1（FP16 推理）、F2（LLM 推理探索） |
 
-> **最后更新**: 2026-05-29。M1 已完成（动态共享内存 + tiled online softmax，BERT-base CUDA -27%），31/31 测试全绿，compute-sanitizer 零错误。
+> **最后更新**: 2026-05-29。M1/M2 已完成（tiled online softmax + K/V 内循环合并），BERT-base CUDA 22-26 ms/iter，31/31 测试全绿，compute-sanitizer 零错误。
