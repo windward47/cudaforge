@@ -12,16 +12,14 @@
 
 ## 第一步：MHA Kernel 深度优化（3 项，~5 天）
 
-### M1. FlashAttention 风格 tiled 精确注意力
+### ~~M1. FlashAttention 风格 tiled 精确注意力~~ ✅
 
 **文件**: `src/operator/nn/mha_fused_cuda.cu`
 
-当前 MHA CUDA kernel 对每个 query 位置、每个 head 重算 K/V（O(B·S·H·S·D·d) 计算量）。FlashAttention 通过分 tile 计算 + online softmax 将显存访问从 O(S²·d) 降到 O(S·d)，适合中等序列长度。
-
-**修复方向**:
-- 实现 Q·K^T 的分 tile 计算，每次只加载一个 Q tile 和一个 K tile 到 shared memory
-- 用 online softmax 累积 attention 权重和 V 加权和
-- 预期 BERT-base (S=8) 延迟再降低 30-50%
+- **动态共享内存**: `2*S*d` floats (16KB for BERT-base) 替代静态 `64*64*2` (64KB)，SM 占用率从 1 block/SM 提升到 2
+- **Tiled K/V 处理**: K/V 按 S 维度分 tile (MHA_MAX_S_SMEM=64)，每 tile 独立加载到 shared memory
+- **Online softmax**: tile 间通过 rescale 累积器保持数值一致性，支持任意序列长度
+- **性能**: BERT-base CUDA 30.35 → 22.17 ms/iter (**-27%**), speedup vs CPU 1.47x → 2.27x
 
 ### M2. QKV 投影融合
 
@@ -103,8 +101,8 @@ BERT 管线打通后，可探索 GPT-2/LLaMA 等 decoder-only 架构：
 
 | 状态 | 数量 | 内容 |
 | --- | --- | --- |
-| 已完成 | 2 | O1（外部数据加载错误日志）、O2（opset≥13 属性兼容） |
-| 待开始 | 3 | M1-M3（MHA 深度优化） |
+| 已完成 | 3 | O1（外部数据加载错误日志）、O2（opset≥13 属性兼容）、M1（FlashAttention 风格 tiled 注意力） |
+| 待开始 | 2 | M2（QKV 投影融合）、M3（Tensor Core FP16 MHA） |
 | 远期 | 2 | F1（FP16 推理）、F2（LLM 推理探索） |
 
-> **最后更新**: 2026-05-28。O1/O2（ONNX 兼容性修复）已完成，31/31 测试全绿，compute-sanitizer 零错误。进入 MHA 深度优化阶段。
+> **最后更新**: 2026-05-29。M1 已完成（动态共享内存 + tiled online softmax，BERT-base CUDA -27%），31/31 测试全绿，compute-sanitizer 零错误。

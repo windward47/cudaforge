@@ -11,7 +11,7 @@
  * Fused MHA kernel — one block per (batch, query_position)
  *
  * grid  = (B * S, 1, 1)
- * block = (min(S, 256), 1, 1)  — threads cooperate on K/V loads
+ * block = (256, 1, 1)  — threads cooperate on K/V loads
  *
  * Each block handles exactly one output query position.
  * It loops over all H heads sequentially, accumulating
@@ -22,6 +22,9 @@
  *   2. Cooperatively load K_h, V_h into shared memory
  *   3. Compute scores = Q·K^T · scale, softmax
  *   4. Weighted V sum → accumulate into output via merged·WO
+ *
+ * For S > MHA_MAX_S_SMEM, uses tiled K/V processing with
+ * online softmax to handle arbitrary sequence lengths.
  * ============================================================ */
 __global__ void mha_fused_kernel(
     const float* __restrict__ X,      /* (B, S, D) */
@@ -50,9 +53,10 @@ __global__ void mha_fused_kernel(
     float*       Y_bs = Y + (b * S + si) * D;
     const float* R_bs = (has_residual && R) ? (R + (b * S + si) * D) : NULL;
 
-    /* Shared memory for K/V of one head */
-    __shared__ float K_smem[MHA_MAX_S_SMEM * MHA_MAX_D];
-    __shared__ float V_smem[MHA_MAX_S_SMEM * MHA_MAX_D];
+    /* Dynamic shared memory for K/V of one head: 2 * S * d floats */
+    extern __shared__ float smem[];
+    float* K_smem = smem;
+    float* V_smem = smem + (int)(S * d);
 
     /* Initialize output for this query position */
     for (int j = tid; j < (int)D; j += num_threads) {
@@ -76,15 +80,27 @@ __global__ void mha_fused_kernel(
             Q_reg[di] = acc + (bQ ? bQ[head_offset + di] : 0.0f);
         }
 
-        if ((int)S <= MHA_MAX_S_SMEM) {
-            /* ---- Small S: load full K_h, V_h into shared memory ---- */
-            int total_kv = (int)(S * d);
+        /* ---- 2. Tiled K/V processing ---- */
+        float max_val = -1e38f;
+        float sum_val = 0.0f;
+        float out_acc[MHA_MAX_D] = {0.0f};
+
+        int num_kv_tiles = ((int)S + MHA_MAX_S_SMEM - 1) / MHA_MAX_S_SMEM;
+
+        for (int kt = 0; kt < num_kv_tiles; kt++) {
+            int sj_start = kt * MHA_MAX_S_SMEM;
+            int sj_end   = min(sj_start + MHA_MAX_S_SMEM, (int)S);
+            int tile_s   = sj_end - sj_start;
+
+            /* ---- 2a. Cooperatively load K/V tile into shared memory ---- */
+            int total_kv = tile_s * (int)d;
             for (int i = tid; i < total_kv; i += num_threads) {
                 int sk = i / (int)d;
                 int dk = i % (int)d;
+                int sj_abs = sj_start + sk;
                 float k_val = 0.0f, v_val = 0.0f;
                 for (int j = 0; j < (int)D; j++) {
-                    float xv = X_b[sk * D + j];
+                    float xv = X_b[sj_abs * D + j];
                     k_val += xv * WK[j * D + head_offset + dk];
                     v_val += xv * WV[j * D + head_offset + dk];
                 }
@@ -93,120 +109,51 @@ __global__ void mha_fused_kernel(
             }
             __syncthreads();
 
-            /* Score row: Q_reg · K_smem^T */
-            float scores[MHA_MAX_S_SMEM];
-            float max_val = -1e38f;
-            for (int sj = 0; sj < (int)S; sj++) {
+            /* ---- 2b. Compute scores for this tile ---- */
+            float tile_scores[MHA_MAX_S_SMEM];
+            float tile_max = -1e38f;
+            for (int sk = 0; sk < tile_s; sk++) {
                 float dot = 0.0f;
                 for (int di = 0; di < (int)d; di++) {
-                    dot += Q_reg[di] * K_smem[sj * d + di];
+                    dot += Q_reg[di] * K_smem[sk * d + di];
                 }
-                scores[sj] = dot * scale;
-                if (scores[sj] > max_val) max_val = scores[sj];
+                tile_scores[sk] = dot * scale;
+                if (tile_scores[sk] > tile_max) tile_max = tile_scores[sk];
             }
 
-            /* Softmax */
-            float sum_val = 0.0f;
-            for (int sj = 0; sj < (int)S; sj++) {
-                scores[sj] = __expf(scores[sj] - max_val);
-                sum_val += scores[sj];
-            }
-            if (sum_val < 1e-12f) sum_val = 1e-12f;
-
-            /* Weighted V sum → merged[di] */
-            float merged[MHA_MAX_D];
-            for (int di = 0; di < (int)d; di++) {
-                float acc = 0.0f;
-                for (int sj = 0; sj < (int)S; sj++) {
-                    acc += scores[sj] * V_smem[sj * d + di];
-                }
-                merged[di] = acc / sum_val;
-            }
-
-            /* Accumulate into output: Y[si, j] += sum_di merged[di] * WO[head_offset+di, j] */
-            for (int j = 0; j < (int)D; j++) {
-                float contrib = 0.0f;
+            /* ---- 2c. Online softmax: rescale previous accumulators ---- */
+            if (tile_max > max_val) {
+                float rescale = __expf(max_val - tile_max);
+                sum_val *= rescale;
                 for (int di = 0; di < (int)d; di++) {
-                    contrib += merged[di] * WO[(head_offset + di) * D + j];
+                    out_acc[di] *= rescale;
                 }
-                Y_bs[j] += contrib;
+                max_val = tile_max;
+            }
+
+            /* ---- 2d. Accumulate exp(scores) and weighted V ---- */
+            for (int sk = 0; sk < tile_s; sk++) {
+                float p = __expf(tile_scores[sk] - max_val);
+                sum_val += p;
+                for (int di = 0; di < (int)d; di++) {
+                    out_acc[di] += p * V_smem[sk * d + di];
+                }
             }
             __syncthreads();
-
-        } else {
-            /* ---- Large S: tiled K/V in S dimension ---- */
-            float max_val = -1e38f;
-            float sum_val = 0.0f;
-            float out_acc[MHA_MAX_D] = {0.0f};
-
-            int num_kv_tiles = ((int)S + MHA_MAX_S_SMEM - 1) / MHA_MAX_S_SMEM;
-
-            for (int kt = 0; kt < num_kv_tiles; kt++) {
-                int sj_start = kt * MHA_MAX_S_SMEM;
-                int sj_end   = min(sj_start + MHA_MAX_S_SMEM, (int)S);
-                int tile_s    = sj_end - sj_start;
-
-                /* Load K/V tile */
-                for (int i = tid; i < tile_s * (int)d; i += num_threads) {
-                    int sk = i / (int)d;
-                    int dk = i % (int)d;
-                    int sj_abs = sj_start + sk;
-                    float k_val = 0.0f, v_val = 0.0f;
-                    for (int j = 0; j < (int)D; j++) {
-                        float xv = X_b[sj_abs * D + j];
-                        k_val += xv * WK[j * D + head_offset + dk];
-                        v_val += xv * WV[j * D + head_offset + dk];
-                    }
-                    K_smem[sk * d + dk] = k_val + (bK ? bK[head_offset + dk] : 0.0f);
-                    V_smem[sk * d + dk] = v_val + (bV ? bV[head_offset + dk] : 0.0f);
-                }
-                __syncthreads();
-
-                /* Scores for this tile */
-                float tile_scores[MHA_MAX_S_SMEM];
-                float tile_max = -1e38f;
-                for (int sk = 0; sk < tile_s; sk++) {
-                    float dot = 0.0f;
-                    for (int di = 0; di < (int)d; di++) {
-                        dot += Q_reg[di] * K_smem[sk * d + di];
-                    }
-                    tile_scores[sk] = dot * scale;
-                    if (tile_scores[sk] > tile_max) tile_max = tile_scores[sk];
-                }
-
-                /* Rescale previous accumulators if new max found */
-                if (tile_max > max_val) {
-                    float rescale = __expf(max_val - tile_max);
-                    sum_val *= rescale;
-                    for (int di = 0; di < (int)d; di++) {
-                        out_acc[di] *= rescale;
-                    }
-                    max_val = tile_max;
-                }
-
-                /* Accumulate exp + weighted V */
-                for (int sk = 0; sk < tile_s; sk++) {
-                    float p = __expf(tile_scores[sk] - max_val);
-                    sum_val += p;
-                    for (int di = 0; di < (int)d; di++) {
-                        out_acc[di] += p * V_smem[sk * d + di];
-                    }
-                }
-                __syncthreads();
-            }
-
-            /* Normalize and accumulate into output */
-            if (sum_val < 1e-12f) sum_val = 1e-12f;
-            float inv_sum = 1.0f / sum_val;
-
-            for (int j = 0; j < (int)D; j++) {
-                float contrib = 0.0f;
-                for (int di = 0; di < (int)d; di++) {
-                    contrib += out_acc[di] * inv_sum * WO[(head_offset + di) * D + j];
-                }
-                Y_bs[j] += contrib;
-            }
         }
+
+        /* ---- 3. Normalize and accumulate into output ---- */
+        if (sum_val < 1e-12f) sum_val = 1e-12f;
+        float inv_sum = 1.0f / sum_val;
+
+        for (int j = tid; j < (int)D; j += num_threads) {
+            float contrib = 0.0f;
+            for (int di = 0; di < (int)d; di++) {
+                contrib += out_acc[di] * inv_sum * WO[(head_offset + di) * D + j];
+            }
+            Y_bs[j] += contrib;
+        }
+        __syncthreads();
     }
 }
 
@@ -242,13 +189,15 @@ int mha_fused_f32_cuda(const void* inputs[], void* outputs[],
     /* One block per (batch, query_position) */
     dim3 grid((unsigned int)(B * S), 1, 1);
 
-    /* Threads per block: enough to cover S for cooperative K/V loads */
-    int threads = (int)(S < 32 ? 32 : (S > 256 ? 256 : S));
-    dim3 block(threads, 1, 1);
+    /* 256 threads: good occupancy for sm_86 */
+    dim3 block(256, 1, 1);
+
+    /* Dynamic shared memory: K_smem + V_smem, S*d floats each */
+    size_t smem_bytes = (size_t)(2 * S * d) * sizeof(float);
 
     int has_residual = p->has_residual && R ? 1 : 0;
 
-    return CUDA_KERNEL_LAUNCH(mha_fused_kernel, grid, block, 0, s,
+    return CUDA_KERNEL_LAUNCH(mha_fused_kernel, grid, block, smem_bytes, s,
         X, WQ, bQ, WK, bK, WV, bV, WO, bO, Y, R,
         B, S, D, H, d, p->scale, has_residual);
 }

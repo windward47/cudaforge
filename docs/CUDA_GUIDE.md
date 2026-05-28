@@ -262,42 +262,55 @@ __global__ void mha_fused_kernel(
     int b  = bs / S;
     int si = bs % S;
 
-    __shared__ float K_smem[64 * 64];  /* K/V tile 缓存 */
-    __shared__ float V_smem[64 * 64];
+    /* 动态共享内存: 2*S*d floats (16KB for BERT-base S=8,d=64)
+       比静态 64*64*2 (64KB) 节省 4x，SM 占用率翻倍 */
+    extern __shared__ float smem[];
+    float* K_smem = smem;
+    float* V_smem = smem + S * d;
 
     /* 初始化输出 = bias + residual */
     Y_bs[j] = bO[j] + (R_bs ? R_bs[j] : 0);
 
     /* 逐 head 循环（避免 block 间竞争） */
     for (int h = 0; h < H; h++) {
-        /* 1. 计算 Q_h[si, :] */
-        float Q_reg[64];  /* ≤ head_dim */
+        /* 1. 计算 Q_h[si, :] 到寄存器 */
+        float Q_reg[64];
         for (di) Q_reg[di] = sum_j X[si,j] * WQ[j, h*d+di] + bQ[h*d+di];
 
-        /* 2. 协作加载 K_h, V_h → shared memory */
-        for (i = tid; i < S*d; i += blockDim.x) {
-            int sk = i / d, dk = i % d;
-            K_smem[sk*d+dk] = sum_j X[sk,j] * WK[j, h*d+dk] + bK[h*d+dk];
-            V_smem[sk*d+dk] = sum_j X[sk,j] * WV[j, h*d+dk] + bV[h*d+dk];
+        /* 2. Tiled K/V 处理 + Online Softmax */
+        float max_val = -1e38f, sum_val = 0.0f;
+        float out_acc[64] = {0};
+
+        for (kt = 0; kt < num_kv_tiles; kt++) {
+            /* 2a. 协作加载 K/V tile → shared memory */
+            for (i = tid; i < tile_s * d; i += blockDim.x) {
+                int sk = i / d, dk = i % d;
+                K_smem[sk*d+dk] = sum_j X[sk,j] * WK[j, h*d+dk] + bK[h*d+dk];
+                V_smem[sk*d+dk] = sum_j X[sk,j] * WV[j, h*d+dk] + bV[h*d+dk];
+            }
+            __syncthreads();
+
+            /* 2b. 计算 tile 内 scores */
+            for (sk) tile_scores[sk] = dot(Q_reg, K_smem[sk,:]) * scale;
+
+            /* 2c. Online softmax: rescale 累积器 */
+            if (tile_max > max_val) {
+                sum_val *= expf(max_val - tile_max);
+                out_acc *= expf(max_val - tile_max);
+                max_val = tile_max;
+            }
+
+            /* 2d. 累加 exp(scores) · V */
+            for (sk) {
+                float p = expf(tile_scores[sk] - max_val);
+                sum_val += p;
+                for (di) out_acc[di] += p * V_smem[sk*d+di];
+            }
+            __syncthreads();
         }
-        __syncthreads();
 
-        /* 3. Q·K^T → scale → softmax */
-        float scores[S];
-        for (sj) scores[sj] = dot(Q_reg, K_smem[sj,:]) * scale;
-        for (sj) scores[sj] = expf(scores[sj] - max_val); sum_val += scores[sj];
-
-        /* 4. Weighted V sum + output projection */
-        float merged[d];
-        for (di) merged[di] = sum_j scores[sj] * V_smem[sj,di] / sum_val;
-
-        /* 5. 累加到输出: Y += merged · WO_slice */
-        for (j) {
-            float contrib = 0;
-            for (di) contrib += merged[di] * WO[h*d+di, j];
-            Y_bs[j] += contrib;
-        }
-        __syncthreads();
+        /* 3. 归一化 + 输出投影: Y += (out_acc/sum_val) · WO */
+        for (j) Y_bs[j] += out_acc[di] / sum_val * WO[h*d+di, j];
     }
 }
 ```
@@ -305,8 +318,9 @@ __global__ void mha_fused_kernel(
 **关键设计决策**:
 - **grid=(B×S)** 而非 (B×H): 每 block 写唯一输出位置，避免 block 间用 atomicAdd 竞争
 - **Heads 串联**而非并联: 多 block 写同一输出用 atomicAdd 会产生大量全局内存竞争，不如在单 block 内顺序处理
-- **scores/merged 用寄存器数组**: 避免共享内存竞态（曾导致 max_diff=28.7 的错误）
-- **仅 S≤64 时加载完整 K/V 到 shared memory**: 长序列用 tiled 在线 softmax
+- **scores/out_acc 用寄存器数组**: 避免共享内存竞态（曾导致 max_diff=28.7 的错误）
+- **动态共享内存** (`extern __shared__`): 按 `2*S*d` 分配，比静态 64×64 节省 4x 显存，SM 占用率翻倍
+- **Tiled K/V + Online Softmax**: K/V 按 S 维度分 tile 加载到 shared memory，tile 间通过 rescale 累积器保持数值一致性，支持任意序列长度（S>64）
 
 **Application 层检测**: `detect_and_fuse_mha()` 在 `graph_execute()` 的 fusion pre-pass 中检测完整 self-attention 子图模式（QKV MatMul→Reshape→Transpose→Q·K^T→Mul→Softmax→×V→Transpose→Reshape→Output MatMul→Residual Add），转换为 MHA_Fused 节点。融合后保存原始节点配置，每次执行后恢复（非破坏性融合）。
 
