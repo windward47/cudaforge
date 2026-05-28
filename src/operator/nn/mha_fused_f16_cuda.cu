@@ -1,10 +1,18 @@
-/* M3: Tensor Core FP16 MHA kernel.
-   Uses scalar FP16 for projections, FP32 for softmax and accumulation.
-   Separate file to avoid extern __shared__ type conflicts with FP32 kernel. */
+/* M3: FP16 MHA kernel with WMMA for output projection.
+   Scalar FP16 for QKV projections, WMMA 16×16×16 for output projection.
+   Pre-loads WO slice into shared memory to avoid large local arrays. */
 #include "operator.h"
 #include "cuda_ops.h"
 #include "mha_fused_int.h"
 #include <cuda_fp16.h>
+#include <mma.h>
+
+using namespace nvcuda;
+
+#define WMMA_M 16
+#define WMMA_N 16
+#define WMMA_K 16
+#define MAX_SEQ_LEN 64
 
 __global__ void mha_fused_f16_kernel(
     const float* __restrict__ X,
@@ -28,13 +36,18 @@ __global__ void mha_fused_f16_kernel(
     float* Y_bs = Y + (b * S + si) * D;
     const float* R_bs = (has_residual && R) ? (R + (b * S + si) * D) : NULL;
     int S_int = (int)S, d_int = (int)d, D_int = (int)D;
+    int S_pad = ((S_int + WMMA_M - 1) / WMMA_M) * WMMA_M;
 
-    /* Dynamic shared memory:
-       K: S × d (FP16) + V: S × d (FP16)
-       BERT-base: 2 * 8 * 64 * 2 = 2KB */
+    /* Dynamic shared memory layout:
+       K(S×d) + V(S×d) + merged(S_pad×d) as __half
+       W_tile(WMMA_K×WMMA_N) as __half, tbuf(WMMA_M×WMMA_N) as float
+       BERT-base: (2*8*64 + 16*64)*2 + 16*16*2 + 16*16*4 = 6144 + 512 + 1024 = 7680 bytes */
     extern __shared__ __half smem[];
     __half* K_smem = smem;
     __half* V_smem = smem + S_int * d_int;
+    __half* M_smem = smem + 2 * S_int * d_int;  /* merged: S_pad × d */
+    __half* W_tile = M_smem + S_pad * d_int;     /* WMMA_K × WMMA_N */
+    float*  tbuf   = (float*)(W_tile + WMMA_K * WMMA_N);  /* WMMA_M × WMMA_N */
 
     /* Initialize output */
     for (int j = tid; j < D_int; j += nthreads) {
@@ -44,65 +57,57 @@ __global__ void mha_fused_f16_kernel(
     }
     __syncthreads();
 
-    /* Loop over heads */
+    /* Process each head */
     for (int h = 0; h < (int)H; h++) {
         int ho = h * d_int;
 
-        /* ---- 1. Compute Q_h[si, :] in FP16, then convert to FP32 for scores ---- */
-        /* Q_reg[di] = sum_j X[si,j] * WQ[j*D+ho+di] + bQ[ho+di] */
-        float Q_reg[64];  /* FP32 for attention computation */
+        /* ---- 1. Q projection: X·WQ → Q_reg (FP16 mul, FP32 acc) ---- */
+        float Q_reg[64];
         for (int di = 0; di < d_int; di++) {
             float acc = 0.0f;
             for (int j = 0; j < D_int; j++) {
-                float x_f32 = X_b[si * D_int + j];
-                float w_f32 = WQ[j * D_int + ho + di];
-                __half x_h = __float2half(x_f32);
-                __half w_h = __float2half(w_f32);
-                /* FP16 multiply, accumulate in FP32 */
-                acc += __half2float(__hmul(x_h, w_h));
+                acc += __half2float(__hmul(
+                    __float2half(X_b[si * D_int + j]),
+                    __float2half(WQ[j * D_int + ho + di])));
             }
             Q_reg[di] = acc + (bQ ? bQ[ho + di] : 0.0f);
         }
 
         /* ---- 2. K = X·WK → K_smem (FP16) ---- */
-        int total_kv = S_int * d_int;
-        for (int i = tid; i < total_kv; i += nthreads) {
+        for (int i = tid; i < S_int * d_int; i += nthreads) {
             int sj = i / d_int, dk = i % d_int;
             float acc = 0.0f;
             for (int j = 0; j < D_int; j++) {
-                __half x_h = __float2half(X_b[sj * D_int + j]);
-                __half w_h = __float2half(WK[j * D_int + ho + dk]);
-                acc += __half2float(__hmul(x_h, w_h));
+                acc += __half2float(__hmul(
+                    __float2half(X_b[sj * D_int + j]),
+                    __float2half(WK[j * D_int + ho + dk])));
             }
             K_smem[i] = __float2half(acc + (bK ? bK[ho + dk] : 0.0f));
         }
 
         /* ---- 3. V = X·WV → V_smem (FP16) ---- */
-        for (int i = tid; i < total_kv; i += nthreads) {
+        for (int i = tid; i < S_int * d_int; i += nthreads) {
             int sj = i / d_int, dk = i % d_int;
             float acc = 0.0f;
             for (int j = 0; j < D_int; j++) {
-                __half x_h = __float2half(X_b[sj * D_int + j]);
-                __half w_h = __float2half(WV[j * D_int + ho + dk]);
-                acc += __half2float(__hmul(x_h, w_h));
+                acc += __half2float(__hmul(
+                    __float2half(X_b[sj * D_int + j]),
+                    __float2half(WV[j * D_int + ho + dk])));
             }
             V_smem[i] = __float2half(acc + (bV ? bV[ho + dk] : 0.0f));
         }
         __syncthreads();
 
         /* ---- 4. Scores = Q·K^T → softmax (FP32) ---- */
-        /* Each thread handles one score row (for our query position si) */
-        float scores[64];  /* S_max */
+        float scores[MAX_SEQ_LEN];
         for (int sj = 0; sj < S_int; sj++) {
             float dot = 0.0f;
             for (int di = 0; di < d_int; di++) {
-                /* Q_reg[di] is FP32, K_smem[sj*d+di] is FP16 */
                 dot += Q_reg[di] * __half2float(K_smem[sj * d_int + di]);
             }
             scores[sj] = dot * scale;
         }
 
-        /* Softmax in FP32 */
         float max_val = -1e38f;
         for (int sj = 0; sj < S_int; sj++)
             if (scores[sj] > max_val) max_val = scores[sj];
@@ -114,27 +119,61 @@ __global__ void mha_fused_f16_kernel(
         if (sum_val < 1e-12f) sum_val = 1e-12f;
         float inv_sum = 1.0f / sum_val;
 
-        /* ---- 5. Weighted V sum → merged (FP32) ---- */
-        float merged[64];  /* d_max */
-        for (int di = 0; di < d_int; di++) {
-            float acc = 0.0f;
-            for (int sj = 0; sj < S_int; sj++) {
-                acc += scores[sj] * inv_sum * __half2float(V_smem[sj * d_int + di]);
+        /* ---- 5. Weighted V sum → M_smem (FP16) ---- */
+        for (int i = tid; i < S_pad * d_int; i += nthreads) {
+            int r = i / d_int, c = i % d_int;
+            if (r < S_int) {
+                float acc = 0.0f;
+                for (int sj = 0; sj < S_int; sj++) {
+                    acc += scores[sj] * inv_sum * __half2float(V_smem[sj * d_int + c]);
+                }
+                M_smem[i] = __float2half(acc);
+            } else {
+                M_smem[i] = __float2half(0.0f);
             }
-            merged[di] = acc;
-        }
-
-        /* ---- 6. Output projection: Y += merged · WO ---- */
-        for (int j = tid; j < D_int; j += nthreads) {
-            float contrib = 0.0f;
-            for (int di = 0; di < d_int; di++) {
-                __half m_h = __float2half(merged[di]);
-                __half w_h = __float2half(WO[(ho + di) * D_int + j]);
-                contrib += __half2float(__hmul(m_h, w_h));
-            }
-            Y_bs[j] += contrib;
         }
         __syncthreads();
+
+        /* ---- 6. Output projection: Y += M_smem · WO (WMMA) ---- */
+        /* M_smem: (S_pad, d) FP16, WO: (D, D) FP32 → load WO tile as FP16 into tbuf */
+        for (int _tr = 0; _tr < S_pad; _tr += WMMA_M) {
+            for (int _tc = 0; _tc < D_int; _tc += WMMA_N) {
+                wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> c_frag;
+                wmma::fill_fragment(c_frag, 0.0f);
+
+                for (int _k = 0; _k < d_int; _k += WMMA_K) {
+                    wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, __half, wmma::row_major> a_frag;
+                    wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, __half, wmma::col_major> b_frag;
+
+                    /* Load A from M_smem (S_pad × d, row-major, ldim = d) */
+                    wmma::load_matrix_sync(a_frag, M_smem + _tr * d_int + _k, d_int);
+
+                    /* Load B: WO slice (d × D) as FP16 into W_tile (col-major). */
+                    for (int i = tid; i < WMMA_K * WMMA_N; i += nthreads) {
+                        int r = i / WMMA_N, c = i % WMMA_N;
+                        int gr = ho + _k + r, gc = _tc + c;
+                        W_tile[r + c * WMMA_K] = (gr < D_int && gc < D_int) ?
+                            __float2half(WO[gr * D_int + gc]) : __float2half(0.0f);
+                    }
+                    __syncthreads();
+                    wmma::load_matrix_sync(b_frag, W_tile, WMMA_K);
+                    wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
+                    __syncthreads();
+                }
+
+                /* Store FP32 result to tbuf, accumulate into Y_bs */
+                wmma::store_matrix_sync(tbuf, c_frag, WMMA_N, wmma::mem_row_major);
+                __syncthreads();
+
+                if (_tr <= si && si < _tr + WMMA_M) {
+                    int local_row = si - _tr;
+                    for (int _i = tid; _i < WMMA_N && _tc + _i < D_int; _i += nthreads) {
+                        Y_bs[_tc + _i] += tbuf[local_row * WMMA_N + _i];
+                    }
+                }
+                __syncthreads();
+            }
+        }
     }
 }
 
@@ -164,8 +203,10 @@ int mha_fused_f16_cuda(const void* inputs[], void* outputs[],
     dim3 grid((unsigned int)(B * S), 1, 1);
     dim3 block(256, 1, 1);
 
-    /* K(S*d) + V(S*d) as __half */
-    size_t smem_bytes = (size_t)(2 * S * d) * sizeof(__half);
+    /* K(S*d) + V(S*d) + merged(S_pad*d) as __half + W_tile(WMMA_K*WMMA_N) as __half + tbuf(16*16 as float) */
+    int S_pad = ((int)S + WMMA_M - 1) / WMMA_M * WMMA_M;
+    size_t smem_bytes = (size_t)(2 * S * d + S_pad * d + WMMA_K * WMMA_N) * sizeof(__half)
+                      + (size_t)(WMMA_M * WMMA_N) * sizeof(float);
 
     return CUDA_KERNEL_LAUNCH(mha_fused_f16_kernel, grid, block, smem_bytes, s,
         X, WQ, bQ, WK, bK, WV, bV, WO, bO, Y, R,

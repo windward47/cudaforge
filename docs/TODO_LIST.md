@@ -34,10 +34,12 @@
 
 **文件**: `src/operator/nn/mha_fused_f16_cuda.cu`（独立文件，避免 shared memory 类型冲突）
 
-- **FP16 标量 kernel**: 已实现，FP32→FP16 逐元素转换 + `__hmul` 标量乘法 + FP32 累加
+- **混合 FP16 kernel**: 标量 FP16 QKV 投影 + WMMA 16×16×16 输出投影
+- **Shared memory**: K(S×d) + V(S×d) + merged(S_pad×d) + W_tile(WMMA_K×WMMA_N) + tbuf(16×16) = ~8KB
 - **精度**: max_rel=2.87e-04（远低于 1e-2 阈值）
-- **性能**: 47.5 ms/iter（略慢于 FP32 的 44.4 ms，因 `__float2half`/`__half2float` 转换开销）
-- **待优化**: WMMA Tensor Core 版本（需解决 `store_matrix_sync` 类型匹配和 shared memory 布局问题，理论吞吐量 2-4×）
+- **性能**: 29.95 ms/iter（FP32 25.88 ms，慢 16% — QKV 标量转换开销主导）
+- **瓶颈分析**: QKV 投影占总计算 95%，标量 `__float2half`/`__hmul`/`__half2float` 转换链开销抵消了 WMMA 输出投影的收益
+- **待优化**: WMMA 用于 QKV 投影（需将 X 和权重预加载到 shared memory，避免大局部数组）
 - **算子注册**: `mha_fused_f16_cuda`，CPU stub 返回 -1
 - **compute-sanitizer**: 0 错误
 
