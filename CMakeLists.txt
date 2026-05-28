@@ -101,6 +101,7 @@ target_sources(operator PRIVATE
     src/operator/nn/reduce.c
     src/operator/nn/cast.c
     src/operator/nn/argmax.c
+    src/operator/nn/mha_fused.c
     src/operator/operator_registry.c
     src/operator/operator_init.c
 )
@@ -130,6 +131,7 @@ if(ENABLE_CUDA)
         src/operator/nn/reduce_cuda.cu
         src/operator/nn/cast_cuda.cu
         src/operator/nn/argmax_cuda.cu
+        src/operator/nn/mha_fused_cuda.cu
         src/operator/blas/matmul_cuda.cu
     )
 endif()
@@ -578,6 +580,45 @@ if(ENABLE_TESTS)
     add_test(NAME test_bert COMMAND test_bert)
     set_tests_properties(test_bert PROPERTIES
         WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+
+    add_executable(test_bert_mha
+        tests/test_bert_mha.c
+    )
+    target_include_directories(test_bert_mha PRIVATE
+        third_party/unity/src
+        src/application/model
+        src/application/engine
+        src/application/include
+        src/operator/include
+        src/operator/blas
+        src/operator/nn
+        src/platform/include
+    )
+    target_link_libraries(test_bert_mha PRIVATE onnx_model application operator platform unity)
+    if(CMAKE_C_COMPILER_ID STREQUAL "MSVC")
+        target_compile_options(test_bert_mha PRIVATE /wd4189 /wd4456 /wd4101)
+    endif()
+    add_test(NAME test_bert_mha COMMAND test_bert_mha)
+    set_tests_properties(test_bert_mha PROPERTIES
+        WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+
+    add_executable(bench_bert_mha
+        tests/bench_bert_mha.c
+    )
+    target_include_directories(bench_bert_mha PRIVATE
+        third_party/unity/src
+        src/application/model
+        src/application/engine
+        src/application/include
+        src/operator/include
+        src/operator/blas
+        src/operator/nn
+        src/platform/include
+    )
+    target_link_libraries(bench_bert_mha PRIVATE onnx_model application operator platform unity)
+    if(CMAKE_C_COMPILER_ID STREQUAL "MSVC")
+        target_compile_options(bench_bert_mha PRIVATE /wd4189 /wd4456 /wd4101)
+    endif()
 
 endif()
 

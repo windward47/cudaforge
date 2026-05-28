@@ -39,6 +39,7 @@ typedef enum {
     OP_REDUCE,
     OP_CAST,
     OP_ARGMAX,
+    OP_MHA_FUSED,
     OP_INPUT,
     OP_OUTPUT
 } op_type_t;

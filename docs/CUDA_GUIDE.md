@@ -239,9 +239,76 @@ __global__ void matmul_f16_tc(const half* A, const half* B, float* C,
 
 ### Level 4: Kernel Fusion（算子融合）
 
-适用场景：Conv/MatMul → ReLU/Sigmoid/GELU 连续模式，消除中间张量的显存往返。
+适用场景：Conv/MatMul → ReLU/Sigmoid/GELU 连续模式，或 Multi-Head Attention 子图融合，消除中间张量的显存往返。
 
-**实现方式**: 在 conv/matmul kernel 末尾内联激活函数，避免单独的激活 kernel launch 和中间结果的 global memory 读写。
+**简单融合 (Conv+Activation)**: 在 conv/matmul kernel 末尾内联激活函数，避免单独的激活 kernel launch 和中间结果的 global memory 读写。
+
+**复杂融合 (MHA_Fused)**: 将 ~14 节点的 self-attention 子图（3×QKV MatMul + 3×Reshape + 3×Transpose + Q·K^T MatMul + Mul + Softmax + ×V MatMul + Transpose + Reshape + Output MatMul + Residual Add）融合为单个 kernel。核心设计：
+
+```cuda
+/* MHA Fused Kernel — grid=(B*S), 每 block 处理一个 query position
+   内部循环所有 head，避免 block 间输出竞争 */
+__global__ void mha_fused_kernel(
+    const float* X,      /* (B, S, D) — LayerNorm 输出 */
+    const float* WQ, const float* bQ,
+    const float* WK, const float* bK,
+    const float* WV, const float* bV,
+    const float* WO, const float* bO,
+    float* Y,            /* (B, S, D) — 输出 */
+    const float* R,      /* (B, S, D) — 残差，可为 NULL */
+    int64_t B, S, D, H, d, float scale, int has_residual)
+{
+    int bs = blockIdx.x;         /* flat: b * S + si */
+    int b  = bs / S;
+    int si = bs % S;
+
+    __shared__ float K_smem[64 * 64];  /* K/V tile 缓存 */
+    __shared__ float V_smem[64 * 64];
+
+    /* 初始化输出 = bias + residual */
+    Y_bs[j] = bO[j] + (R_bs ? R_bs[j] : 0);
+
+    /* 逐 head 循环（避免 block 间竞争） */
+    for (int h = 0; h < H; h++) {
+        /* 1. 计算 Q_h[si, :] */
+        float Q_reg[64];  /* ≤ head_dim */
+        for (di) Q_reg[di] = sum_j X[si,j] * WQ[j, h*d+di] + bQ[h*d+di];
+
+        /* 2. 协作加载 K_h, V_h → shared memory */
+        for (i = tid; i < S*d; i += blockDim.x) {
+            int sk = i / d, dk = i % d;
+            K_smem[sk*d+dk] = sum_j X[sk,j] * WK[j, h*d+dk] + bK[h*d+dk];
+            V_smem[sk*d+dk] = sum_j X[sk,j] * WV[j, h*d+dk] + bV[h*d+dk];
+        }
+        __syncthreads();
+
+        /* 3. Q·K^T → scale → softmax */
+        float scores[S];
+        for (sj) scores[sj] = dot(Q_reg, K_smem[sj,:]) * scale;
+        for (sj) scores[sj] = expf(scores[sj] - max_val); sum_val += scores[sj];
+
+        /* 4. Weighted V sum + output projection */
+        float merged[d];
+        for (di) merged[di] = sum_j scores[sj] * V_smem[sj,di] / sum_val;
+
+        /* 5. 累加到输出: Y += merged · WO_slice */
+        for (j) {
+            float contrib = 0;
+            for (di) contrib += merged[di] * WO[h*d+di, j];
+            Y_bs[j] += contrib;
+        }
+        __syncthreads();
+    }
+}
+```
+
+**关键设计决策**:
+- **grid=(B×S)** 而非 (B×H): 每 block 写唯一输出位置，避免 block 间用 atomicAdd 竞争
+- **Heads 串联**而非并联: 多 block 写同一输出用 atomicAdd 会产生大量全局内存竞争，不如在单 block 内顺序处理
+- **scores/merged 用寄存器数组**: 避免共享内存竞态（曾导致 max_diff=28.7 的错误）
+- **仅 S≤64 时加载完整 K/V 到 shared memory**: 长序列用 tiled 在线 softmax
+
+**Application 层检测**: `detect_and_fuse_mha()` 在 `graph_execute()` 的 fusion pre-pass 中检测完整 self-attention 子图模式（QKV MatMul→Reshape→Transpose→Q·K^T→Mul→Softmax→×V→Transpose→Reshape→Output MatMul→Residual Add），转换为 MHA_Fused 节点。融合后保存原始节点配置，每次执行后恢复（非破坏性融合）。
 
 ```cuda
 /* conv kernel 末尾 — 融合激活 */

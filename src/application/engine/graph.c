@@ -1,5 +1,6 @@
 #include "graph.h"
 #include "conv_int.h"
+#include "mha_fused_int.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -238,8 +239,378 @@ static const char* op_name(op_type_t type) {
         case OP_REDUCE:             return "reduce_f32";
         case OP_CAST:               return "cast_f32";
         case OP_ARGMAX:             return "argmax_f32";
+        case OP_MHA_FUSED:          return "mha_fused_f32";
         default:                    return NULL;
     }
+}
+
+/* ============================================================
+ * MHA fusion helpers
+ * ============================================================ */
+
+/* Find the unique consumer node of a tensor. Returns -1 if 0 or >1 consumers. */
+static int mha_unique_consumer(inference_graph_t* g, int tid, const int* skip) {
+    int found = -1;
+    for (int i = 0; i < g->num_nodes; i++) {
+        if (skip && skip[i]) continue;
+        graph_node_t* n = &g->nodes[i];
+        for (int j = 0; j < n->num_inputs; j++) {
+            if (n->input_tensors[j] == tid) {
+                if (found >= 0) return -1;
+                found = i;
+                break;
+            }
+        }
+    }
+    return found;
+}
+
+/* Count consumers of a tensor across all non-skipped nodes */
+static int mha_count_consumers(inference_graph_t* g, int tid, const int* skip) {
+    int count = 0;
+    for (int i = 0; i < g->num_nodes; i++) {
+        if (skip && skip[i]) continue;
+        graph_node_t* n = &g->nodes[i];
+        for (int j = 0; j < n->num_inputs; j++) {
+            if (n->input_tensors[j] == tid) { count++; break; }
+        }
+    }
+    return count;
+}
+
+/* ============================================================
+ * MHA node restore info — for non-destructive fusion
+ * ============================================================ */
+typedef struct {
+    int        node_id;  /* -1 if no restore needed */
+    op_type_t  saved_type;
+    int        saved_num_inputs;
+    int*       saved_input_tensors;
+    int        saved_num_outputs;
+    int*       saved_output_tensors;
+    int        saved_num_weights;
+    tensor_t** saved_weights;
+    void*      saved_params;
+    size_t     saved_params_size;
+} mha_restore_info_t;
+
+/* ============================================================
+ * MHA subgraph fusion detection
+ *
+ * Detects the standard BERT self-attention pattern:
+ *   X → 3×[MatMul+Add → Reshape → Transpose] → Q, K, V
+ *   Q·K^T → Mul(scale) → Softmax → ×V
+ *   Transpose → Reshape → MatMul(W_O)+Add(b_O) → Add(residual)
+ *
+ * Converts the first QKV MatMul node into OP_MHA_FUSED and marks
+ * the remaining 20+ nodes as skipped.  Saves the original node
+ * state in *restore so the caller can undo the conversion after
+ * execution (non-destructive fusion).
+ * ============================================================ */
+static int detect_and_fuse_mha(inference_graph_t* g, int* fused_skip,
+                               mha_restore_info_t* restore) {
+    if (g->num_nodes < 20) return 0;
+    if (restore) restore->node_id = -1;
+
+    /* Phase 1: scan for a tensor consumed by exactly 3 MatMul nodes */
+    for (int tid = 0; tid < g->num_tensors; tid++) {
+        int mm_nodes[3];
+        int mm_count = 0;
+        for (int i = 0; i < g->num_nodes && mm_count <= 3; i++) {
+            if (fused_skip[i]) continue;
+            graph_node_t* n = &g->nodes[i];
+            if (n->type != OP_MATMUL || n->num_inputs < 1 || n->num_outputs < 1) continue;
+            for (int j = 0; j < n->num_inputs; j++) {
+                if (n->input_tensors[j] == tid) {
+                    if (mm_count < 3) mm_nodes[mm_count] = i;
+                    mm_count++;
+                    break;
+                }
+            }
+        }
+        if (mm_count != 3) continue;
+
+        int anchor_tid = tid;
+
+        /* Phase 2: trace each chain: MatMul → (Add) → Reshape → Transpose */
+        int chain_add[3]       = {-1, -1, -1};
+        int chain_reshape[3]   = {-1, -1, -1};
+        int chain_transpose[3] = {-1, -1, -1};
+        int chain_out_tid[3]   = {-1, -1, -1};
+        tensor_t* chain_w[3] = {NULL, NULL, NULL};
+        tensor_t* chain_b[3] = {NULL, NULL, NULL};
+        bool chains_ok = true;
+
+        for (int c = 0; c < 3 && chains_ok; c++) {
+            int mm_nid = mm_nodes[c];
+            graph_node_t* mm = &g->nodes[mm_nid];
+
+            /* Extract weight tensor (second input to MatMul) */
+            if (mm->num_weights >= 1 && mm->weights && mm->weights[0])
+                chain_w[c] = mm->weights[0];
+
+            int cur_tid = mm->output_tensors[0];
+
+            /* Optional Add (bias) */
+            int add_nid = mha_unique_consumer(g, cur_tid, fused_skip);
+            if (add_nid >= 0 && g->nodes[add_nid].type == OP_ADD
+                && g->nodes[add_nid].num_inputs >= 2
+                && g->nodes[add_nid].input_tensors[0] == cur_tid) {
+                chain_add[c] = add_nid;
+                if (g->nodes[add_nid].num_weights >= 1 && g->nodes[add_nid].weights)
+                    chain_b[c] = g->nodes[add_nid].weights[0];
+                cur_tid = g->nodes[add_nid].output_tensors[0];
+            }
+
+            /* Reshape */
+            int rs_nid = mha_unique_consumer(g, cur_tid, fused_skip);
+            if (rs_nid < 0 || g->nodes[rs_nid].type != OP_RESHAPE) {
+                chains_ok = false; break;
+            }
+            chain_reshape[c] = rs_nid;
+            cur_tid = g->nodes[rs_nid].output_tensors[0];
+
+            /* Transpose */
+            int tr_nid = mha_unique_consumer(g, cur_tid, fused_skip);
+            if (tr_nid < 0 || g->nodes[tr_nid].type != OP_TRANSPOSE) {
+                chains_ok = false; break;
+            }
+            chain_transpose[c] = tr_nid;
+            chain_out_tid[c] = g->nodes[tr_nid].output_tensors[0];
+        }
+        if (!chains_ok) continue;
+
+        /* Phase 3: identify Q, K, V.
+         * Q = chain whose output is input[0] of a MatMul (attention scores)
+         * K = chain whose output is input[1] of the SAME MatMul
+         * V = the remaining chain */
+        int q_idx = -1, k_idx = -1, v_idx = -1;
+        int attn_mm_nid = -1;
+
+        for (int ci = 0; ci < 3 && attn_mm_nid < 0; ci++) {
+            int out_tid = chain_out_tid[ci];
+            for (int i = 0; i < g->num_nodes; i++) {
+                if (fused_skip[i]) continue;
+                graph_node_t* n = &g->nodes[i];
+                if (n->type != OP_MATMUL || n->num_inputs < 2) continue;
+                if (n->input_tensors[0] == out_tid) {
+                    /* Found a MatMul consuming this chain as first input → Q */
+                    q_idx = ci;
+                    attn_mm_nid = i;
+                    break;
+                }
+            }
+        }
+        if (q_idx < 0 || attn_mm_nid < 0) continue;
+
+        /* The second input of attn_mm is K */
+        graph_node_t* attn_mm = &g->nodes[attn_mm_nid];
+        int k_tid = attn_mm->input_tensors[1];
+        for (int ci = 0; ci < 3; ci++) {
+            if (ci == q_idx) continue;
+            if (chain_out_tid[ci] == k_tid) {
+                k_idx = ci;
+                break;
+            }
+        }
+        if (k_idx < 0) continue;
+
+        /* The remaining chain is V */
+        for (int ci = 0; ci < 3; ci++) {
+            if (ci != q_idx && ci != k_idx) { v_idx = ci; break; }
+        }
+
+        /* Phase 4: trace attention computation */
+        int attn_out_tid = attn_mm->output_tensors[0];
+
+        /* Mul(scale) */
+        int mul_nid = mha_unique_consumer(g, attn_out_tid, fused_skip);
+        if (mul_nid < 0 || g->nodes[mul_nid].type != OP_MUL) continue;
+        int mul_out_tid = g->nodes[mul_nid].output_tensors[0];
+
+        /* Softmax */
+        int softmax_nid = mha_unique_consumer(g, mul_out_tid, fused_skip);
+        if (softmax_nid < 0 || g->nodes[softmax_nid].type != OP_SOFTMAX) continue;
+        int probs_tid = g->nodes[softmax_nid].output_tensors[0];
+
+        /* MatMul(probs, V) */
+        int v_mm_nid = mha_unique_consumer(g, probs_tid, fused_skip);
+        if (v_mm_nid < 0 || g->nodes[v_mm_nid].type != OP_MATMUL
+            || g->nodes[v_mm_nid].num_inputs < 2) continue;
+        /* Verify V input: either input[0] or input[1] */
+        graph_node_t* v_mm = &g->nodes[v_mm_nid];
+        int v_tid = chain_out_tid[v_idx];
+        if (v_mm->input_tensors[0] != probs_tid
+            || (v_mm->input_tensors[1] != v_tid)) continue;
+
+        /* Phase 5: trace merge + output projection + residual */
+        int v_out_tid = v_mm->output_tensors[0];
+
+        /* Transpose */
+        int merge_tr_nid = mha_unique_consumer(g, v_out_tid, fused_skip);
+        if (merge_tr_nid < 0 || g->nodes[merge_tr_nid].type != OP_TRANSPOSE) continue;
+        int merge_tr_out = g->nodes[merge_tr_nid].output_tensors[0];
+
+        /* Reshape */
+        int merge_rs_nid = mha_unique_consumer(g, merge_tr_out, fused_skip);
+        if (merge_rs_nid < 0 || g->nodes[merge_rs_nid].type != OP_RESHAPE) continue;
+        int merged_tid = g->nodes[merge_rs_nid].output_tensors[0];
+
+        /* MatMul(output projection) */
+        int out_mm_nid = mha_unique_consumer(g, merged_tid, fused_skip);
+        if (out_mm_nid < 0 || g->nodes[out_mm_nid].type != OP_MATMUL) continue;
+        graph_node_t* out_mm = &g->nodes[out_mm_nid];
+        tensor_t* wo_weight = (out_mm->num_weights >= 1 && out_mm->weights)
+                              ? out_mm->weights[0] : NULL;
+        int out_mm_out = out_mm->output_tensors[0];
+
+        /* Optional Add(b_O) */
+        int out_add_nid = -1;
+        tensor_t* bo_weight = NULL;
+        int proj_tid = out_mm_out;
+        {
+            int candidate = mha_unique_consumer(g, out_mm_out, fused_skip);
+            if (candidate >= 0 && g->nodes[candidate].type == OP_ADD
+                && g->nodes[candidate].num_inputs >= 2
+                && g->nodes[candidate].input_tensors[0] == out_mm_out) {
+                out_add_nid = candidate;
+                if (g->nodes[candidate].num_weights >= 1 && g->nodes[candidate].weights)
+                    bo_weight = g->nodes[candidate].weights[0];
+                proj_tid = g->nodes[candidate].output_tensors[0];
+            }
+        }
+
+        /* Optional residual Add */
+        int res_add_nid = -1;
+        int residual_tid = -1;
+        int final_out_tid = proj_tid;
+        {
+            int candidate = mha_unique_consumer(g, proj_tid, fused_skip);
+            if (candidate >= 0 && g->nodes[candidate].type == OP_ADD
+                && g->nodes[candidate].num_inputs >= 2) {
+                graph_node_t* ra = &g->nodes[candidate];
+                if (ra->input_tensors[0] == proj_tid) {
+                    res_add_nid = candidate;
+                    residual_tid = ra->input_tensors[1];
+                    final_out_tid = ra->output_tensors[0];
+                }
+            }
+        }
+
+        /* Phase 6: extract dimensions from tensor shapes */
+        tensor_t* anchor_tensor = g->tensors[anchor_tid].tensor;
+        if (!anchor_tensor || anchor_tensor->ndim < 3) continue;
+        int64_t B = anchor_tensor->shape[0];
+        int64_t S = anchor_tensor->shape[1];
+        int64_t D = anchor_tensor->shape[2];
+
+        /* Get H and d from Q Transpose output shape: (B, H, S, d) */
+        int q_out_tid = chain_out_tid[q_idx];
+        tensor_t* q_tensor = g->tensors[q_out_tid].tensor;
+        if (!q_tensor || q_tensor->ndim < 4) continue;
+        int64_t H = q_tensor->shape[1];
+        int64_t d = q_tensor->shape[3];
+
+        /* Phase 7: collect all nodes to skip */
+        int skip_list[32];
+        int skip_count = 0;
+        for (int c = 0; c < 3; c++) {
+            if (mm_nodes[c] != mm_nodes[q_idx])  /* skip the other 2 MatMuls */
+                skip_list[skip_count++] = mm_nodes[c];
+            if (chain_add[c] >= 0)
+                skip_list[skip_count++] = chain_add[c];
+            skip_list[skip_count++] = chain_reshape[c];
+            skip_list[skip_count++] = chain_transpose[c];
+        }
+        skip_list[skip_count++] = attn_mm_nid;
+        skip_list[skip_count++] = mul_nid;
+        skip_list[skip_count++] = softmax_nid;
+        skip_list[skip_count++] = v_mm_nid;
+        skip_list[skip_count++] = merge_tr_nid;
+        skip_list[skip_count++] = merge_rs_nid;
+        skip_list[skip_count++] = out_mm_nid;
+        if (out_add_nid >= 0) skip_list[skip_count++] = out_add_nid;
+        if (res_add_nid >= 0) skip_list[skip_count++] = res_add_nid;
+
+        /* Verify skip count is reasonable (≥ 18 for full BERT pattern) */
+        if (skip_count < 18 || skip_count > 32) continue;
+
+        /* Phase 8: save original state, then convert Q MatMul into MHA_Fused */
+        int target_nid = mm_nodes[q_idx];
+        graph_node_t* target = &g->nodes[target_nid];
+
+        if (restore) {
+            restore->node_id            = target_nid;
+            restore->saved_type         = target->type;
+            restore->saved_num_inputs   = target->num_inputs;
+            restore->saved_input_tensors = target->input_tensors;
+            restore->saved_num_outputs  = target->num_outputs;
+            restore->saved_output_tensors = target->output_tensors;
+            restore->saved_num_weights  = target->num_weights;
+            restore->saved_weights      = target->weights;
+            restore->saved_params       = target->params;
+            restore->saved_params_size  = target->params_size;
+        }
+
+        /* Free old arrays */
+        free(target->input_tensors);
+        free(target->output_tensors);
+        free(target->weights);
+        free(target->params);
+
+        /* Build new input_tensors: [anchor_tid, residual_tid] */
+        target->num_inputs = 2;
+        target->input_tensors = (int*)malloc(2 * sizeof(int));
+        if (!target->input_tensors) return 0;
+        target->input_tensors[0] = anchor_tid;
+        target->input_tensors[1] = residual_tid;
+
+        /* Build new output_tensors: [final_out_tid] */
+        target->num_outputs = 1;
+        target->output_tensors = (int*)malloc(1 * sizeof(int));
+        if (!target->output_tensors) return 0;
+        target->output_tensors[0] = final_out_tid;
+
+        /* Build weights: [W_Q, b_Q, W_K, b_K, W_V, b_V, W_O, b_O] */
+        target->num_weights = 8;
+        target->weights = (tensor_t**)malloc(8 * sizeof(tensor_t*));
+        if (!target->weights) return 0;
+        target->weights[0] = chain_w[q_idx];
+        target->weights[1] = chain_b[q_idx];
+        target->weights[2] = chain_w[k_idx];
+        target->weights[3] = chain_b[k_idx];
+        target->weights[4] = chain_w[v_idx];
+        target->weights[5] = chain_b[v_idx];
+        target->weights[6] = wo_weight;
+        target->weights[7] = bo_weight;
+
+        /* Build params */
+        mha_fused_params_t* fp = (mha_fused_params_t*)malloc(sizeof(mha_fused_params_t));
+        if (!fp) return 0;
+        fp->batch_size   = B;
+        fp->seq_len      = S;
+        fp->hidden_size  = D;
+        fp->num_heads    = H;
+        fp->head_dim     = d;
+        fp->scale        = 1.0f / sqrtf((float)d);
+        fp->has_residual = (residual_tid >= 0);
+        target->params      = fp;
+        target->params_size = sizeof(mha_fused_params_t);
+        target->type        = OP_MHA_FUSED;
+
+        /* Update tensor producer: the final output tensor is now produced by target */
+        if (final_out_tid >= 0 && final_out_tid < g->num_tensors)
+            g->tensors[final_out_tid].producer = target_nid;
+
+        /* Phase 9: mark all other nodes as skipped */
+        for (int s = 0; s < skip_count; s++) {
+            fused_skip[skip_list[s]] = 1;
+        }
+
+        return 1;  /* fused one pattern */
+    }
+
+    return 0;
 }
 
 /* ============================================================
@@ -251,6 +622,9 @@ int graph_execute(inference_graph_t* g, tensor_t* inputs[],
 
     int ret = 0;
     int* fused_skip = NULL;
+    mha_restore_info_t mha_restore;
+    memset(&mha_restore, 0, sizeof(mha_restore));
+    mha_restore.node_id = -1;
 
     /* Copy graph inputs to input node tensors (skip self-copy when user passes graph tensor) */
     for (int i = 0; i < g->num_inputs; i++) {
@@ -317,6 +691,9 @@ int graph_execute(inference_graph_t* g, tensor_t* inputs[],
                     }
                 }
             }
+
+            /* MHA fusion: detect full BERT self-attention subgraph */
+            fused_count += detect_and_fuse_mha(g, fused_skip, &mha_restore);
         }
     }
 
@@ -515,6 +892,23 @@ int graph_execute(inference_graph_t* g, tensor_t* inputs[],
     ret = 0;
 
 cleanup:
+    /* Restore MHA-fused node to its original type and configuration */
+    if (mha_restore.node_id >= 0) {
+        graph_node_t* n = &g->nodes[mha_restore.node_id];
+        free(n->input_tensors);
+        free(n->output_tensors);
+        free(n->weights);
+        free(n->params);
+        n->type         = mha_restore.saved_type;
+        n->num_inputs   = mha_restore.saved_num_inputs;
+        n->input_tensors = mha_restore.saved_input_tensors;
+        n->num_outputs  = mha_restore.saved_num_outputs;
+        n->output_tensors = mha_restore.saved_output_tensors;
+        n->num_weights  = mha_restore.saved_num_weights;
+        n->weights      = mha_restore.saved_weights;
+        n->params       = mha_restore.saved_params;
+        n->params_size  = mha_restore.saved_params_size;
+    }
     free(fused_skip);
     return ret;
 }
