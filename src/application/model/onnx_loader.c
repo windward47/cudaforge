@@ -39,6 +39,8 @@ static char* dup_str(const char* s) {
  * ============================================================ */
 enum {
     F_ModelProto_graph          = 7,
+    F_ModelProto_opset_import   = 8,  /* repeated OperatorSetIdProto */
+    F_OperatorSetIdProto_version = 2, /* int64 */
     F_GraphProto_node           = 1,
     F_GraphProto_initializer    = 5,
     F_GraphProto_input          = 11,
@@ -102,6 +104,9 @@ typedef struct {
 
 /* File-static: model file directory for resolving external data paths */
 static char g_model_dir[512] = "";
+
+/* File-static: opset version (default 11, parsed from ModelProto.opset_import) */
+static int64_t g_model_opset = 11;
 
 /* ============================================================
  * Internal: parsed ONNX model before graph construction
@@ -273,14 +278,32 @@ static int parse_tensor_proto(pb_message_t* msg, onnx_tensor_info_t* info) {
                                 if (r == (size_t)length) {
                                     info->raw_data_size = (size_t)length;
                                 } else {
+                                    fprintf(stderr, "onnx_load: tensor '%s' external data fread "
+                                            "short read: got %zu, expected %lld\n",
+                                            info->name, r, (long long)length);
                                     free(info->raw_data);
                                     info->raw_data = NULL;
                                 }
+                            } else {
+                                fprintf(stderr, "onnx_load: tensor '%s' external data OOM "
+                                        "(%lld bytes)\n", info->name, (long long)length);
                             }
+                        } else {
+                            fprintf(stderr, "onnx_load: tensor '%s' external data fseek failed "
+                                    "(offset=%lld)\n", info->name, (long long)offset);
                         }
                         fclose(ext);
+                    } else {
+                        fprintf(stderr, "onnx_load: tensor '%s' external data file not found: "
+                                "'%s'\n", info->name, full_path);
                     }
+                } else {
+                    fprintf(stderr, "onnx_load: tensor '%s' external data path too long: "
+                            "'%s%s'\n", info->name, g_model_dir, location);
                 }
+            } else if (ed_count > 0) {
+                fprintf(stderr, "onnx_load: tensor '%s' has external_data entries (%d) but "
+                        "missing location or length\n", info->name, ed_count);
             }
         }
         free(ed_fields);
@@ -722,10 +745,12 @@ static int infer_output_shape(onnx_node_info_t* node, onnx_parsed_model_t* model
         return 0;
     }
 
-    /* Reshape: output shape from the 'shape' initializer (input[1]) */
+    /* Reshape: output shape from input[1] (initializer or constant tensor).
+       opset < 14: shape is typically an initializer.
+       opset ≥ 14: shape can be any tensor with known values. */
     if (ot == OP_RESHAPE) {
         onnx_tensor_info_t* shape_info = find_tensor(model, node->input_names[1]);
-        if (!shape_info || !shape_info->is_initializer || !shape_info->raw_data)
+        if (!shape_info || !shape_info->raw_data)
             return 0;
         int64_t* shape_raw = (int64_t*)shape_info->raw_data;
         int64_t numel = 1;
@@ -1347,7 +1372,9 @@ static inference_graph_t* build_graph_from_onnx(onnx_parsed_model_t* pm) {
         } else if (ot == OP_SOFTMAX) {
             softmax_params_t sp;
             memset(&sp, 0, sizeof(sp));
-            int64_t axis = node_attr_int(node, "axis", 1);
+            /* Softmax default axis: opset < 13 → 1, opset ≥ 13 → -1 */
+            int64_t softmax_default_axis = (g_model_opset >= 13) ? -1 : 1;
+            int64_t axis = node_attr_int(node, "axis", softmax_default_axis);
             onnx_tensor_info_t* in_t = find_tensor(pm, node->input_names[0]);
             if (in_t) {
                 /* Determine num_classes (axis dim) and num_blocks (product of other dims) */
@@ -1768,6 +1795,30 @@ onnx_model_t* onnx_load_from_file(const char* path) {
         return NULL;
     }
     pb_message_t* graph_msg = pb_field_as_message(graph_field, 4);
+
+    /* Parse opset_import (field 8): repeated OperatorSetIdProto,
+       each with version (field 2). Use the default domain ("") entry. */
+    g_model_opset = 11;
+    {
+        pb_field_t** opsets = NULL;
+        int oc = 0;
+        pb_find_all_fields(model_msg, F_ModelProto_opset_import, &opsets, &oc);
+        for (int i = 0; i < oc; i++) {
+            pb_message_t* osm = pb_field_as_message(opsets[i], 2);
+            if (osm) {
+                /* domain (field 1) is empty string for default ONNX opset */
+                size_t dlen = 0;
+                const uint8_t* dom = pb_field_get_string(osm, 1, &dlen);
+                int64_t ver = pb_field_get_int64(osm, F_OperatorSetIdProto_version, 0);
+                if ((!dom || dlen == 0) && ver > 0) {
+                    g_model_opset = ver;
+                }
+                pb_message_destroy(osm);
+            }
+        }
+        free(opsets);
+    }
+
     pb_message_destroy(model_msg);
     if (!graph_msg) { free(data); return NULL; }
 
