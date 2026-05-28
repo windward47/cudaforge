@@ -186,3 +186,10 @@ static const operator_registry_t s_mha_fused_reg = {
 int register_mha_fused_f32(void) {
     return operator_register(&s_mha_fused_reg);
 }
+
+/* FP16 MHA is CUDA-only (Tensor Core WMMA). CPU stub returns error. */
+int mha_fused_f16(const void* inputs[], void* outputs[],
+                  const operator_params_t* params, stream_t* stream) {
+    (void)inputs; (void)outputs; (void)params; (void)stream;
+    return -1;  /* FP16 not supported on CPU */
+}

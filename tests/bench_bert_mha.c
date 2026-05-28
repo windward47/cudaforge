@@ -231,6 +231,55 @@ int main(void) {
                 total, total / BENCH_ITERS);
     }
 
+    /* ---- FP16 benchmark ---- */
+    {
+        const operator_registry_t* fp16_reg = operator_find("mha_fused_f16_cuda");
+        if (fp16_reg && fp16_reg->func) {
+            fprintf(stderr, "\nCUDA FP16 (%d warmup + %d iters):\n", WARMUP_ITERS, BENCH_ITERS);
+
+            /* Prepare device pointers */
+            tensor_copy_to_device(tX); tensor_copy_to_device(tR);
+            tensor_copy_to_device(twQ); tensor_copy_to_device(tbQ);
+            tensor_copy_to_device(twK); tensor_copy_to_device(tbK);
+            tensor_copy_to_device(twV); tensor_copy_to_device(tbV);
+            tensor_copy_to_device(twO); tensor_copy_to_device(tbO);
+            tensor_copy_to_device(tY);
+
+            mha_fused_params_t fp;
+            memset(&fp, 0, sizeof(fp));
+            fp.batch_size = B; fp.seq_len = S;
+            fp.hidden_size = D; fp.num_heads = H;
+            fp.head_dim = d; fp.scale = scale;
+            fp.has_residual = true;
+
+            const void* fp16_inputs[] = {
+                tX->data_device, tR->data_device,
+                twQ->data_device, tbQ->data_device,
+                twK->data_device, tbK->data_device,
+                twV->data_device, tbV->data_device,
+                twO->data_device, tbO->data_device,
+            };
+            void* fp16_outputs[] = { tY->data_device };
+
+            for (int i = 0; i < WARMUP_ITERS; i++) {
+                fp16_reg->func(fp16_inputs, fp16_outputs, (const operator_params_t*)&fp, NULL);
+            }
+            /* Sync via platform API to ensure kernel completes */
+            g_cuda.stream_synchronize(NULL);
+            double t0 = now_ms();
+            for (int i = 0; i < BENCH_ITERS; i++) {
+                fp16_reg->func(fp16_inputs, fp16_outputs, (const operator_params_t*)&fp, NULL);
+            }
+            g_cuda.stream_synchronize(NULL);
+            double t1 = now_ms();
+            double total = t1 - t0;
+            fprintf(stderr, "  total: %.2f ms,  avg: %.3f ms/iter\n",
+                    total, total / BENCH_ITERS);
+        } else {
+            fprintf(stderr, "\nCUDA FP16: SKIP (not registered)\n");
+        }
+    }
+
     cuda_platform_finalize();
 #endif
 

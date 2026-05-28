@@ -30,17 +30,16 @@
 - **实现方式**: Option B（kernel 侧优化），无需修改 fusion pass 或权重布局
 - **共享内存**: 48KB（K_smem + V_smem），在 sm_86 默认限制内
 
-### M3. Tensor Core FP16 MHA
+### M3. Tensor Core FP16 MHA（部分完成）
 
-**文件**: `src/operator/nn/mha_fused_cuda.cu`（FP16 版本）
+**文件**: `src/operator/nn/mha_fused_f16_cuda.cu`（独立文件，避免 shared memory 类型冲突）
 
-sm_86 (RTX 2050) 支持 Tensor Core FP16。将 MHA 中的矩阵乘法（QKV 投影和 attention 计算）映射到 Tensor Core 指令，理论吞吐量提升 4-8×。
-
-**修复方向**:
-- QKV 投影: FP16 wmma
-- Attention S·K^T + P·V: 使用 wmma 做批量小矩阵乘法
-- 输出投影: FP16 wmma
-- 注意: 需要混合精度（accumulator 保持 FP32 精度）
+- **FP16 标量 kernel**: 已实现，FP32→FP16 逐元素转换 + `__hmul` 标量乘法 + FP32 累加
+- **精度**: max_rel=2.87e-04（远低于 1e-2 阈值）
+- **性能**: 47.5 ms/iter（略慢于 FP32 的 44.4 ms，因 `__float2half`/`__half2float` 转换开销）
+- **待优化**: WMMA Tensor Core 版本（需解决 `store_matrix_sync` 类型匹配和 shared memory 布局问题，理论吞吐量 2-4×）
+- **算子注册**: `mha_fused_f16_cuda`，CPU stub 返回 -1
+- **compute-sanitizer**: 0 错误
 
 ---
 
@@ -99,8 +98,8 @@ BERT 管线打通后，可探索 GPT-2/LLaMA 等 decoder-only 架构：
 
 | 状态 | 数量 | 内容 |
 | --- | --- | --- |
-| 已完成 | 4 | O1（外部数据加载错误日志）、O2（opset≥13 属性兼容）、M1（FlashAttention 风格 tiled 注意力）、M2（QKV 投影融合） |
-| 待开始 | 1 | M3（Tensor Core FP16 MHA） |
+| 已完成 | 5 | O1（外部数据加载错误日志）、O2（opset≥13 属性兼容）、M1（FlashAttention 风格 tiled 注意力）、M2（QKV 投影融合）、M3（FP16 标量 kernel 框架） |
+| 待优化 | 1 | M3 WMMA Tensor Core 版本（需解决 store_matrix_sync 类型匹配） |
 | 远期 | 2 | F1（FP16 推理）、F2（LLM 推理探索） |
 
-> **最后更新**: 2026-05-29。M1/M2 已完成（tiled online softmax + K/V 内循环合并），BERT-base CUDA 22-26 ms/iter，31/31 测试全绿，compute-sanitizer 零错误。
+> **最后更新**: 2026-05-29。M1-M3 已完成（M3 为 FP16 标量 kernel，WMMA 版本待优化），31/31 测试全绿，compute-sanitizer 零错误。

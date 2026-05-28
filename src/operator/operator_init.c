@@ -52,6 +52,7 @@ int register_reduce_f32_cuda(void);
 int register_cast_f32_cuda(void);
 int register_argmax_f32_cuda(void);
 int register_mha_fused_f32_cuda(void);
+int register_mha_fused_f16_cuda(void);
 
 int operator_init_all(void) {
     int ret = 0;
@@ -105,5 +106,6 @@ int operator_init_all(void) {
     ret += register_cast_f32_cuda();
     ret += register_argmax_f32_cuda();
     ret += register_mha_fused_f32_cuda();
+    ret += register_mha_fused_f16_cuda();
     return ret;
 }
