@@ -1,6 +1,7 @@
 #include "operator.h"
 #include "cuda_ops.h"
 #include "cast_int.h"
+#include <cuda_fp16.h>
 
 __global__ void cast_i64_to_f32_kernel(const int64_t* input, float* output, int64_t n) {
     int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -13,6 +14,20 @@ __global__ void cast_f32_to_i64_kernel(const float* input, int64_t* output, int6
     int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < n) {
         output[idx] = (int64_t)input[idx];
+    }
+}
+
+__global__ void cast_f32_to_f16_kernel(const float* input, __half* output, int64_t n) {
+    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) {
+        output[idx] = __float2half(input[idx]);
+    }
+}
+
+__global__ void cast_f16_to_f32_kernel(const __half* input, float* output, int64_t n) {
+    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) {
+        output[idx] = __half2float(input[idx]);
     }
 }
 
@@ -32,6 +47,12 @@ int cast_f32_cuda(const void* inputs[], void* outputs[],
     } else if (cp->src_dtype == ONNX_DTYPE_FLOAT && cp->dst_dtype == ONNX_DTYPE_INT64) {
         CUDA_KERNEL_LAUNCH(cast_f32_to_i64_kernel, grid, block, 0, s,
                            (const float*)inputs[0], (int64_t*)outputs[0], cp->numel);
+    } else if (cp->src_dtype == ONNX_DTYPE_FLOAT && cp->dst_dtype == ONNX_DTYPE_FLOAT16) {
+        CUDA_KERNEL_LAUNCH(cast_f32_to_f16_kernel, grid, block, 0, s,
+                           (const float*)inputs[0], (__half*)outputs[0], cp->numel);
+    } else if (cp->src_dtype == ONNX_DTYPE_FLOAT16 && cp->dst_dtype == ONNX_DTYPE_FLOAT) {
+        CUDA_KERNEL_LAUNCH(cast_f16_to_f32_kernel, grid, block, 0, s,
+                           (const __half*)inputs[0], (float*)outputs[0], cp->numel);
     } else {
         /* Unsupported casts (e.g. F32→F32): fallback to memcpy (matches CPU behavior) */
         cudaMemcpyAsync(outputs[0], inputs[0],

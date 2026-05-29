@@ -711,17 +711,50 @@ int graph_execute(inference_graph_t* g, tensor_t* inputs[],
         if (n->type == OP_INPUT) continue;
         if (n->type == OP_OUTPUT) continue;
 
-        /* Build op name */
+        /* Build op name — try dtype-aware name first, fall back to f32 */
         char name_buf[64];
         const char* base = op_name(n->type);
         if (!base) { ret = -1; goto cleanup; }
-        if (use_cuda) {
-            snprintf(name_buf, sizeof(name_buf), "%s_cuda", base);
-        } else {
-            snprintf(name_buf, sizeof(name_buf), "%s", base);
+
+        /* Check output tensor dtype for FP16 dispatch */
+        int output_is_f16 = 0;
+        if (n->num_outputs > 0 && n->output_tensors && n->output_tensors[0] >= 0) {
+            int tid = n->output_tensors[0];
+            if (tid < g->num_tensors && g->tensors[tid].tensor) {
+                if (g->tensors[tid].tensor->dtype == DATA_TYPE_F16) output_is_f16 = 1;
+            }
         }
 
-        const operator_registry_t* op = operator_find(name_buf);
+        const operator_registry_t* op = NULL;
+        if (output_is_f16 && n->type != OP_CAST && n->type != OP_RESHAPE
+            && n->type != OP_TRANSPOSE && n->type != OP_SLICE
+            && n->type != OP_SPLIT && n->type != OP_SQUEEZE_UNSQUEEZE) {
+            /* Try FP16 variant first */
+            char base_f16[64];
+            /* Replace "_f32" suffix with "_f16" */
+            size_t blen = strlen(base);
+            if (blen > 3 && strcmp(base + blen - 3, "f32") == 0) {
+                snprintf(base_f16, sizeof(base_f16), "%.*sf16", (int)(blen - 3), base);
+            } else {
+                snprintf(base_f16, sizeof(base_f16), "%s", base);
+            }
+            if (use_cuda) {
+                snprintf(name_buf, sizeof(name_buf), "%s_cuda", base_f16);
+            } else {
+                snprintf(name_buf, sizeof(name_buf), "%s", base_f16);
+            }
+            op = operator_find(name_buf);
+        }
+
+        if (!op) {
+            /* Fall back to f32 variant */
+            if (use_cuda) {
+                snprintf(name_buf, sizeof(name_buf), "%s_cuda", base);
+            } else {
+                snprintf(name_buf, sizeof(name_buf), "%s", base);
+            }
+            op = operator_find(name_buf);
+        }
         if (!op) {
             /* Fall back to CPU version if CUDA variant not found */
             if (use_cuda) {

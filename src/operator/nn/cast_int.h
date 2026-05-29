@@ -4,8 +4,9 @@
 #include <stdint.h>
 
 /* ONNX TensorProto::DataType */
-#define ONNX_DTYPE_FLOAT  1
-#define ONNX_DTYPE_INT64  7
+#define ONNX_DTYPE_FLOAT    1
+#define ONNX_DTYPE_FLOAT16  10
+#define ONNX_DTYPE_INT64    7
 
 typedef struct {
     int     src_dtype;   /* ONNX data type of input */

@@ -65,14 +65,17 @@
 
 ## 第三步：FP16 推理与更大模型（远期，视需求启动）
 
-### F1. FP16 推理支持
+### ~~F1. FP16 推理支持~~ ✅
 
-**文件**: 新增 `src/platform/tensor_fp16.c`，修改所有 CUDA kernel
+**文件**: 多文件修改
 
-- 在 `tensor_t` 中增加 FP16 数据缓冲区
-- 为高频算子（Conv、MatMul、逐元素、LayerNorm、MHA）添加 FP16 kernel
-- 使用 `cudaDeviceGetAttribute` 查询 FP16 硬件支持
-- CPU 端通过 Cast op 做类型转换
+- **Cast FP16<->FP32**: `cast_int.h` 新增 `ONNX_DTYPE_FLOAT16=10`，CPU 和 CUDA 实现 FP16<->FP32 转换（CPU 使用软件 IEEE 754 编解码，CUDA 使用 `__float2half`/`__half2float`）
+- **Dtype-aware 调度**: `graph.c` 的 `graph_execute()` 检查输出 tensor dtype，FP16 时先查找 `_f16` 变体，找不到回退 `_f32`
+- **FP16 逐元素算子**: `elementwise_f16_cuda.cu` — ReLU、Sigmoid、GELU、SiLU、Exp、Add、Mul、Sub、Div（支持 broadcast）
+- **FP16 MHA**: 已有 `mha_fused_f16_cuda`（WMMA Tensor Core，5.57× 加速）
+- **tensor 系统**: 已支持 FP16（`DATA_TYPE_F16` 已定义，`tensor_create`/`copy_to_device`/`copy_to_host` 按 dtype size 计算字节）
+- **注册算子**: 11 个 FP16 CUDA 算子（relu/sigmoid/gelu/silu/exp/add/mul/sub/div/mha_fused/cast）
+- **31/31 测试通过**
 
 ### F2. LLM 推理探索
 
@@ -99,7 +102,7 @@ BERT 管线打通后，可探索 GPT-2/LLaMA 等 decoder-only 架构：
 
 | 状态 | 数量 | 内容 |
 | --- | --- | --- |
-| 已完成 | 5 | O1（外部数据加载错误日志）、O2（opset≥13 属性兼容）、M1（FlashAttention 风格 tiled 注意力）、M2（QKV 投影融合）、M3（Tensor Core FP16 MHA） |
-| 远期 | 2 | F1（FP16 推理）、F2（LLM 推理探索） |
+| 已完成 | 6 | O1（外部数据加载错误日志）、O2（opset≥13 属性兼容）、M1（FlashAttention 风格 tiled 注意力）、M2（QKV 投影融合）、M3（Tensor Core FP16 MHA）、F1（FP16 推理支持） |
+| 远期 | 1 | F2（LLM 推理探索） |
 
-> **最后更新**: 2026-05-29。M1-M3 全部完成（M3: 全 WMMA FP16 kernel，5.57× 加速），31/31 测试全绿，compute-sanitizer 零错误。BERT-base 单层 CUDA 推理 4.66 ms/iter。
+> **最后更新**: 2026-05-29。M1-M3 + F1 全部完成。11 个 FP16 CUDA 算子已注册，dtype-aware 调度已实现，Cast FP16<->FP32 已支持。31/31 测试全绿。

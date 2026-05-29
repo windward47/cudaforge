@@ -133,6 +133,7 @@ if(ENABLE_CUDA)
         src/operator/nn/argmax_cuda.cu
         src/operator/nn/mha_fused_cuda.cu
         src/operator/nn/mha_fused_f16_cuda.cu
+        src/operator/nn/elementwise_f16_cuda.cu
         src/operator/blas/matmul_cuda.cu
     )
 endif()

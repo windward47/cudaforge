@@ -53,6 +53,15 @@ int register_cast_f32_cuda(void);
 int register_argmax_f32_cuda(void);
 int register_mha_fused_f32_cuda(void);
 int register_mha_fused_f16_cuda(void);
+int register_relu_f16_cuda(void);
+int register_sigmoid_f16_cuda(void);
+int register_gelu_f16_cuda(void);
+int register_silu_f16_cuda(void);
+int register_exp_f16_cuda(void);
+int register_add_f16_cuda(void);
+int register_mul_f16_cuda(void);
+int register_sub_f16_cuda(void);
+int register_div_f16_cuda(void);
 
 int operator_init_all(void) {
     int ret = 0;
@@ -107,5 +116,14 @@ int operator_init_all(void) {
     ret += register_argmax_f32_cuda();
     ret += register_mha_fused_f32_cuda();
     ret += register_mha_fused_f16_cuda();
+    ret += register_relu_f16_cuda();
+    ret += register_sigmoid_f16_cuda();
+    ret += register_gelu_f16_cuda();
+    ret += register_silu_f16_cuda();
+    ret += register_exp_f16_cuda();
+    ret += register_add_f16_cuda();
+    ret += register_mul_f16_cuda();
+    ret += register_sub_f16_cuda();
+    ret += register_div_f16_cuda();
     return ret;
 }
