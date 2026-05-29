@@ -6,8 +6,9 @@
 typedef struct {
     int64_t batch_size;   /* B */
     int64_t hidden_size;  /* D */
-    int64_t num_heads;    /* H */
-    int64_t head_dim;     /* d = D/H */
+    int64_t num_heads;    /* H_q — query heads */
+    int64_t num_kv_heads; /* H_kv — key/value heads (GQA: H_kv < H_q, MQA: H_kv=1) */
+    int64_t head_dim;     /* d = D/H_q */
     float   scale;        /* 1/sqrt(d) */
     int64_t cache_len;    /* number of cached positions (current token index) */
     int64_t max_seq;      /* max sequence length (cache buffer size) */

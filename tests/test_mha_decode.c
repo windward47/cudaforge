@@ -184,7 +184,7 @@ static int test_mha_decode_cpu(void) {
     mha_decode_params_t p1;
     memset(&p1, 0, sizeof(p1));
     p1.batch_size = TB; p1.hidden_size = TD;
-    p1.num_heads = TH; p1.head_dim = Td;
+    p1.num_heads = TH; p1.num_kv_heads = TH; p1.head_dim = Td;
     p1.scale = scale; p1.cache_len = 0; p1.max_seq = TMAX_SEQ;
 
     const void* cpu_inputs1[] = {
@@ -227,7 +227,7 @@ static int test_mha_decode_cpu(void) {
     mha_decode_params_t p2;
     memset(&p2, 0, sizeof(p2));
     p2.batch_size = TB; p2.hidden_size = TD;
-    p2.num_heads = TH; p2.head_dim = Td;
+    p2.num_heads = TH; p2.num_kv_heads = TH; p2.head_dim = Td;
     p2.scale = scale; p2.cache_len = 1; p2.max_seq = TMAX_SEQ;
 
     const void* cpu_inputs2[] = {
@@ -297,7 +297,7 @@ static int test_mha_decode_cuda(void) {
     mha_decode_params_t p;
     memset(&p, 0, sizeof(p));
     p.batch_size = TB; p.hidden_size = TD;
-    p.num_heads = TH; p.head_dim = Td;
+    p.num_heads = TH; p.num_kv_heads = TH; p.head_dim = Td;
     p.scale = scale; p.cache_len = 0; p.max_seq = TMAX_SEQ;
 
     /* CPU reference */
