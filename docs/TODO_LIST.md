@@ -92,12 +92,15 @@
 - **GPT-2 测试模型**: `gen_gpt2_test.py`（hidden=64, heads=4, 2 层）
 - **性能**: 单 token CUDA 解码慢于 CPU（launch 开销主导），需要 batch 解码或 graph 级优化
 
+已追加实现:
+
+- **RoPE 算子**: `OP_ROPE`，旋转位置编码（CPU + CUDA），支持 LLaMA/Mistral
+- **永久 MHA 融合**: `graph_set_permanent_fusion()` — 跳过 graph_execute 后的 restore，适合 decode 循环
+
 待完成:
 
-- **RoPE**（旋转位置编码）— LLaMA/Mistral 需要
 - **GQA/MQA**（分组/多查询注意力）— LLaMA 2+ 需要
 - **批 decode 优化** — 多 token 并行解码
-- **Graph 级融合** — 永久 MHA 融合（避免每次 graph_execute 重新检测）
 
 ---
 

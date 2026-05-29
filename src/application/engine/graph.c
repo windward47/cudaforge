@@ -128,6 +128,10 @@ void graph_set_kv_cache(inference_graph_t* g, int K_tensor_id, int V_tensor_id) 
     g->kv_cache_V_tid = V_tensor_id;
 }
 
+void graph_set_permanent_fusion(inference_graph_t* g, int enable) {
+    if (g) g->permanent_fusion = enable;
+}
+
 /* ============================================================
  * Topological sort (Kahn's algorithm)
  * ============================================================ */
@@ -250,6 +254,7 @@ static const char* op_name(op_type_t type) {
         case OP_MHA_FUSED:          return "mha_fused_f32";
         case OP_MHA_DECODE:         return "mha_decode_f32";
         case OP_CAUSAL_MASK:        return "causal_mask_f32";
+        case OP_ROPE:               return "rope_f32";
         default:                    return NULL;
     }
 }
@@ -703,7 +708,12 @@ int graph_execute(inference_graph_t* g, tensor_t* inputs[],
             }
 
             /* MHA fusion: detect full BERT self-attention subgraph */
-            fused_count += detect_and_fuse_mha(g, fused_skip, &mha_restore);
+            /* Only save restore info for non-permanent fusion */
+            if (!g->permanent_fusion) {
+                fused_count += detect_and_fuse_mha(g, fused_skip, &mha_restore);
+            } else {
+                fused_count += detect_and_fuse_mha(g, fused_skip, NULL);
+            }
         }
     }
 
