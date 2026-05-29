@@ -47,14 +47,19 @@ __global__ void mha_decode_f32_kernel(
     float* scores_smem = smem;           /* max_seq floats */
     float* reduce_buf = smem + max_seq;  /* nthreads floats */
 
-    /* Compute K_new, V_new for all KV heads (shared across query head groups) */
-    for (int kv_h = tid; kv_h < H_kv_int; kv_h += nthreads) {
-        int kv_ho = kv_h * d_int;
-        for (int di = 0; di < d_int; di++) {
+    /* Compute K_new, V_new for all KV heads — all threads cooperatively.
+       Flatten across (kv_h, di) pairs: total = H_kv * d elements. */
+    {
+        int total_kv = H_kv_int * d_int;
+        for (int i = tid; i < total_kv; i += nthreads) {
+            int kv_h = i / d_int;
+            int di = i % d_int;
+            int kv_ho = kv_h * d_int;
             float k_acc = 0.0f, v_acc = 0.0f;
             for (int j = 0; j < D_int; j++) {
-                k_acc += x[j] * WK[j * kv_dim + kv_ho + di];
-                v_acc += x[j] * WV[j * kv_dim + kv_ho + di];
+                float xj = x[j];
+                k_acc += xj * WK[j * kv_dim + kv_ho + di];
+                v_acc += xj * WV[j * kv_dim + kv_ho + di];
             }
             int64_t idx = (b * max_seq + cache_len) * H_kv_int * d_int + kv_ho + di;
             K_cache_out[idx] = k_acc + (bK ? bK[kv_ho + di] : 0.0f);
@@ -139,11 +144,13 @@ __global__ void mha_decode_f32_kernel(
         for (int di = 0; di < d_int; di++) merged[di] = scores_smem[di];
         __syncthreads();
 
-        /* 5. Output projection: Y += merged · WO */
+        /* 5. Output projection: Y += merged · WO
+           No atomicAdd needed: threads handle disjoint j values,
+           and __syncthreads() between heads ensures sequential accumulation. */
         for (int j = tid; j < D_int; j += nthreads) {
             float contrib = 0.0f;
             for (int di = 0; di < d_int; di++) contrib += merged[di] * WO[(ho + di) * D_int + j];
-            atomicAdd(&y[j], contrib);
+            y[j] += contrib;
         }
         __syncthreads();
     }
