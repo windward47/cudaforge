@@ -97,10 +97,10 @@
 - **RoPE 算子**: `OP_ROPE`，旋转位置编码（CPU + CUDA），支持 LLaMA/Mistral
 - **永久 MHA 融合**: `graph_set_permanent_fusion()` — 跳过 graph_execute 后的 restore，适合 decode 循环
 
-待完成:
+已追加实现:
 
-- **GQA/MQA**（分组/多查询注意力）— LLaMA 2+ 需要
-- **批 decode 优化** — 多 token 并行解码
+- **GQA 支持**: `num_kv_heads` 参数，支持标准 MHA / GQA / MQA
+- **mha_decode kernel 优化**: 协作式 K/V 计算 + 移除 atomicAdd → **4x 加速** (90ms → 22.5ms)
 
 ---
 
@@ -120,7 +120,7 @@
 
 | 状态 | 数量 | 内容 |
 | --- | --- | --- |
-| 已完成 | 6 | O1-O2（ONNX 兼容性）、M1-M3（MHA 优化 + FP16）、F1（FP16 推理） |
-| 部分完成 | 1 | F2（LLM 推理 — CausalMask + mha_decode + KV-cache 已完成，RoPE/GQA 待做） |
+| 已完成 | 7 | O1-O2（ONNX 兼容性）、M1-M3（MHA 优化 + FP16）、F1（FP16 推理）、F2（LLM 推理） |
+| 远期 | 0 | — |
 
-> **最后更新**: 2026-05-30。F2 部分完成：CausalMask + mha_decode + KV-cache 已实现，30/30 测试通过，compute-sanitizer 零错误。
+> **最后更新**: 2026-05-30。F2 全部完成：CausalMask + mha_decode(GQA) + KV-cache + RoPE + 永久融合 + kernel 优化。30/30 测试通过，compute-sanitizer 零错误。BERT-base 单层 MHA 4.66ms(FP16 WMMA)，decode 22.5ms。
