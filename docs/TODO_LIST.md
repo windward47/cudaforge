@@ -77,12 +77,27 @@
 - **注册算子**: 11 个 FP16 CUDA 算子（relu/sigmoid/gelu/silu/exp/add/mul/sub/div/mha_fused/cast）
 - **31/31 测试通过**
 
-### F2. LLM 推理探索
+### F2. LLM 推理探索（部分完成）
 
-BERT 管线打通后，可探索 GPT-2/LLaMA 等 decoder-only 架构：
-- 新增算子: **CausalMask**（下三角 mask）、**KV-Cache**（自回归缓存）、**RoPE**（旋转位置编码）
-- 新增融合: **FlashAttention** 风格的 tile-based 精确注意力
-- 支持 GQA (Grouped-Query Attention) 和 MQA (Multi-Query Attention) 变体
+已实现 decoder-only 模型核心组件：
+
+- **CausalMask 算子**: `OP_CAUSAL_MASK`，下三角 attention mask（CPU + CUDA）
+- **mha_decode kernel**: `OP_MHA_DECODE`，单 token 解码 + KV-cache（CPU + CUDA）
+  - KV-cache: 预分配 `(B, max_seq, H, d)` 缓冲区，`cache_len` 追踪填充位置
+  - 注意力: 遍历 cache 中 0..cache_len 位置，online softmax
+  - 输出投影: merged 通过 shared memory 广播到所有线程
+- **Graph KV-cache 支持**: `graph_set_kv_cache()` 标记持久 tensor，`graph_execute()` 跳过 D2H 拷贝
+- **算子注册**: 扩展到 128 slots（原 64 不够用）
+- **测试**: `test_mha_decode`（CPU + CUDA 通过），`bench_mha_decode`（延迟测量）
+- **GPT-2 测试模型**: `gen_gpt2_test.py`（hidden=64, heads=4, 2 层）
+- **性能**: 单 token CUDA 解码慢于 CPU（launch 开销主导），需要 batch 解码或 graph 级优化
+
+待完成:
+
+- **RoPE**（旋转位置编码）— LLaMA/Mistral 需要
+- **GQA/MQA**（分组/多查询注意力）— LLaMA 2+ 需要
+- **批 decode 优化** — 多 token 并行解码
+- **Graph 级融合** — 永久 MHA 融合（避免每次 graph_execute 重新检测）
 
 ---
 
@@ -102,7 +117,7 @@ BERT 管线打通后，可探索 GPT-2/LLaMA 等 decoder-only 架构：
 
 | 状态 | 数量 | 内容 |
 | --- | --- | --- |
-| 已完成 | 6 | O1（外部数据加载错误日志）、O2（opset≥13 属性兼容）、M1（FlashAttention 风格 tiled 注意力）、M2（QKV 投影融合）、M3（Tensor Core FP16 MHA）、F1（FP16 推理支持） |
-| 远期 | 1 | F2（LLM 推理探索） |
+| 已完成 | 6 | O1-O2（ONNX 兼容性）、M1-M3（MHA 优化 + FP16）、F1（FP16 推理） |
+| 部分完成 | 1 | F2（LLM 推理 — CausalMask + mha_decode + KV-cache 已完成，RoPE/GQA 待做） |
 
-> **最后更新**: 2026-05-29。M1-M3 + F1 全部完成。11 个 FP16 CUDA 算子已注册，dtype-aware 调度已实现，Cast FP16<->FP32 已支持。31/31 测试全绿。
+> **最后更新**: 2026-05-30。F2 部分完成：CausalMask + mha_decode + KV-cache 已实现，30/30 测试通过，compute-sanitizer 零错误。
