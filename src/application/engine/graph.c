@@ -25,6 +25,8 @@ inference_graph_t* graph_create(void) {
     g->topo_order   = NULL;
     g->input_node_ids  = NULL;
     g->output_node_ids = NULL;
+    g->kv_cache_K_tid  = -1;
+    g->kv_cache_V_tid  = -1;
     return g;
 }
 
@@ -118,6 +120,12 @@ int graph_set_output(inference_graph_t* g, int node_id) {
     if (!g->output_node_ids) return -1;
     g->output_node_ids[id] = node_id;
     return 0;
+}
+
+void graph_set_kv_cache(inference_graph_t* g, int K_tensor_id, int V_tensor_id) {
+    if (!g) return;
+    g->kv_cache_K_tid = K_tensor_id;
+    g->kv_cache_V_tid = V_tensor_id;
 }
 
 /* ============================================================
@@ -240,6 +248,8 @@ static const char* op_name(op_type_t type) {
         case OP_CAST:               return "cast_f32";
         case OP_ARGMAX:             return "argmax_f32";
         case OP_MHA_FUSED:          return "mha_fused_f32";
+        case OP_MHA_DECODE:         return "mha_decode_f32";
+        case OP_CAUSAL_MASK:        return "causal_mask_f32";
         default:                    return NULL;
     }
 }
@@ -892,11 +902,14 @@ int graph_execute(inference_graph_t* g, tensor_t* inputs[],
         }
 
         /* Copy back to host if CUDA — must happen BEFORE any host-side verify */
+        /* Skip D2H for KV-cache tensors (they persist on device between calls) */
         if (use_cuda) {
             for (int i = 0; i < n->num_outputs; i++) {
                 int tid = effective_output_tids[i] ? effective_output_tids[i]
                                                    : n->output_tensors[i];
-                if (tid >= 0) tensor_copy_to_host(g->tensors[tid].tensor);
+                if (tid >= 0 && tid != g->kv_cache_K_tid && tid != g->kv_cache_V_tid) {
+                    tensor_copy_to_host(g->tensors[tid].tensor);
+                }
             }
             g_cuda.stream_synchronize(0);
         }

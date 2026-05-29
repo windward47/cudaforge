@@ -40,6 +40,8 @@ typedef enum {
     OP_CAST,
     OP_ARGMAX,
     OP_MHA_FUSED,
+    OP_MHA_DECODE,
+    OP_CAUSAL_MASK,
     OP_INPUT,
     OP_OUTPUT
 } op_type_t;
@@ -75,6 +77,9 @@ typedef struct {
     int             num_outputs;
     int*            input_node_ids;
     int*            output_node_ids;
+    /* KV-cache support for autoregressive decode */
+    int             kv_cache_K_tid;  /* tensor index for K cache, -1 if unused */
+    int             kv_cache_V_tid;  /* tensor index for V cache, -1 if unused */
 } inference_graph_t;
 
 /* Graph construction */
@@ -89,6 +94,9 @@ int   graph_set_input(inference_graph_t* g, int node_id);
 int   graph_set_output(inference_graph_t* g, int node_id);
 int   graph_build(inference_graph_t* g);
 void  graph_destroy(inference_graph_t* g);
+
+/* KV-cache: mark tensors as persistent (skip D2H copy between calls) */
+void  graph_set_kv_cache(inference_graph_t* g, int K_tensor_id, int V_tensor_id);
 
 /* Execution */
 int   graph_execute(inference_graph_t* g, tensor_t* inputs[],

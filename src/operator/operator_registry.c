@@ -1,7 +1,7 @@
 #include "operator.h"
 #include <string.h>
 
-#define MAX_REGISTERED_OPS 64
+#define MAX_REGISTERED_OPS 128
 
 static const operator_registry_t* s_registry[MAX_REGISTERED_OPS];
 static int s_registry_count = 0;

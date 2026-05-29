@@ -102,6 +102,8 @@ target_sources(operator PRIVATE
     src/operator/nn/cast.c
     src/operator/nn/argmax.c
     src/operator/nn/mha_fused.c
+    src/operator/nn/causal_mask.c
+    src/operator/nn/mha_decode.c
     src/operator/operator_registry.c
     src/operator/operator_init.c
 )
@@ -134,6 +136,8 @@ if(ENABLE_CUDA)
         src/operator/nn/mha_fused_cuda.cu
         src/operator/nn/mha_fused_f16_cuda.cu
         src/operator/nn/elementwise_f16_cuda.cu
+        src/operator/nn/causal_mask_cuda.cu
+        src/operator/nn/mha_decode_cuda.cu
         src/operator/blas/matmul_cuda.cu
     )
 endif()
@@ -604,6 +608,26 @@ if(ENABLE_TESTS)
     set_tests_properties(test_bert_mha PROPERTIES
         WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
 
+    add_executable(test_mha_decode
+        tests/test_mha_decode.c
+    )
+    target_include_directories(test_mha_decode PRIVATE
+        src/application/model
+        src/application/engine
+        src/application/include
+        src/operator/include
+        src/operator/blas
+        src/operator/nn
+        src/platform/include
+    )
+    target_link_libraries(test_mha_decode PRIVATE onnx_model application operator platform)
+    if(CMAKE_C_COMPILER_ID STREQUAL "MSVC")
+        target_compile_options(test_mha_decode PRIVATE /wd4189 /wd4456 /wd4101)
+    endif()
+    add_test(NAME test_mha_decode COMMAND test_mha_decode)
+    set_tests_properties(test_mha_decode PROPERTIES
+        WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+
     add_executable(bench_bert_mha
         tests/bench_bert_mha.c
     )
@@ -620,6 +644,23 @@ if(ENABLE_TESTS)
     target_link_libraries(bench_bert_mha PRIVATE onnx_model application operator platform unity)
     if(CMAKE_C_COMPILER_ID STREQUAL "MSVC")
         target_compile_options(bench_bert_mha PRIVATE /wd4189 /wd4456 /wd4101)
+    endif()
+
+    add_executable(bench_mha_decode
+        tests/bench_mha_decode.c
+    )
+    target_include_directories(bench_mha_decode PRIVATE
+        src/application/model
+        src/application/engine
+        src/application/include
+        src/operator/include
+        src/operator/blas
+        src/operator/nn
+        src/platform/include
+    )
+    target_link_libraries(bench_mha_decode PRIVATE onnx_model application operator platform)
+    if(CMAKE_C_COMPILER_ID STREQUAL "MSVC")
+        target_compile_options(bench_mha_decode PRIVATE /wd4189 /wd4456 /wd4101)
     endif()
 
 endif()

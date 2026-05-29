@@ -25,6 +25,7 @@ int register_reduce_f32(void);
 int register_cast_f32(void);
 int register_argmax_f32(void);
 int register_mha_fused_f32(void);
+int register_causal_mask_f32(void);
 
 /* CUDA operator registration (extern "C" from .cu files) */
 int register_relu_f32_cuda(void);
@@ -62,6 +63,9 @@ int register_add_f16_cuda(void);
 int register_mul_f16_cuda(void);
 int register_sub_f16_cuda(void);
 int register_div_f16_cuda(void);
+int register_causal_mask_f32_cuda(void);
+int register_mha_decode_f32(void);
+int register_mha_decode_f32_cuda(void);
 
 int operator_init_all(void) {
     int ret = 0;
@@ -90,6 +94,7 @@ int operator_init_all(void) {
     ret += register_cast_f32();
     ret += register_argmax_f32();
     ret += register_mha_fused_f32();
+    ret += register_causal_mask_f32();
     ret += register_relu_f32_cuda();
     ret += register_matmul_f32_cuda();
     ret += register_conv2d_f32_cuda();
@@ -125,5 +130,7 @@ int operator_init_all(void) {
     ret += register_mul_f16_cuda();
     ret += register_sub_f16_cuda();
     ret += register_div_f16_cuda();
+    ret += register_causal_mask_f32_cuda();
+    ret += register_mha_decode_f32_cuda();
     return ret;
 }
