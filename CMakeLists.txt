@@ -137,6 +137,8 @@ if(ENABLE_CUDA)
         src/operator/nn/mha_fused_cuda.cu
         src/operator/nn/mha_fused_f16_cuda.cu
         src/operator/nn/elementwise_f16_cuda.cu
+        src/operator/nn/conv_f16_cuda.cu
+        src/operator/nn/matmul_f16_cuda.cu
         src/operator/nn/causal_mask_cuda.cu
         src/operator/nn/mha_decode_cuda.cu
         src/operator/nn/rope_cuda.cu

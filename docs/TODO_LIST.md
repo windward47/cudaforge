@@ -31,8 +31,8 @@
 
 | # | 任务 | 文件 | 说明 |
 | --- | --- | --- | --- |
-| H1 | FP16 Conv2D kernel | `conv_f16_cuda.cu` (新建) | FP16 推理链路最大缺失，Conv 是计算密集型算子 |
-| H2 | FP16 MatMul kernel | `matmul_f16_cuda.cu` (新建) | WMMA 可复用 MHA 中的模式 |
+| ~~H1~~ | ~~FP16 Conv2D kernel~~ | `conv_f16_cuda.cu` | ✅ 直接卷积 kernel，FP16 输入/权重，FP32 累加，支持 activation 融合 |
+| ~~H2~~ | ~~FP16 MatMul kernel~~ | `matmul_f16_cuda.cu` | ✅ 16×16 tiling，FP16 输入，FP32 累加 |
 | H3 | FP16 BatchNorm/LayerNorm | `batchnorm_f16_cuda.cu` 等 | 归一化层在 FP16 模型中频繁使用 |
 | H4 | FP16 Softmax/Reduce | `softmax_f16_cuda.cu` 等 | 注意力机制需要 FP16 Softmax |
 | H5 | Resize 双线性插值 | `resize.c` / `resize_cuda.cu` | 当前仅 nearest-neighbor，部分模型需要 bilinear |
