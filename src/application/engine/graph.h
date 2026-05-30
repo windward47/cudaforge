@@ -43,6 +43,7 @@ typedef enum {
     OP_MHA_DECODE,
     OP_CAUSAL_MASK,
     OP_ROPE,
+    OP_PAD,
     OP_INPUT,
     OP_OUTPUT
 } op_type_t;

@@ -105,6 +105,7 @@ target_sources(operator PRIVATE
     src/operator/nn/causal_mask.c
     src/operator/nn/mha_decode.c
     src/operator/nn/rope.c
+    src/operator/nn/pad.c
     src/operator/operator_registry.c
     src/operator/operator_init.c
 )
@@ -144,6 +145,7 @@ if(ENABLE_CUDA)
         src/operator/nn/causal_mask_cuda.cu
         src/operator/nn/mha_decode_cuda.cu
         src/operator/nn/rope_cuda.cu
+        src/operator/nn/pad_cuda.cu
         src/operator/blas/matmul_cuda.cu
     )
 endif()
