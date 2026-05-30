@@ -77,6 +77,21 @@
 
 ---
 
+## F2: LLM 推理（进行中）
+
+| 项 | 状态 | 说明 |
+| --- | --- | --- |
+| OP_WHERE | ✅ | 条件选择算子，支持 broadcast |
+| OP_TANH | ✅ | 双曲正切激活 |
+| INT64 数据类型 | ✅ | platform 层支持 DATA_TYPE_I64 |
+| BOOL tensor 支持 | ✅ | ONNX loader 1-byte → float 转换 |
+| 批量 MatMul 推断 | ✅ | 支持 3D+ 输入 |
+| Transpose/Concat 推断 | ✅ | 新增 shape inference |
+| 自回归生成 API | ✅ | generate.h / generate.c |
+| GPT-2 测试模型 | ✅ | gen_gpt2_full.py (hidden=64, 2层) |
+| GPT-2 端到端推理 | ⏳ | proto3 raw_data (field 13) 加载问题待修 |
+| KV-cache decode | ⏳ | 待实现 mha_decode 集成 |
+
 ## 远期规划
 
 | 方向 | 说明 |
