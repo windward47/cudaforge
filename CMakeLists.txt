@@ -658,6 +658,27 @@ if(ENABLE_TESTS)
     set_tests_properties(test_rope PROPERTIES
         WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
 
+    add_executable(test_fp16_ops
+        tests/test_fp16_ops.c
+    )
+    target_include_directories(test_fp16_ops PRIVATE
+        src/application/model
+        src/application/engine
+        src/application/include
+        src/operator/include
+        src/operator/blas
+        src/operator/nn
+        src/platform/include
+        src/platform/cuda
+    )
+    target_link_libraries(test_fp16_ops PRIVATE onnx_model application operator platform)
+    if(CMAKE_C_COMPILER_ID STREQUAL "MSVC")
+        target_compile_options(test_fp16_ops PRIVATE /wd4189 /wd4456 /wd4101)
+    endif()
+    add_test(NAME test_fp16_ops COMMAND test_fp16_ops)
+    set_tests_properties(test_fp16_ops PROPERTIES
+        WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+
     add_executable(bench_bert_mha
         tests/bench_bert_mha.c
     )

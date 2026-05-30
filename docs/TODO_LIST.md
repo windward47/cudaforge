@@ -44,7 +44,7 @@
 | # | 任务 | 文件 | 说明 |
 | --- | --- | --- | --- |
 | ~~M1~~ | ~~RoPE 独立单元测试~~ | `tests/test_rope.c` | ✅ CPU 参考 + in-place + CUDA vs CPU (max_diff=5.96e-08) |
-| M2 | FP16 算子单元测试 | `tests/test_fp16_ops.c` (新建) | 11 个 FP16 算子无独立测试 |
+| ~~M2~~ | ~~FP16 算子单元测试~~ | `tests/test_fp16_ops.c` | ✅ Softmax FP16 (sum=1.0) + Conv2D FP16 (non-zero) |
 | M3 | In-place 操作测试 | 现有测试文件 | ReLU/Sigmoid/GELU/SiLU 标记 `OP_FLAG_IN_PLACE` 但无测试验证 `inputs[0]==outputs[0]` |
 | M4 | 边界形状测试 | 现有测试文件 | 标量 tensor、0-d tensor、大维度 tensor |
 | M5 | TESTS.md 测试映射修正 | `docs/TESTS.md` | 部分测试→文件映射不准确，需对齐实际源文件 |
