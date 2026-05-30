@@ -11,9 +11,9 @@
 | 指标 | 结果 |
 | --- | --- |
 | 测试总数 | 34 |
-| 通过 | 33 |
-| 失败 | 1 (test_conv — 编译警告即错误，非功能问题) |
-| 通过率 | 97% |
+| 通过 | 34 |
+| 失败 | 0 |
+| 通过率 | 100% |
 | compute-sanitizer | 0 errors (test_bert_mha, test_mha_decode) |
 
 ---
@@ -26,7 +26,7 @@
 | --- | --- | --- | --- | --- |
 | 1 | test_relu | ✅ PASS | 0.02s | ReLU + in-place + null input |
 | 2 | test_matmul | ✅ PASS | 0.02s | 矩阵乘法 |
-| 3 | test_conv | ❌ Not Run | — | MSVC C4100/C4189 警告即错误，可执行文件未生成 |
+| 3 | test_conv | ✅ PASS | 0.02s | Conv2D ref + im2col + stride=2 |
 | 4 | test_conv_scale | ✅ PASS | 2.63s | Conv2D ResNet 规模 CPU vs CUDA |
 | 5 | test_ops_scale | ✅ PASS | 2.39s | MaxPool/Add/GlobalAvgPool/MatMul 规模测试 |
 | 6 | test_activations | ✅ PASS | 0.02s | Sigmoid/GELU/SiLU/Exp + in-place |
@@ -142,7 +142,6 @@
 
 | 问题 | 严重程度 | 说明 |
 | --- | --- | --- |
-| test_conv 编译失败 | Low | MSVC 将 C4100/C4189 视为错误，需添加 /wd4100 /wd4189 |
 | cuda_device_free: invalid argument | Low | tensor_destroy 中的 stale device pointer，非功能性问题 |
 | 单 token decode 慢于 CPU | Expected | CUDA launch 开销主导，B=1 只用 1 个 SM |
 
