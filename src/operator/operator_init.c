@@ -67,6 +67,7 @@ int register_conv2d_f16_cuda(void);
 int register_matmul_f16_cuda(void);
 int register_batchnorm_f16_cuda(void);
 int register_layernorm_f16_cuda(void);
+int register_softmax_f16_cuda(void);
 int register_causal_mask_f32_cuda(void);
 int register_mha_decode_f32(void);
 int register_rope_f32(void);
@@ -141,6 +142,7 @@ int operator_init_all(void) {
     ret += register_matmul_f16_cuda();
     ret += register_batchnorm_f16_cuda();
     ret += register_layernorm_f16_cuda();
+    ret += register_softmax_f16_cuda();
     ret += register_causal_mask_f32_cuda();
     ret += register_mha_decode_f32_cuda();
     ret += register_rope_f32_cuda();

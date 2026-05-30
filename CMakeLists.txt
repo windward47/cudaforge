@@ -140,6 +140,7 @@ if(ENABLE_CUDA)
         src/operator/nn/conv_f16_cuda.cu
         src/operator/nn/matmul_f16_cuda.cu
         src/operator/nn/norm_f16_cuda.cu
+        src/operator/nn/softmax_f16_cuda.cu
         src/operator/nn/causal_mask_cuda.cu
         src/operator/nn/mha_decode_cuda.cu
         src/operator/nn/rope_cuda.cu
