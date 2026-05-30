@@ -106,6 +106,7 @@ target_sources(operator PRIVATE
     src/operator/nn/mha_decode.c
     src/operator/nn/rope.c
     src/operator/nn/pad.c
+    src/operator/nn/clip.c
     src/operator/operator_registry.c
     src/operator/operator_init.c
 )
@@ -146,6 +147,7 @@ if(ENABLE_CUDA)
         src/operator/nn/mha_decode_cuda.cu
         src/operator/nn/rope_cuda.cu
         src/operator/nn/pad_cuda.cu
+        src/operator/nn/clip_cuda.cu
         src/operator/blas/matmul_cuda.cu
     )
 endif()
@@ -634,6 +636,26 @@ if(ENABLE_TESTS)
     endif()
     add_test(NAME test_mha_decode COMMAND test_mha_decode)
     set_tests_properties(test_mha_decode PROPERTIES
+        WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+
+    add_executable(test_rope
+        tests/test_rope.c
+    )
+    target_include_directories(test_rope PRIVATE
+        src/application/model
+        src/application/engine
+        src/application/include
+        src/operator/include
+        src/operator/blas
+        src/operator/nn
+        src/platform/include
+    )
+    target_link_libraries(test_rope PRIVATE onnx_model application operator platform)
+    if(CMAKE_C_COMPILER_ID STREQUAL "MSVC")
+        target_compile_options(test_rope PRIVATE /wd4189 /wd4456 /wd4101)
+    endif()
+    add_test(NAME test_rope COMMAND test_rope)
+    set_tests_properties(test_rope PROPERTIES
         WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
 
     add_executable(bench_bert_mha

@@ -44,6 +44,7 @@ typedef enum {
     OP_CAUSAL_MASK,
     OP_ROPE,
     OP_PAD,
+    OP_CLIP,
     OP_INPUT,
     OP_OUTPUT
 } op_type_t;

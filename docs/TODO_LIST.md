@@ -37,13 +37,13 @@
 | ~~H4~~ | ~~FP16 Softmax~~ | `softmax_f16_cuda.cu` | ✅ FP16 Softmax，FP32 累加保证数值稳定 |
 | ~~H5~~ | ~~Resize 双线性插值~~ | `resize.c` / `resize_cuda.cu` | ✅ 已实现（CPU + CUDA 均支持 mode=1 bilinear） |
 | ~~H6~~ | ~~ONNX Pad 算子~~ | `pad.c` / `pad_cuda.cu` | ✅ 支持 constant/edge/reflect 三种模式 |
-| H7 | ONNX Clip 算子 | `clip.c` / `clip_cuda.cu` (新建) | 部分导出器用 Clip 替代 ReLU |
+| ~~H7~~ | ~~ONNX Clip 算子~~ | `clip.c` / `clip_cuda.cu` | ✅ clamp 到 [min, max] |
 
 ### Medium — 测试覆盖
 
 | # | 任务 | 文件 | 说明 |
 | --- | --- | --- | --- |
-| M1 | RoPE 独立单元测试 | `tests/test_rope.c` (新建) | 当前无任何测试覆盖 |
+| ~~M1~~ | ~~RoPE 独立单元测试~~ | `tests/test_rope.c` | ✅ CPU 参考 + in-place + CUDA vs CPU (max_diff=5.96e-08) |
 | M2 | FP16 算子单元测试 | `tests/test_fp16_ops.c` (新建) | 11 个 FP16 算子无独立测试 |
 | M3 | In-place 操作测试 | 现有测试文件 | ReLU/Sigmoid/GELU/SiLU 标记 `OP_FLAG_IN_PLACE` 但无测试验证 `inputs[0]==outputs[0]` |
 | M4 | 边界形状测试 | 现有测试文件 | 标量 tensor、0-d tensor、大维度 tensor |

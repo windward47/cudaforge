@@ -263,6 +263,7 @@ static const char* op_name(op_type_t type) {
         case OP_CAUSAL_MASK:        return "causal_mask_f32";
         case OP_ROPE:               return "rope_f32";
         case OP_PAD:                return "pad_f32";
+        case OP_CLIP:               return "clip_f32";
         default:                    return NULL;
     }
 }

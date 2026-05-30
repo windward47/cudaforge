@@ -77,7 +77,7 @@ cmake --build build -j$(nproc)
 # 快速验证 — 打印平台信息
 ./build/Release/cudaforge.exe
 
-# 完整测试套件（30 个测试程序）
+# 完整测试套件（31 个测试程序）
 ctest --test-dir build -C Release -j$(nproc)
 
 # GPU 内存安全检查
@@ -262,7 +262,7 @@ CudaForge 内置了一个**手写的 protobuf wire-format 解析器**（约 200 
 CudaForge 的初衷是学习推理引擎的底层原理。通读全部代码只需一个下午。同时适用于无法承载 100+ MB 依赖的嵌入式场景。
 
 **Q: 能跑 ResNet / YOLO / BERT 吗？**
-已通过五层验证：(1) MNIST CNN（Conv×2 + ReLU + MaxPool + Reshape + Gemm + Softmax）；(2) **ResNet-18**（1×3×224×224 → 1×1000，50 节点，CUDA 推理与 PyTorch 对比 max_diff = 5.25e-06，Top-1 一致）；(3) **YOLOv8n**（1×3×640×640 → 1×84×8400，234 节点，CPU/CUDA 推理 max_diff < 1e-3，compute-sanitizer 零错误）；(4) **BERT-like Phase A**（Embedding + LayerNorm + FFN + SiLU，CPU/CUDA 推理与 ONNX Runtime 对比 max_diff = 5.96e-07）；(5) **BERT-base Phase B**（Embedding + LayerNorm + FFN + Exp + ReduceSum/Max + ArgMax + Cast + Softmax + Concat，CPU max_diff=2.24e-08，CUDA max_diff=7.45e-09，compute-sanitizer 零错误）；(6) **BERT-base Phase C**（MHA 融合 kernel，22 节点 self-attention 子图 → 1 个 MHA_Fused kernel + 1 个 output MatMul，CPU vs CUDA 相对误差 < 1.3e-06，compute-sanitizer 零错误，BERT-base 单层 CUDA 推理 4.66 ms/iter（FP16 WMMA），5.57x vs FP32）。覆盖 34 种算子（含 MHA_Fused 融合、MHA_Decode、CausalMask、RoPE），**30 项测试全部通过**。
+已通过五层验证：(1) MNIST CNN（Conv×2 + ReLU + MaxPool + Reshape + Gemm + Softmax）；(2) **ResNet-18**（1×3×224×224 → 1×1000，50 节点，CUDA 推理与 PyTorch 对比 max_diff = 5.25e-06，Top-1 一致）；(3) **YOLOv8n**（1×3×640×640 → 1×84×8400，234 节点，CPU/CUDA 推理 max_diff < 1e-3，compute-sanitizer 零错误）；(4) **BERT-like Phase A**（Embedding + LayerNorm + FFN + SiLU，CPU/CUDA 推理与 ONNX Runtime 对比 max_diff = 5.96e-07）；(5) **BERT-base Phase B**（Embedding + LayerNorm + FFN + Exp + ReduceSum/Max + ArgMax + Cast + Softmax + Concat，CPU max_diff=2.24e-08，CUDA max_diff=7.45e-09，compute-sanitizer 零错误）；(6) **BERT-base Phase C**（MHA 融合 kernel，22 节点 self-attention 子图 → 1 个 MHA_Fused kernel + 1 个 output MatMul，CPU vs CUDA 相对误差 < 1.3e-06，compute-sanitizer 零错误，BERT-base 单层 CUDA 推理 4.66 ms/iter（FP16 WMMA），5.57x vs FP32）。覆盖 36 种算子（含 MHA_Fused 融合、MHA_Decode、CausalMask、RoPE、Pad、Clip），**31 项测试全部通过**。
 
 **Q: 支持 FP16 或 INT8 推理吗？**
 支持 FP32 和 FP16 推理。FP16 通过 WMMA Tensor Core 实现，MHA 融合 kernel 加速 5.57×。INT8 量化在后续计划中。
