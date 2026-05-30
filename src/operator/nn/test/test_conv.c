@@ -39,20 +39,21 @@ void test_conv2d_f32_basic(void) {
     TEST_ASSERT_FLOAT_WITHIN(1e-5, 12.0f, output[2]);
     TEST_ASSERT_FLOAT_WITHIN(1e-5, 14.0f, output[3]);
 
-    /* Also verify stride=2 variant: input 4x4, kernel 3x3, pad=0, stride=2 */
-    float input44[16] = {1,1,1,1, 1,1,1,1, 1,1,1,1, 1,1,1,1};
+    /* stride=2 variant: input 5x5, kernel 3x3, pad=0, stride=2
+       OH = (5-3)/2+1 = 2, output is 2x2, each = sum of 3x3 ones = 9 */
+    float input55[25];
+    for (int i = 0; i < 25; i++) input55[i] = 1.0f;
     float w33[9] = {1,1,1, 1,1,1, 1,1,1};
     float out22[4] = {0};
     conv_params_t p2 = {
-        .N=1,.C=1,.H=4,.W=4,.K=1,.kernel_h=3,.kernel_w=3,
+        .N=1,.C=1,.H=5,.W=5,.K=1,.kernel_h=3,.kernel_w=3,
         .pad_h=0,.pad_w=0,.stride_h=2,.stride_w=2,
         .dilation_h=1,.dilation_w=1,.groups=1,
     };
-    const void* inputs2[] = {input44, w33, NULL};
+    const void* inputs2[] = {input55, w33, NULL};
     void* outputs2[] = {out22};
     ret = op->func(inputs2, outputs2, (const operator_params_t*)&p2, NULL);
     TEST_ASSERT_EQUAL_INT(0, ret);
-    /* Each output is sum of 3x3 window of 1s = 9, so all outputs should be 9 */
     TEST_ASSERT_FLOAT_WITHIN(1e-5, 9.0f, out22[0]);
     TEST_ASSERT_FLOAT_WITHIN(1e-5, 9.0f, out22[1]);
     TEST_ASSERT_FLOAT_WITHIN(1e-5, 9.0f, out22[2]);

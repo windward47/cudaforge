@@ -253,6 +253,9 @@ if(ENABLE_TESTS)
         src/operator/blas
     )
     target_link_libraries(test_conv PRIVATE operator platform unity)
+    if(CMAKE_C_COMPILER_ID STREQUAL "MSVC")
+        target_compile_options(test_conv PRIVATE /wd4100 /wd4189)
+    endif()
     add_test(NAME test_conv COMMAND test_conv)
 
     if(ENABLE_CUDA)
