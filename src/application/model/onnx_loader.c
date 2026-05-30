@@ -541,6 +541,8 @@ static op_type_t map_onnx_op(const char* onnx_op) {
     if (strcmp(onnx_op, "ReduceMax")  == 0) return OP_REDUCE;
     if (strcmp(onnx_op, "Cast")       == 0) return OP_CAST;
     if (strcmp(onnx_op, "ArgMax")     == 0) return OP_ARGMAX;
+    if (strcmp(onnx_op, "Where")     == 0) return OP_WHERE;
+    if (strcmp(onnx_op, "Tanh")     == 0) return OP_TANH;
     return (op_type_t)(-1);
 }
 
@@ -558,7 +560,8 @@ static int infer_output_shape(onnx_node_info_t* node, onnx_parsed_model_t* model
     /* Elementwise ops: output = input shape */
     if (ot == OP_RELU || ot == OP_SIGMOID || ot == OP_GELU || ot == OP_SILU
         || ot == OP_BATCHNORM || ot == OP_ADD || ot == OP_MUL || ot == OP_SOFTMAX
-        || ot == OP_SUB || ot == OP_DIV || ot == OP_EXP || ot == OP_CAST) {
+        || ot == OP_SUB || ot == OP_DIV || ot == OP_EXP || ot == OP_CAST
+        || ot == OP_TANH) {
         for (int oi = 0; oi < node->num_outputs; oi++) {
             onnx_tensor_info_t* out = find_tensor(model, node->output_names[oi]);
             if (!out) out = add_tensor(model, node->output_names[oi]);
@@ -1237,6 +1240,13 @@ static inference_graph_t* build_graph_from_onnx(onnx_parsed_model_t* pm) {
                         int64_t* src = (int64_t*)t->raw_data;
                         float* dst = (float*)wt->data;
                         for (int64_t j = 0; j < num; j++) dst[j] = (float)src[j];
+                    } else if (t->dtype_onnx == 9 && t->raw_data) {
+                        /* BOOL tensor: 1 byte per element, convert to float */
+                        int64_t num = (int64_t)t->raw_data_size;
+                        if (num > wt->numel) num = wt->numel;
+                        uint8_t* src = (uint8_t*)t->raw_data;
+                        float* dst = (float*)wt->data;
+                        for (int64_t j = 0; j < num; j++) dst[j] = (src[j] != 0) ? 1.0f : 0.0f;
                     } else if (t->raw_data_size <= (size_t)wt->numel * sizeof(float)) {
                         memcpy(wt->data, t->raw_data, t->raw_data_size);
                     }
@@ -1248,9 +1258,17 @@ static inference_graph_t* build_graph_from_onnx(onnx_parsed_model_t* pm) {
                     tensor_t* tt = tensor_create(DATA_TYPE_F32, t->ndim, t->shape);
                     if (tt) {
                         /* Copy initializer data into graph tensor */
-                        if (t->is_initializer && t->raw_data
-                            && t->raw_data_size <= (size_t)tt->numel * sizeof(float)) {
-                            memcpy(tt->data, t->raw_data, t->raw_data_size);
+                        if (t->is_initializer && t->raw_data) {
+                            if (t->dtype_onnx == 9) {
+                                /* BOOL: 1 byte per element */
+                                int64_t num = (int64_t)t->raw_data_size;
+                                if (num > tt->numel) num = tt->numel;
+                                uint8_t* src = (uint8_t*)t->raw_data;
+                                float* dst = (float*)tt->data;
+                                for (int64_t j = 0; j < num; j++) dst[j] = (src[j] != 0) ? 1.0f : 0.0f;
+                            } else if (t->raw_data_size <= (size_t)tt->numel * sizeof(float)) {
+                                memcpy(tt->data, t->raw_data, t->raw_data_size);
+                            }
                         }
                         t->tensor_id = graph_add_tensor(g, tt);
                     }

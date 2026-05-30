@@ -15,6 +15,7 @@ typedef enum {
     DATA_TYPE_I32,
     DATA_TYPE_I8,
     DATA_TYPE_U8,
+    DATA_TYPE_I64,
     DATA_TYPE_COUNT
 } data_type_t;
 

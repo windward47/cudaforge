@@ -10,8 +10,6 @@ int reshape_f32(const void* inputs[], void* outputs[],
     if (!params) return -1;
 
     const reshape_params_t* p = (const reshape_params_t*)params;
-    /* Zero-copy reshape: just copy data (same numel, new shape).
-       The output tensor is already pre-allocated with target shape. */
     memcpy(outputs[0], inputs[0], (size_t)p->numel * sizeof(float));
     return 0;
 }

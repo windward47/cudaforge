@@ -45,6 +45,8 @@ typedef enum {
     OP_ROPE,
     OP_PAD,
     OP_CLIP,
+    OP_WHERE,
+    OP_TANH,
     OP_INPUT,
     OP_OUTPUT
 } op_type_t;

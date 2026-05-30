@@ -264,6 +264,8 @@ static const char* op_name(op_type_t type) {
         case OP_ROPE:               return "rope_f32";
         case OP_PAD:                return "pad_f32";
         case OP_CLIP:               return "clip_f32";
+        case OP_WHERE:              return "where_f32";
+        case OP_TANH:               return "tanh_f32";
         default:                    return NULL;
     }
 }
@@ -743,7 +745,7 @@ int graph_execute(inference_graph_t* g, tensor_t* inputs[],
         /* Build op name — try dtype-aware name first, fall back to f32 */
         char name_buf[64];
         const char* base = op_name(n->type);
-        if (!base) { ret = -1; goto cleanup; }
+        if (!base) { fprintf(stderr, "ERROR: unknown op type %d at node %d\n", (int)n->type, node_id); ret = -1; goto cleanup; }
 
         /* Check output tensor dtype for FP16 dispatch */
         int output_is_f16 = 0;
@@ -902,7 +904,8 @@ int graph_execute(inference_graph_t* g, tensor_t* inputs[],
                     if (!ot->data_device) {
                         const data_type_info_t* info = data_type_get_info(ot->dtype);
                         size_t bytes = (size_t)ot->numel * info->size;
-                        ot->data_device = g_cuda.device_alloc(bytes);
+                        if (bytes > 0)
+                            ot->data_device = g_cuda.device_alloc(bytes);
                     }
                     if (ot->data_device)
                         op_outputs[i] = ot->data_device;

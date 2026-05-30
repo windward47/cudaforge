@@ -73,10 +73,12 @@ int register_mha_decode_f32(void);
 int register_rope_f32(void);
 int register_pad_f32(void);
 int register_clip_f32(void);
+int register_where_f32(void);
 int register_mha_decode_f32_cuda(void);
 int register_rope_f32_cuda(void);
 int register_pad_f32_cuda(void);
 int register_clip_f32_cuda(void);
+int register_where_f32_cuda(void);
 
 int operator_init_all(void) {
     int ret = 0;
@@ -109,6 +111,7 @@ int operator_init_all(void) {
     ret += register_rope_f32();
     ret += register_pad_f32();
     ret += register_clip_f32();
+    ret += register_where_f32();
     ret += register_relu_f32_cuda();
     ret += register_matmul_f32_cuda();
     ret += register_conv2d_f32_cuda();
@@ -154,5 +157,6 @@ int operator_init_all(void) {
     ret += register_rope_f32_cuda();
     ret += register_pad_f32_cuda();
     ret += register_clip_f32_cuda();
+    ret += register_where_f32_cuda();
     return ret;
 }

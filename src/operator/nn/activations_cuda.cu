@@ -79,6 +79,21 @@ int gelu_f32_cuda(const void* inputs[], void* outputs[],
                      *(const int64_t*)inputs[1]);
 }
 
+__global__ void tanh_f32_kernel(const float* in, float* out, int64_t n) {
+    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) out[idx] = tanhf(in[idx]);
+}
+
+int tanh_f32_cuda(const void* inputs[], void* outputs[],
+                   const operator_params_t* params, stream_t* stream) {
+    (void)params;
+    if (!inputs || !inputs[0] || !inputs[1] || !outputs || !outputs[0]) return -1;
+    cudaStream_t s = stream ? (cudaStream_t)stream->cuda_stream : 0;
+    return launch_1d(s, (const void*)tanh_f32_kernel,
+                     (const float*)inputs[0], (float*)outputs[0],
+                     *(const int64_t*)inputs[1]);
+}
+
 extern "C" int register_activations_cuda(void) {
     static operator_registry_t sigmoid_reg = {
         .name = "sigmoid_f32_cuda", .data_type = "f32",
@@ -101,5 +116,10 @@ extern "C" int register_activations_cuda(void) {
     ret += operator_register(&gelu_reg);
     ret += operator_register(&silu_reg);
     ret += operator_register(&exp_reg);
+    static operator_registry_t tanh_reg = {
+        .name = "tanh_f32_cuda", .data_type = "f32",
+        .func = tanh_f32_cuda, .version = 1, .flags = OP_FLAG_IN_PLACE,
+    };
+    ret += operator_register(&tanh_reg);
     return ret;
 }

@@ -53,3 +53,9 @@ mnist_data/
 *.gcno
 *.gcov
 coverage/
+
+# GPT-2 test model (generated)
+tests/gpt2_full.onnx
+tests/gpt2_full_vocab.txt
+tests/gpt2_full_input.bin
+tests/gpt2_full_logits.bin
