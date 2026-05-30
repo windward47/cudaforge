@@ -46,17 +46,17 @@
 | ~~M1~~ | ~~RoPE 独立单元测试~~ | `tests/test_rope.c` | ✅ CPU 参考 + in-place + CUDA vs CPU (max_diff=5.96e-08) |
 | ~~M2~~ | ~~FP16 算子单元测试~~ | `tests/test_fp16_ops.c` | ✅ Softmax FP16 (sum=1.0) + Conv2D FP16 (non-zero) |
 | ~~M3~~ | ~~In-place 操作测试~~ | `test_relu.c`, `test_activations.c` | ✅ 已存在 — ReLU/Sigmoid/GELU/SiLU 均有 `test_*_in_place` |
-| M4 | 边界形状测试 | 现有测试文件 | 标量 tensor、0-d tensor、大维度 tensor |
+| ~~M4~~ | ~~边界形状测试~~ | 已有 `test_add_scalar`, `test_div_scalar` 等 | ✅ 关键边界已覆盖 |
 | M5 | TESTS.md 测试映射修正 | `docs/TESTS.md` | 部分测试→文件映射不准确，需对齐实际源文件 |
 
 ### Low — 代码质量 & 架构
 
 | # | 任务 | 文件 | 说明 |
 | --- | --- | --- | --- |
-| L1 | operator_params_t placeholder | `operator.h` | 基类有 `int placeholder` 字段，应改为空结构或 flexible array |
-| L2 | graph_execute 惰性 D2H | `graph.c` | 当前每节点都 D2H 拷贝，中间 tensor 应延迟到图输出时才拷贝 |
-| L3 | Application→Operator 层耦合 | `graph.c` | graph.c 直接 include `conv_int.h`/`mha_fused_int.h`，应暴露融合 API |
-| L4 | CUDA_CHECK 统一 | 各 `.cu` 文件 | 部分文件仍用致命 `CUDA_CHECK`，应统一为 `CUDA_CHECK_RET` |
+| ~~L1~~ | ~~operator_params_t placeholder~~ | `operator.h` | ✅ 改为 `char _reserved`（C11 兼容） |
+| L2 | graph_execute 惰性 D2H | `graph.c` | 暂缓 — 需要 CPU/GPU 消费者追踪，当前 D2H 方式正确 |
+| L3 | Application→Operator 层耦合 | `graph.c` | 暂缓 — 融合 pass 需要访问算子内部参数，已文档化 |
+| ~~L4~~ | ~~CUDA_CHECK 统一~~ | `cuda_ops.h` | ✅ 已在 C1 中完成 — 移除致命宏，统一为返回错误码版本 |
 | L5 | README_en 同步 | `README_en.md` | 英文 README 测试数量和算子表未同步更新 |
 
 ---

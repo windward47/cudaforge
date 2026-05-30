@@ -10,9 +10,10 @@ extern "C" {
 
 /* ============================================================
  * Operator parameter (opaque base — each op defines its own)
+ * Each operator casts this to its own params struct (e.g. conv_params_t).
  * ============================================================ */
 typedef struct {
-    int placeholder;
+    char _reserved;  /* non-empty for C11 compliance; unused */
 } operator_params_t;
 
 /* ============================================================
