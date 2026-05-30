@@ -67,12 +67,13 @@ int graph_add_node(inference_graph_t* g, op_type_t type,
     /* Copy weights array (caller retains ownership of the tensor_t* pointers) */
     if (num_weights > 0 && weights) {
         n->weights = (tensor_t**)malloc((size_t)num_weights * sizeof(tensor_t*));
-        if (n->weights)
-            memcpy(n->weights, weights, (size_t)num_weights * sizeof(tensor_t*));
+        if (!n->weights) return -1;
+        memcpy(n->weights, weights, (size_t)num_weights * sizeof(tensor_t*));
     }
 
     if (params && params_size > 0) {
-        n->params      = malloc(params_size);
+        n->params = malloc(params_size);
+        if (!n->params) return -1;
         n->params_size = params_size;
         memcpy(n->params, params, params_size);
     }
@@ -80,10 +81,12 @@ int graph_add_node(inference_graph_t* g, op_type_t type,
     /* Copy tensor indices */
     if (num_inputs > 0) {
         n->input_tensors = (int*)malloc((size_t)num_inputs * sizeof(int));
+        if (!n->input_tensors) return -1;
         memcpy(n->input_tensors, input_tensors, (size_t)num_inputs * sizeof(int));
     }
     if (num_outputs > 0) {
         n->output_tensors = (int*)malloc((size_t)num_outputs * sizeof(int));
+        if (!n->output_tensors) return -1;
         memcpy(n->output_tensors, output_tensors, (size_t)num_outputs * sizeof(int));
     }
 

@@ -104,9 +104,8 @@ typedef struct {
 ```
 src/operator/nn/
 ├── conv.c              # 通用实现（纯 C fallback）
+├── conv_cuda.cu        # CUDA 实现（含 Winograd 优化）
 ├── conv_int.h          # 内部共享声明
-├── conv_x86.c          # x86 优化实现（AVX2/AVX512）
-├── conv_arm.c          # ARM 优化实现（NEON/SVE）
 └── test/
     └── test_conv.c     # 单元测试
 ```

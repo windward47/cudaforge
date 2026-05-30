@@ -91,6 +91,18 @@ __global__ void mul_f16_broadcast_kernel(const __half* a, const __half* b,
     if (i < N) out[i] = __hmul(a[i], b[i % C]);
 }
 
+__global__ void sub_f16_broadcast_kernel(const __half* a, const __half* b,
+                                          __half* out, int64_t N, int64_t C) {
+    int64_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < N) out[i] = __hsub(a[i], b[i % C]);
+}
+
+__global__ void div_f16_broadcast_kernel(const __half* a, const __half* b,
+                                          __half* out, int64_t N, int64_t C) {
+    int64_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < N) out[i] = __hdiv(a[i], b[i % C]);
+}
+
 /* ============================================================
  * Host dispatch functions
  * ============================================================ */
@@ -170,6 +182,13 @@ int sub_f16_cuda(const void* inputs[], void* outputs[],
     int64_t n = p->numel;
     dim3 block(OPS_THREADS_PER_BLOCK, 1, 1);
     dim3 grid((unsigned int)((n + OPS_THREADS_PER_BLOCK - 1) / OPS_THREADS_PER_BLOCK), 1, 1);
+
+    if (p->B_numel == n) {
+        return CUDA_KERNEL_LAUNCH(sub_f16_kernel, grid, block, 0, s, a, b, out, n);
+    } else if (p->B_numel > 0 && p->B_numel < n) {
+        return CUDA_KERNEL_LAUNCH(sub_f16_broadcast_kernel, grid, block, 0, s,
+                                  a, b, out, n, p->B_numel);
+    }
     return CUDA_KERNEL_LAUNCH(sub_f16_kernel, grid, block, 0, s, a, b, out, n);
 }
 
@@ -185,6 +204,13 @@ int div_f16_cuda(const void* inputs[], void* outputs[],
     int64_t n = p->numel;
     dim3 block(OPS_THREADS_PER_BLOCK, 1, 1);
     dim3 grid((unsigned int)((n + OPS_THREADS_PER_BLOCK - 1) / OPS_THREADS_PER_BLOCK), 1, 1);
+
+    if (p->B_numel == n) {
+        return CUDA_KERNEL_LAUNCH(div_f16_kernel, grid, block, 0, s, a, b, out, n);
+    } else if (p->B_numel > 0 && p->B_numel < n) {
+        return CUDA_KERNEL_LAUNCH(div_f16_broadcast_kernel, grid, block, 0, s,
+                                  a, b, out, n, p->B_numel);
+    }
     return CUDA_KERNEL_LAUNCH(div_f16_kernel, grid, block, 0, s, a, b, out, n);
 }
 

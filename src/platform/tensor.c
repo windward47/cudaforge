@@ -86,13 +86,40 @@ int tensor_copy_to_host(tensor_t* t) {
 #endif
 }
 
+/* Software FP16 decode (IEEE 754 half-precision) for tensor_allclose */
+static float f16_to_f32(uint16_t h) {
+    uint32_t sign = ((uint32_t)(h & 0x8000)) << 16;
+    int32_t exp = ((h >> 10) & 0x1F);
+    uint32_t mant = ((uint32_t)(h & 0x3FF)) << 13;
+    uint32_t bits;
+    if (exp == 0) {
+        if (mant == 0) { bits = sign; }
+        else { while (!(mant & 0x800000)) { mant <<= 1; exp--; }
+               exp++; mant &= ~0x800000;
+               bits = sign | ((uint32_t)(exp + 127 - 15) << 23) | mant; }
+    } else if (exp == 31) {
+        bits = sign | 0x7F800000 | mant;
+    } else {
+        bits = sign | ((uint32_t)(exp + 127 - 15) << 23) | mant;
+    }
+    float f; memcpy(&f, &bits, sizeof(f)); return f;
+}
+
+static float tensor_get_float(const tensor_t* t, int64_t i) {
+    const data_type_info_t* info = data_type_get_info(t->dtype);
+    if (info->size == 4) return ((float*)t->data)[i];
+    if (info->size == 2) return f16_to_f32(((uint16_t*)t->data)[i]);
+    return 0.0f;
+}
+
 bool tensor_allclose(const tensor_t* a, const tensor_t* b,
                      float rtol, float atol) {
     if (!a || !b || a->numel != b->numel) return false;
+    if (a->dtype != b->dtype) return false;
 
     for (int64_t i = 0; i < a->numel; i++) {
-        float va = ((float*)a->data)[i];
-        float vb = ((float*)b->data)[i];
+        float va = tensor_get_float(a, i);
+        float vb = tensor_get_float(b, i);
         float diff = fabsf(va - vb);
         float max  = fmaxf(fabsf(va), fabsf(vb));
         if (diff > atol && diff > rtol * max) {

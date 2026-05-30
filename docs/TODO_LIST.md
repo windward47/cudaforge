@@ -6,7 +6,7 @@
 
 ## 审阅概要
 
-**当前状态**: 31 种算子全部 CPU+CUDA 双实现，3 个端到端模型验证通过（ResNet-18、YOLOv8n、BERT-base），**31 项测试全通过**。算子覆盖涵盖 CNN 和 Transformer/BERT 推理全链路。Phase C MHA 融合 kernel 已集成，compute-sanitizer 零错误。
+**当前状态**: 34 种算子全部 CPU+CUDA 双实现（含 FP16 变体），4 个端到端模型验证通过（ResNet-18、YOLOv8n、BERT-base、GPT-2 测试模型），**30 项测试全通过**。算子覆盖涵盖 CNN、Transformer/BERT、LLM 推理全链路。MHA 融合 kernel (FP32+FP16 WMMA)、decode kernel (KV-cache+GQA)、RoPE、CausalMask 均已实现。
 
 ---
 
