@@ -87,7 +87,7 @@ compute-sanitizer ./build/Release/test_onnx.exe
 预期输出：
 
 ```text
-CudaForge v0.1.0
+CudaForge v0.5.0
 Platform: x86_64 (8 cores, 64 B cache line)
 CUDA: enabled (1 device(s))
 ```

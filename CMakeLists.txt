@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.18)
-project(CudaForge VERSION 0.1.0 LANGUAGES C CXX)
+project(CudaForge VERSION 0.5.0 LANGUAGES C CXX)
 
 # ============================================================
 # Options
