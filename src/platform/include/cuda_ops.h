@@ -21,18 +21,8 @@ extern "C" {
  *  CUDA error check — only meaningful when compiled by nvcc
  * -------------------------------------------------------------------------- */
 #ifdef __CUDACC__
+/* CUDA error check — logs error and returns error code (non-fatal) */
 #define CUDA_CHECK(call) \
-    do { \
-        cudaError_t err = call; \
-        if (err != cudaSuccess) { \
-            fprintf(stderr, "CUDA error at %s:%d: %s\n", \
-                    __FILE__, __LINE__, cudaGetErrorString(err)); \
-            goto cuda_error; \
-        } \
-    } while(0)
-
-/* Non-fatal variant: logs error and returns the cudaError_t to caller */
-#define CUDA_CHECK_RET(call) \
     do { \
         cudaError_t _err = call; \
         if (_err != cudaSuccess) { \
@@ -43,7 +33,6 @@ extern "C" {
     } while(0)
 #else
 #define CUDA_CHECK(call) (void)(call)
-#define CUDA_CHECK_RET(call) do { (void)(call); } while(0)
 #endif
 
 /* --------------------------------------------------------------------------

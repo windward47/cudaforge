@@ -24,8 +24,8 @@
 
 | # | 任务 | 文件 | 说明 |
 | --- | --- | --- | --- |
-| C1 | CUDA_CHECK 改为返回错误码 | `cuda_ops.h` | 当前 `CUDA_CHECK` 调用 `exit()`，推理库不应直接退出。应统一使用 `CUDA_CHECK_RET` |
-| C2 | graph.c realloc 失败处理 | `graph.c:37,55` | realloc 返回 NULL 时原指针丢失（内存泄漏），需先保存旧指针 |
+| ~~C1~~ | ~~CUDA_CHECK 改为返回错误码~~ | `cuda_ops.h` | ✅ 移除致命宏，统一为返回错误码版本 |
+| ~~C2~~ | ~~graph.c realloc 失败处理~~ | `graph.c` | ✅ 4 处 realloc 改用临时变量，失败时保留旧指针 |
 
 ### High — 功能完整性
 
@@ -64,7 +64,7 @@
 ## 远期规划
 
 | 方向 | 说明 |
-|------|------|
+| --- | --- |
 | INT8 量化推理 | 量化 kernel + 校准工具 |
 | 动态形状支持 | ONNX dynamic axes |
 | x86 SIMD 优化 | AVX2/AVX-512 加速 CPU 路径 |

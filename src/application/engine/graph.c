@@ -33,10 +33,11 @@ inference_graph_t* graph_create(void) {
 int graph_add_tensor(inference_graph_t* g, tensor_t* t) {
     if (!g || !t) return -1;
     int id = g->num_tensors;
+    graph_tensor_t* p = (graph_tensor_t*)realloc(g->tensors,
+                    (size_t)(g->num_tensors + 1) * sizeof(graph_tensor_t));
+    if (!p) return -1;
+    g->tensors = p;
     g->num_tensors++;
-    g->tensors = (graph_tensor_t*)realloc(g->tensors,
-                    (size_t)g->num_tensors * sizeof(graph_tensor_t));
-    if (!g->tensors) return -1;
 
     g->tensors[id].tensor    = t;
     g->tensors[id].producer  = -1;
@@ -51,10 +52,11 @@ int graph_add_node(inference_graph_t* g, op_type_t type,
                    void* params, size_t params_size) {
     if (!g) return -1;
     int id = g->num_nodes;
+    graph_node_t* p = (graph_node_t*)realloc(g->nodes,
+                  (size_t)(g->num_nodes + 1) * sizeof(graph_node_t));
+    if (!p) return -1;
+    g->nodes = p;
     g->num_nodes++;
-    g->nodes = (graph_node_t*)realloc(g->nodes,
-                  (size_t)g->num_nodes * sizeof(graph_node_t));
-    if (!g->nodes) return -1;
 
     graph_node_t* n = &g->nodes[id];
     memset(n, 0, sizeof(graph_node_t));
@@ -106,10 +108,11 @@ int graph_add_node(inference_graph_t* g, op_type_t type,
 int graph_set_input(inference_graph_t* g, int node_id) {
     if (!g || node_id < 0 || node_id >= g->num_nodes) return -1;
     int id = g->num_inputs;
+    int* p = (int*)realloc(g->input_node_ids,
+                          (size_t)(g->num_inputs + 1) * sizeof(int));
+    if (!p) return -1;
+    g->input_node_ids = p;
     g->num_inputs++;
-    g->input_node_ids = (int*)realloc(g->input_node_ids,
-                          (size_t)g->num_inputs * sizeof(int));
-    if (!g->input_node_ids) return -1;
     g->input_node_ids[id] = node_id;
     return 0;
 }
@@ -117,10 +120,11 @@ int graph_set_input(inference_graph_t* g, int node_id) {
 int graph_set_output(inference_graph_t* g, int node_id) {
     if (!g || node_id < 0 || node_id >= g->num_nodes) return -1;
     int id = g->num_outputs;
+    int* p = (int*)realloc(g->output_node_ids,
+                           (size_t)(g->num_outputs + 1) * sizeof(int));
+    if (!p) return -1;
+    g->output_node_ids = p;
     g->num_outputs++;
-    g->output_node_ids = (int*)realloc(g->output_node_ids,
-                           (size_t)g->num_outputs * sizeof(int));
-    if (!g->output_node_ids) return -1;
     g->output_node_ids[id] = node_id;
     return 0;
 }
