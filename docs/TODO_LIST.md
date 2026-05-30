@@ -73,7 +73,7 @@
 
 | # | 任务 | 文件 | 说明 |
 | --- | --- | --- | --- |
-| T1 | test_conv 编译修复 | `tests/test_conv.c` | MSVC C4100/C4189 警告即错误，需添加 /wd4100 /wd4189 |
+| ~~T1~~ | ~~test_conv 编译修复~~ | `test_conv.c` | ✅ 添加 /wd4100 /wd4189 + 修复 stride=2 测试用例 (4×4→5×5 input) |
 
 ---
 
@@ -96,7 +96,7 @@
 | --- | --- | --- |
 | 已完成 | 19 | Phase A/B/C, M1-M3, O1-O2, F1, F2, C1-C2, H1-H7, M1-M5, L1/L4/L5 |
 | 暂缓 | 2 | L2 (惰性 D2H), L3 (层耦合) |
-| 待修复 | 1 | T1 (test_conv 编译) |
+| 已修复 | 1 | T1 (test_conv 编译 + 测试 bug) |
 | 远期 | 6 | INT8/动态形状/SIMD/ARM/TensorRT/多GPU |
 
-> **最后更新**: 2026-05-30。v0.5.0 发布。36 种算子，33/34 测试通过，BERT-base FP16 4.66ms (8.96× vs CPU)。
+> **最后更新**: 2026-05-30。v0.5.0。36 种算子，**34/34 测试全部通过**，BERT-base FP16 4.66ms (8.96× vs CPU)。T1 修复（test_conv 编译 + 测试 bug）。
