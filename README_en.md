@@ -77,7 +77,7 @@ cmake --build build -j$(nproc)
 # Smoke test — prints platform info
 ./build/Release/cudaforge.exe
 
-# Full test suite (30 test executables)
+# Full test suite (32 test executables)
 ctest --test-dir build -C Release -j$(nproc)
 
 # GPU memory safety check
@@ -124,6 +124,12 @@ CUDA: enabled (1 device(s))
 | ReduceSum/Max | `ReduceSum` / `ReduceMax` | ✓ | ✓ | Shared-memory stride reduction along axes |
 | Cast | `Cast` | ✓ | ✓ | int64↔F32 type conversion, supports ONNX `to` attr |
 | ArgMax | `ArgMax` | ✓ | ✓ | Shared-memory (value,index) pair reduction |
+| MHA_Fused | S-Attn subgraph fusion | ✓ | ✓ | QKV projection + Multi-Head Attention + output projection fused (FP32 + FP16 WMMA) |
+| MHA_Decode | Single-token decode | ✓ | ✓ | KV-cache + GQA support, online softmax, for autoregressive generation |
+| CausalMask | Causal mask | ✓ | ✓ | Lower-triangular attention mask (0/on-diagonal, -inf/above) |
+| RoPE | Rotary Position Encoding | ✓ | ✓ | Rotary Position Encoding for LLaMA/Mistral |
+| Pad | Pad | ✓ | ✓ | Constant/edge/reflect padding for 4D tensors |
+| Clip | Clip | ✓ | ✓ | Clamp values to [min, max] |
 
 ## API at a Glance
 
@@ -257,10 +263,10 @@ CudaForge includes a **hand-written protobuf wire-format parser** (~200 lines of
 CudaForge is for learning how inference engines work under the hood. Reading its entire codebase takes an afternoon. It's also useful for embedded scenarios where you can't afford 100+ MB of dependencies.
 
 **Q: Can I run ResNet / YOLO / BERT?**
-Five tiers verified: (1) MNIST CNN (Conv×2 + ReLU + MaxPool + Reshape + Gemm + Softmax); (2) **ResNet-18** (1×3×224×224 → 1×1000, 50 nodes, CUDA vs PyTorch max_diff = 5.25e-06, Top-1 matches); (3) **YOLOv8n** (1×3×640×640 → 1×84×8400, 234 nodes, CPU/CUDA max_diff < 1e-3, compute-sanitizer 0 errors); (4) **BERT-like Phase A** (Embedding + LayerNorm + FFN + SiLU, CPU/CUDA vs ONNX Runtime max_diff = 5.96e-07); (5) **BERT-base Phase B** (Embedding + LayerNorm + FFN + Exp + ReduceSum/Max + ArgMax + Cast + Softmax + Concat, CPU max_diff=2.24e-08, CUDA max_diff=7.45e-09, compute-sanitizer 0 errors). 30 operators covered, 30 tests all passing.
+Five tiers verified: (1) MNIST CNN (Conv×2 + ReLU + MaxPool + Reshape + Gemm + Softmax); (2) **ResNet-18** (1×3×224×224 → 1×1000, 50 nodes, CUDA vs PyTorch max_diff = 5.25e-06, Top-1 matches); (3) **YOLOv8n** (1×3×640×640 → 1×84×8400, 234 nodes, CPU/CUDA max_diff < 1e-3, compute-sanitizer 0 errors); (4) **BERT-like Phase A** (Embedding + LayerNorm + FFN + SiLU, CPU/CUDA vs ONNX Runtime max_diff = 5.96e-07); (5) **BERT-base Phase B** (Embedding + LayerNorm + FFN + Exp + ReduceSum/Max + ArgMax + Cast + Softmax + Concat, CPU max_diff=2.24e-08, CUDA max_diff=7.45e-09, compute-sanitizer 0 errors). 36 operators covered (including MHA_Fused fusion, MHA_Decode, CausalMask, RoPE, Pad, Clip), 32 tests all passing.
 
 **Q: Does it support FP16 or INT8?**
-Currently FP32 only. Mixed-precision and quantization are planned for future releases.
+Supports FP32 and FP16 inference. FP16 via WMMA Tensor Cores, MHA fused kernel 5.57× speedup. INT8 quantization planned for future.
 
 **Q: How do I debug a CUDA kernel?**
 Use `compute-sanitizer` (ships with CUDA Toolkit):
