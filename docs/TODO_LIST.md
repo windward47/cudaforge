@@ -89,7 +89,7 @@
 | Transpose/Concat 推断 | ✅ | 新增 shape inference |
 | 自回归生成 API | ✅ | generate.h / generate.c |
 | GPT-2 测试模型 | ✅ | gen_gpt2_full.py (hidden=64, 2层) |
-| GPT-2 端到端推理 | ⏳ | proto3 raw_data (field 13) 加载问题待修 |
+| GPT-2 端到端推理 | ⏳ | Where/Tanh op 已支持，Gather 已验证，ONNX proto3 field 13 加载问题待修 |
 | KV-cache decode | ⏳ | 待实现 mha_decode 集成 |
 
 ## 远期规划
