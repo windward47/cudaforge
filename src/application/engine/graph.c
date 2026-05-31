@@ -942,7 +942,10 @@ int graph_execute(inference_graph_t* g, tensor_t* inputs[],
                 int tid = effective_output_tids[i] ? effective_output_tids[i]
                                                    : n->output_tensors[i];
                 if (tid >= 0 && tid != g->kv_cache_K_tid && tid != g->kv_cache_V_tid) {
-                    tensor_copy_to_host(g->tensors[tid].tensor);
+                    tensor_t* ot = g->tensors[tid].tensor;
+                    if (ot && ot->numel > 0) {
+                        tensor_copy_to_host(ot);
+                    }
                 }
             }
             g_cuda.stream_synchronize(0);
