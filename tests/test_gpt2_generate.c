@@ -100,9 +100,6 @@ static int test_gpt2_prefill(void) {
     fprintf(stderr, "Logits[0..5]: %.4f %.4f %.4f %.4f %.4f %.4f\n",
             last_logits[0], last_logits[1], last_logits[2],
             last_logits[3], last_logits[4], last_logits[5]);
-    fprintf(stderr, "Logits sum: %.4f, max: %.4f, min: %.4f\n",
-            last_logits[0] + last_logits[1] + last_logits[2] + last_logits[3],
-            last_logits[0], last_logits[255]);
 
     /* Load reference and compare */
     float ref_logits[8 * 256];

@@ -207,15 +207,27 @@ static int parse_tensor_proto(pb_message_t* msg, onnx_tensor_info_t* info) {
         }
         return 0;
     }
-    /* Fallback: try field 13 (proto3 raw_data) */
-    raw = pb_field_get_string(msg, 13, &raw_len);
-    if (raw && raw_len > 0) {
-        info->raw_data = (uint8_t*)malloc(raw_len);
-        if (info->raw_data) {
-            memcpy(info->raw_data, raw, raw_len);
-            info->raw_data_size = raw_len;
+    /* Fallback: try field 13 as raw_data (proto3 stores raw_data at field 13).
+       Only use if it looks like valid tensor data (not external_data entries). */
+    {
+        size_t raw13_len = 0;
+        const uint8_t* raw13 = pb_field_get_string(msg, 13, &raw13_len);
+        if (raw13 && raw13_len > 0) {
+            /* Heuristic: external_data entries are typically small (< 100 bytes)
+               and contain key-value pairs. Raw tensor data is typically larger.
+               Also check if the length matches expected tensor size. */
+            int64_t expected_bytes = 1;
+            for (int d = 0; d < info->ndim; d++) expected_bytes *= info->shape[d];
+            expected_bytes *= 4; /* float32 */
+            if (raw13_len >= (size_t)expected_bytes || raw13_len >= 256) {
+                info->raw_data = (uint8_t*)malloc(raw13_len);
+                if (info->raw_data) {
+                    memcpy(info->raw_data, raw13, raw13_len);
+                    info->raw_data_size = raw13_len;
+                }
+                return 0;
+            }
         }
-        return 0;
     }
 
     /* float_data: proto3 uses field 4 */
@@ -1272,11 +1284,16 @@ static inference_graph_t* build_graph_from_onnx(onnx_parsed_model_t* pm) {
             /* For non-commutative ops (Sub, Div, Gather), an initializer at
                position 0 must keep its position in op_inputs rather than being
                pushed to the end. Gather(data, indices) needs data at inputs[0]. */
-            /* Where: all inputs are data (condition + X + Y), not weights */
+            /* Determine if this input should be treated as a weight (embedded in node)
+               or as a data input (resolved at execution time).
+               Add/Mul/Sub/Div/Where: all inputs are data (broadcast semantics).
+               Gather: input[0] is data (embedding table).
+               Other ops: initializers become weights. */
             int as_weight = (t && t->is_initializer && t->raw_data
-                             && !((ot == OP_SUB || ot == OP_DIV
-                                   || ot == OP_GATHER) && ii == 0)
-                             && ot != OP_WHERE);
+                             && ot != OP_ADD && ot != OP_MUL
+                             && ot != OP_SUB && ot != OP_DIV
+                             && ot != OP_WHERE
+                             && !(ot == OP_GATHER && ii == 0));
 
             if (as_weight) {
                 tensor_t* wt = tensor_create(DATA_TYPE_F32, t->ndim, t->shape);
