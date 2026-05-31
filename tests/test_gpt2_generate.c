@@ -88,7 +88,7 @@ static int test_gpt2_prefill(void) {
     /* Run inference */
     tensor_t* inputs[] = {t_in};
     tensor_t* outputs[] = {t_out};
-    int ret = inference_session_run(sess, inputs, outputs, 1 /* use_cuda */);
+    int ret = inference_session_run(sess, inputs, outputs, 0 /* CPU */);
     CHECK(ret == 0, "inference_session_run failed");
 
     /* Check logits */
