@@ -104,6 +104,10 @@ void  graph_destroy(inference_graph_t* g);
 /* KV-cache: mark tensors as persistent (skip D2H copy between calls) */
 void  graph_set_kv_cache(inference_graph_t* g, int K_tensor_id, int V_tensor_id);
 
+/* Update cache_len for all mha_decode nodes in the graph.
+   Call this before each graph_execute during autoregressive decode. */
+void  graph_update_cache_len(inference_graph_t* g, int64_t new_cache_len);
+
 /* Permanent fusion: skip MHA restore after execution (for decode loops) */
 void  graph_set_permanent_fusion(inference_graph_t* g, int enable);
 

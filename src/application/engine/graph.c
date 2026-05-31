@@ -1,6 +1,7 @@
 #include "graph.h"
 #include "conv_int.h"
 #include "mha_fused_int.h"
+#include "mha_decode_int.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -133,6 +134,18 @@ void graph_set_kv_cache(inference_graph_t* g, int K_tensor_id, int V_tensor_id) 
     if (!g) return;
     g->kv_cache_K_tid = K_tensor_id;
     g->kv_cache_V_tid = V_tensor_id;
+}
+
+void graph_update_cache_len(inference_graph_t* g, int64_t new_cache_len) {
+    if (!g) return;
+    for (int i = 0; i < g->num_nodes; i++) {
+        graph_node_t* n = &g->nodes[i];
+        if (n->type == OP_MHA_DECODE && n->params
+            && n->params_size >= sizeof(mha_decode_params_t)) {
+            mha_decode_params_t* p = (mha_decode_params_t*)n->params;
+            p->cache_len = new_cache_len;
+        }
+    }
 }
 
 void graph_set_permanent_fusion(inference_graph_t* g, int enable) {
