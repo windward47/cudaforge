@@ -867,10 +867,11 @@ int graph_execute(inference_graph_t* g, tensor_t* inputs[],
         for (int i = 0; i < n->num_outputs; i++) {
             int tid = effective_output_tids[i] ? effective_output_tids[i]
                                                : n->output_tensors[i];
-            if (tid >= 0 && tid < g->num_tensors)
+            if (tid >= 0 && tid < g->num_tensors) {
                 op_outputs[i] = g->tensors[tid].tensor->data;
-            else
+            } else {
                 op_outputs[i] = NULL;
+            }
         }
 
         /* Handle ops that need extra metadata via inputs[] slot */

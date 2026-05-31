@@ -207,6 +207,16 @@ static int parse_tensor_proto(pb_message_t* msg, onnx_tensor_info_t* info) {
         }
         return 0;
     }
+    /* Fallback: try field 13 (proto3 raw_data) */
+    raw = pb_field_get_string(msg, 13, &raw_len);
+    if (raw && raw_len > 0) {
+        info->raw_data = (uint8_t*)malloc(raw_len);
+        if (info->raw_data) {
+            memcpy(info->raw_data, raw, raw_len);
+            info->raw_data_size = raw_len;
+        }
+        return 0;
+    }
 
     /* float_data: proto3 uses field 4 */
     pb_field_t* fd = pb_find_field(msg, 4);
@@ -647,17 +657,27 @@ static int infer_output_shape(onnx_node_info_t* node, onnx_parsed_model_t* model
         if (!in1) return 0;
 
         int64_t transB = node_attr_int(node, "transB", 0);
-        int64_t M = in0->ndim >= 2 ? in0->shape[0] : 1;
-        int64_t N = transB ? in1->shape[0] : (in1->ndim >= 2 ? in1->shape[1] : 1);
+        int64_t M = in0->ndim >= 2 ? in0->shape[in0->ndim - 2] : 1;
+        int64_t N = transB ? in1->shape[0] : (in1->ndim >= 2 ? in1->shape[in1->ndim - 1] : 1);
 
-        int64_t out_shape[2] = {M, N};
+        /* Support batched MatMul: preserve batch dims */
+        int ndim_out = (in0->ndim > in1->ndim) ? in0->ndim : in1->ndim;
+        if (ndim_out < 2) ndim_out = 2;
+        int64_t out_shape[8] = {0};
+        out_shape[ndim_out - 2] = M;
+        out_shape[ndim_out - 1] = N;
+        for (int d = 0; d < ndim_out - 2; d++) {
+            int64_t a_dim = (d < in0->ndim - 2) ? in0->shape[d] : 1;
+            int64_t b_dim = (d < in1->ndim - 2) ? in1->shape[d] : 1;
+            out_shape[d] = (a_dim > b_dim) ? a_dim : b_dim;
+        }
+
         for (int oi = 0; oi < node->num_outputs; oi++) {
             onnx_tensor_info_t* out = find_tensor(model, node->output_names[oi]);
             if (!out) out = add_tensor(model, node->output_names[oi]);
             if (out) {
-                out->ndim = 2;
-                out->shape[0] = out_shape[0];
-                out->shape[1] = out_shape[1];
+                out->ndim = ndim_out;
+                for (int d = 0; d < ndim_out; d++) out->shape[d] = out_shape[d];
             }
         }
         return 0;
