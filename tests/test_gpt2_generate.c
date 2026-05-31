@@ -91,6 +91,13 @@ static int test_gpt2_prefill(void) {
     int ret = inference_session_run(sess, inputs, outputs, 0 /* CPU */);
     CHECK(ret == 0, "inference_session_run failed");
 
+    /* Check output tensor */
+    fprintf(stderr, "t_out: ndim=%d numel=%lld shape=[%lld,%lld,%lld]\n",
+            t_out->ndim, (long long)t_out->numel,
+            t_out->ndim > 0 ? (long long)t_out->shape[0] : -1,
+            t_out->ndim > 1 ? (long long)t_out->shape[1] : -1,
+            t_out->ndim > 2 ? (long long)t_out->shape[2] : -1);
+
     /* Check logits */
     float* logits = (float*)t_out->data;
     int64_t vocab_size = 256;
