@@ -23,6 +23,7 @@
 #include "reduce_int.h"
 #include "cast_int.h"
 #include "argmax_int.h"
+#include "where_int.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -568,6 +569,31 @@ static int infer_output_shape(onnx_node_info_t* node, onnx_parsed_model_t* model
             if (out) {
                 out->ndim = in0->ndim;
                 for (int d = 0; d < in0->ndim; d++) out->shape[d] = in0->shape[d];
+            }
+        }
+        return 0;
+    }
+
+    /* Where: output = broadcast shape of condition, X, Y */
+    if (ot == OP_WHERE) {
+        int64_t out_shape[8] = {0};
+        int out_ndim = 0;
+        for (int ii = 0; ii < node->num_inputs && ii < 3; ii++) {
+            onnx_tensor_info_t* inp = find_tensor(model, node->input_names[ii]);
+            if (!inp) continue;
+            if (inp->ndim > out_ndim) out_ndim = inp->ndim;
+            for (int d = 0; d < inp->ndim; d++) {
+                int od = out_ndim - inp->ndim + d;  /* right-align */
+                if (od >= 0 && inp->shape[d] > out_shape[od])
+                    out_shape[od] = inp->shape[d];
+            }
+        }
+        for (int oi = 0; oi < node->num_outputs; oi++) {
+            onnx_tensor_info_t* out = find_tensor(model, node->output_names[oi]);
+            if (!out) out = add_tensor(model, node->output_names[oi]);
+            if (out) {
+                out->ndim = out_ndim;
+                for (int d = 0; d < out_ndim; d++) out->shape[d] = out_shape[d];
             }
         }
         return 0;
@@ -1226,9 +1252,11 @@ static inference_graph_t* build_graph_from_onnx(onnx_parsed_model_t* pm) {
             /* For non-commutative ops (Sub, Div, Gather), an initializer at
                position 0 must keep its position in op_inputs rather than being
                pushed to the end. Gather(data, indices) needs data at inputs[0]. */
+            /* Where: all inputs are data (condition + X + Y), not weights */
             int as_weight = (t && t->is_initializer && t->raw_data
                              && !((ot == OP_SUB || ot == OP_DIV
-                                   || ot == OP_GATHER) && ii == 0));
+                                   || ot == OP_GATHER) && ii == 0)
+                             && ot != OP_WHERE);
 
             if (as_weight) {
                 tensor_t* wt = tensor_create(DATA_TYPE_F32, t->ndim, t->shape);
@@ -1415,6 +1443,20 @@ static inference_graph_t* build_graph_from_onnx(onnx_parsed_model_t* pm) {
             if (in_a) { mp.numel = 1; for (int d = 0; d < in_a->ndim; d++) mp.numel *= in_a->shape[d]; }
             if (in_b) { mp.B_numel = 1; for (int d = 0; d < in_b->ndim; d++) mp.B_numel *= in_b->shape[d]; }
             params = &mp; params_size = sizeof(mp);
+        } else if (ot == OP_WHERE) {
+            where_params_t wp;
+            memset(&wp, 0, sizeof(wp));
+            /* Output numel from output tensor (set by shape inference) */
+            onnx_tensor_info_t* out_w = find_tensor(pm, node->output_names[0]);
+            if (out_w) { wp.numel = 1; for (int d = 0; d < out_w->ndim; d++) wp.numel *= out_w->shape[d]; }
+            /* Per-input numel for broadcast */
+            onnx_tensor_info_t* in_cond = find_tensor(pm, node->input_names[0]);
+            onnx_tensor_info_t* in_x = find_tensor(pm, node->input_names[1]);
+            onnx_tensor_info_t* in_y = find_tensor(pm, node->input_names[2]);
+            if (in_cond) { wp.cond_numel = 1; for (int d = 0; d < in_cond->ndim; d++) wp.cond_numel *= in_cond->shape[d]; }
+            if (in_x) { wp.x_numel = 1; for (int d = 0; d < in_x->ndim; d++) wp.x_numel *= in_x->shape[d]; }
+            if (in_y) { wp.y_numel = 1; for (int d = 0; d < in_y->ndim; d++) wp.y_numel *= in_y->shape[d]; }
+            params = &wp; params_size = sizeof(wp);
         } else if (ot == OP_CONCAT) {
             concat_params_t cp;
             memset(&cp, 0, sizeof(cp));

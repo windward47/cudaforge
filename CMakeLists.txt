@@ -704,6 +704,22 @@ if(ENABLE_TESTS)
     # test_gpt2_generate: build only, not in test suite (LLM model loading WIP)
     # add_test(NAME test_gpt2_generate COMMAND test_gpt2_generate)
 
+    add_executable(test_gather_minimal
+        tests/test_gather_minimal.c
+    )
+    target_include_directories(test_gather_minimal PRIVATE
+        src/application/engine
+        src/application/include
+        src/operator/include
+        src/operator/blas
+        src/operator/nn
+        src/platform/include
+    )
+    target_link_libraries(test_gather_minimal PRIVATE onnx_model application operator platform)
+    if(CMAKE_C_COMPILER_ID STREQUAL "MSVC")
+        target_compile_options(test_gather_minimal PRIVATE /wd4189 /wd4456 /wd4101)
+    endif()
+
     add_executable(bench_bert_mha
         tests/bench_bert_mha.c
     )

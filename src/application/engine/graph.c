@@ -746,6 +746,10 @@ int graph_execute(inference_graph_t* g, tensor_t* inputs[],
         char name_buf[64];
         const char* base = op_name(n->type);
         if (!base) { fprintf(stderr, "ERROR: unknown op type %d at node %d\n", (int)n->type, node_id); ret = -1; goto cleanup; }
+#ifdef GRAPH_DEBUG
+        fprintf(stderr, "[exec %d] type=%d name='%s' n_in=%d n_out=%d\n",
+                node_id, (int)n->type, base, n->num_inputs, n->num_outputs);
+#endif
 
         /* Check output tensor dtype for FP16 dispatch */
         int output_is_f16 = 0;
@@ -793,8 +797,14 @@ int graph_execute(inference_graph_t* g, tensor_t* inputs[],
             }
         }
         if (!op) {
+#ifdef GRAPH_DEBUG
+            fprintf(stderr, "  -> operator NOT FOUND for '%s'\n", name_buf);
+#endif
             ret = -2; goto cleanup;
         }
+#ifdef GRAPH_DEBUG
+        fprintf(stderr, "  -> operator found: '%s' (data_type='%s')\n", op->name, op->data_type);
+#endif
 
         /* Input slots needed: tensor inputs + weights + extra metadata slots */
         int total_inputs = n->num_inputs + n->num_weights;
