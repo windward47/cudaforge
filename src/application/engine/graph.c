@@ -960,7 +960,7 @@ int graph_execute(inference_graph_t* g, tensor_t* inputs[],
             int tid = n->input_tensors[0];
             if (tid >= 0 && tid < g->num_tensors && i < g->num_outputs) {
                 tensor_t* src = g->tensors[tid].tensor;
-                if (outputs[i]->data != src->data) {
+                if (src && outputs[i]->data != src->data) {
                     const data_type_info_t* info = data_type_get_info(src->dtype);
                     size_t bytes = (size_t)src->numel * info->size;
                     memcpy(outputs[i]->data, src->data, bytes);
