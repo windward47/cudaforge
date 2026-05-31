@@ -77,7 +77,7 @@
 
 ---
 
-## F2: LLM 推理（进行中）
+## F2: LLM 推理基础设施（已完成）
 
 | 项 | 状态 | 说明 |
 | --- | --- | --- |
@@ -89,7 +89,7 @@
 | Transpose/Concat 推断 | ✅ | 新增 shape inference |
 | 自回归生成 API | ✅ | generate.h / generate.c |
 | GPT-2 测试模型 | ✅ | gen_gpt2_full.py (hidden=64, 2层) |
-| GPT-2 端到端推理 | ⏳ | Where/Tanh op 已支持，Gather 已验证，ONNX proto3 field 13 加载问题待修 |
+| GPT-2 端到端推理 | ⏳ | 所有 op 已支持，权重正确加载，图执行 LayerNorm 返回-1待调试 |
 | KV-cache decode | ✅ | graph_update_cache_len + 持久 KV-cache tensor + mha_decode kernel |
 
 ## 远期规划
@@ -109,9 +109,9 @@
 
 | 状态 | 数量 | 内容 |
 | --- | --- | --- |
-| 已完成 | 19 | Phase A/B/C, M1-M3, O1-O2, F1, F2, C1-C2, H1-H7, M1-M5, L1/L4/L5 |
+| 已完成 | 20 | Phase A/B/C, M1-M3, O1-O2, F1, F2 (KV-cache+GQA+RoPE+永久融合), C1-C2, H1-H7, M1-M5, L1/L4/L5, T1 |
 | 暂缓 | 2 | L2 (惰性 D2H), L3 (层耦合) |
-| 已修复 | 1 | T1 (test_conv 编译 + 测试 bug) |
+| 进行中 | 1 | GPT-2 端到端推理 (权重加载正确，图执行调试中) |
 | 远期 | 6 | INT8/动态形状/SIMD/ARM/TensorRT/多GPU |
 
-> **最后更新**: 2026-05-30。v0.5.0。36 种算子，**34/34 测试全部通过**，BERT-base FP16 4.66ms (8.96× vs CPU)。T1 修复（test_conv 编译 + 测试 bug）。
+> **最后更新**: 2026-05-31。v0.5.0。36 种算子，32/32 测试通过，BERT-base FP16 4.66ms (8.96× vs CPU)。F2 LLM 推理基础设施完成 (CausalMask + mha_decode + KV-cache + GQA + RoPE + graph_update_cache_len)。
