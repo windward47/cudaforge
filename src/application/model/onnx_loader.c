@@ -1322,20 +1322,29 @@ static inference_graph_t* build_graph_from_onnx(onnx_parsed_model_t* pm) {
                 if (t && t->tensor_id < 0) {
                     tensor_t* tt = tensor_create(DATA_TYPE_F32, t->ndim, t->shape);
                     if (tt) {
-                        /* Copy initializer data into graph tensor */
-                        if (t->is_initializer && t->raw_data) {
-                            if (t->dtype_onnx == 9) {
-                                /* BOOL: 1 byte per element */
-                                int64_t num = (int64_t)t->raw_data_size;
-                                if (num > tt->numel) num = tt->numel;
-                                uint8_t* src = (uint8_t*)t->raw_data;
-                                float* dst = (float*)tt->data;
-                                for (int64_t j = 0; j < num; j++) dst[j] = (src[j] != 0) ? 1.0f : 0.0f;
-                            } else if (t->raw_data_size <= (size_t)tt->numel * sizeof(float)) {
-                                memcpy(tt->data, t->raw_data, t->raw_data_size);
-                            }
-                        }
                         t->tensor_id = graph_add_tensor(g, tt);
+                    }
+                }
+                /* Copy initializer data into graph tensor (even if already exists) */
+                if (t && t->tensor_id >= 0 && t->is_initializer && t->raw_data) {
+                    tensor_t* tt = g->tensors[t->tensor_id].tensor;
+                    if (tt && tt->data) {
+                        if (t->dtype_onnx == 9) {
+                            /* BOOL: 1 byte per element, convert to float */
+                            int64_t num = (int64_t)t->raw_data_size;
+                            if (num > tt->numel) num = tt->numel;
+                            uint8_t* src = (uint8_t*)t->raw_data;
+                            float* dst = (float*)tt->data;
+                            for (int64_t j = 0; j < num; j++) dst[j] = (src[j] != 0) ? 1.0f : 0.0f;
+                        } else if (t->dtype_onnx == 7 && t->raw_data_size == (size_t)tt->numel * sizeof(int64_t)) {
+                            /* INT64: convert to float */
+                            int64_t num = tt->numel;
+                            int64_t* src = (int64_t*)t->raw_data;
+                            float* dst = (float*)tt->data;
+                            for (int64_t j = 0; j < num; j++) dst[j] = (float)src[j];
+                        } else if (t->raw_data_size <= (size_t)tt->numel * sizeof(float)) {
+                            memcpy(tt->data, t->raw_data, t->raw_data_size);
+                        }
                     }
                 }
                 in_tids[num_data_in] = (t && t->tensor_id >= 0) ? t->tensor_id : -1;
