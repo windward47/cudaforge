@@ -64,22 +64,20 @@ static int test_gpt2_prefill(void) {
     CHECK(n_in >= 1 && n_out >= 1, "Model has no inputs/outputs");
 
     /* Get input/output tensors from graph */
-    /* Input must be float — the Gather kernel reads float indices */
+    /* Input must be int64 to match ONNX model's dtype=7 (INT64) */
     int64_t input_shape[] = {1, 8};
     int64_t logits_shape[] = {1, 8, 256};
-    tensor_t* t_in = tensor_create(DATA_TYPE_F32, 2, input_shape);
+    tensor_t* t_in = tensor_create(DATA_TYPE_I64, 2, input_shape);
     tensor_t* t_out = tensor_create(DATA_TYPE_F32, 3, logits_shape);
 
-    /* Load test input (stored as int64, convert to float for Gather) */
+    /* Load test input (stored as int64, pass as int64 to match model's dtype) */
     int64_t input_ids[8];
     if (load_binary("tests/gpt2_full_input.bin", input_ids, 8 * sizeof(int64_t)) != 0) {
         fprintf(stderr, "SKIP: gpt2_full_input.bin not found\n");
         tensor_destroy(t_in); tensor_destroy(t_out);
         return 0;
     }
-    /* Convert int64 token IDs to float */
-    float* in_f32 = (float*)t_in->data;
-    for (int i = 0; i < 8; i++) in_f32[i] = (float)input_ids[i];
+    memcpy(t_in->data, input_ids, 8 * sizeof(int64_t));
 
     fprintf(stderr, "Input tokens: ");
     for (int i = 0; i < 8; i++) fprintf(stderr, "%lld ", (long long)input_ids[i]);
