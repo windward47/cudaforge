@@ -89,7 +89,7 @@
 | Transpose/Concat 推断 | ✅ | 新增 shape inference |
 | 自回归生成 API | ✅ | generate.h / generate.c |
 | GPT-2 测试模型 | ✅ | gen_gpt2_full.py (hidden=64, 2层) |
-| GPT-2 端到端推理 | ⏳ | 权重加载修复，输出 tensor 形状正确 (1,8,256)，计算链路全零待调试 |
+| GPT-2 端到端推理 | ⏳ | 权重加载修复，输出形状正确，计算链路全零 — 需 ONNX loader 节点连接调试 |
 | KV-cache decode | ✅ | graph_update_cache_len + 持久 KV-cache tensor + mha_decode kernel |
 
 ## 远期规划
