@@ -1755,6 +1755,8 @@ static inference_graph_t* build_graph_from_onnx(onnx_parsed_model_t* pm) {
             if (in_g) { for (int d = 0; d < axis; d++) gp.outer_size *= in_g->shape[d]; }
             gp.inner_size = 1;
             if (in_g) { for (int d = (int)axis; d < in_g->ndim; d++) gp.inner_size *= in_g->shape[d]; }
+            /* Flag: indices are int64 (not float). Reuse out_axis_dim field. */
+            gp.out_axis_dim = (idx_g && idx_g->dtype_onnx == ONNX_DTYPE_INT64) ? 1 : 0;
             params = &gp; params_size = sizeof(gp);
         } else if (ot == OP_SQUEEZE_UNSQUEEZE) {
             squeeze_unsqueeze_params_t sup;
