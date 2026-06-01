@@ -23,8 +23,8 @@ CudaForge is a **from-scratch CUDA inference engine** written in C. It loads sta
 | Aspect | CudaForge | Typical inference stack |
 | --- | --- | --- |
 | Dependencies | **Zero** (self-contained protobuf parser) | cuDNN + TensorRT + protobuf + ... |
-| Binary size | ~500 KB | 100+ MB |
-| Build time | ~10 seconds | Several minutes |
+| Binary size | ~1.3 MB (exe) / ~2.1 MB (lib) | 100+ MB |
+| Build time | ~1 min (CUDA compile) | Several minutes |
 | Hackability | Plain C — read it all in an afternoon | Millions of lines of framework code |
 
 CudaForge is built for **learning, prototyping, and embedded deployment** — not for beating TensorRT on benchmarks. Every CUDA kernel is written by hand and paired with a CPU fallback, so you can trace exactly how data moves from ONNX weights → GPU kernels → inference results.
@@ -87,7 +87,7 @@ compute-sanitizer ./build/Release/test_onnx.exe
 Expected output:
 
 ```text
-CudaForge v0.5.0
+CudaForge v0.6.0
 Platform: x86_64 (8 cores, 64 B cache line)
 CUDA: enabled (1 device(s))
 ```
@@ -263,7 +263,7 @@ CudaForge includes a **hand-written protobuf wire-format parser** (~200 lines of
 CudaForge is for learning how inference engines work under the hood. Reading its entire codebase takes an afternoon. It's also useful for embedded scenarios where you can't afford 100+ MB of dependencies.
 
 **Q: Can I run ResNet / YOLO / BERT?**
-Five tiers verified: (1) MNIST CNN (Conv×2 + ReLU + MaxPool + Reshape + Gemm + Softmax); (2) **ResNet-18** (1×3×224×224 → 1×1000, 50 nodes, CUDA vs PyTorch max_diff = 5.25e-06, Top-1 matches); (3) **YOLOv8n** (1×3×640×640 → 1×84×8400, 234 nodes, CPU/CUDA max_diff < 1e-3, compute-sanitizer 0 errors); (4) **BERT-like Phase A** (Embedding + LayerNorm + FFN + SiLU, CPU/CUDA vs ONNX Runtime max_diff = 5.96e-07); (5) **BERT-base Phase B** (Embedding + LayerNorm + FFN + Exp + ReduceSum/Max + ArgMax + Cast + Softmax + Concat, CPU max_diff=2.24e-08, CUDA max_diff=7.45e-09, compute-sanitizer 0 errors). 36 operators covered (including MHA_Fused fusion, MHA_Decode, CausalMask, RoPE, Pad, Clip), 32 tests all passing.
+Six tiers verified: (1) **MNIST CNN** (Conv×2 + ReLU + MaxPool + Reshape + Gemm + Softmax); (2) **ResNet-18** (1×3×224×224 → 1×1000, CUDA vs PyTorch max_diff = 5.25e-06); (3) **YOLOv8n** (1×3×640×640 → 1×84×8400, 234 nodes, compute-sanitizer 0 errors); (4) **BERT-base** (Embedding + LayerNorm + FFN + MHA fusion + Softmax + ArgMax, CPU max_diff=2.24e-08, CUDA FP16 WMMA 4.66 ms/iter, compute-sanitizer 0 errors); (5) **GPT-2 end-to-end** (vocab=256, hidden=64, heads=4, layers=2, prefill + autoregressive generation, logits max_diff=4.77e-07 vs ONNX Runtime); (6) **Gather int64 + batched MatMul** for full LLM inference pipeline. 36 operators covered, 35 tests all passing.
 
 **Q: Does it support FP16 or INT8?**
 Supports FP32 and FP16 inference. FP16 via WMMA Tensor Cores, MHA fused kernel 5.57× speedup. INT8 quantization planned for future.

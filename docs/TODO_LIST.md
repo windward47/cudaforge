@@ -6,16 +6,17 @@
 
 ## 当前状态
 
-**v0.5.0** — 36 种算子 CPU+CUDA 双实现（含 15 个 FP16 kernel），33/34 测试通过，compute-sanitizer 零错误。
+**v0.6.0** — 36 种算子 CPU+CUDA 双实现（含 15 个 FP16 kernel），35/35 测试通过，compute-sanitizer 零错误。
 
 | 指标 | 数值 |
 | --- | --- |
 | 算子总数 | 36 |
 | FP16 kernel | 15 |
-| 测试通过 | 33/34 (test_conv 编译问题) |
+| 测试通过 | 35/35 |
 | compute-sanitizer | 0 errors |
 | BERT-base CUDA FP32 | 26.01 ms/iter |
 | BERT-base CUDA FP16 WMMA | **4.66 ms/iter (8.96× vs CPU)** |
+| GPT-2 logits max_diff | **4.77e-07** (vs ONNX Runtime) |
 
 **已完成里程碑**:
 
@@ -114,4 +115,4 @@
 | 进行中 | 0 | — |
 | 远期 | 6 | INT8/动态形状/SIMD/ARM/TensorRT/多GPU |
 
-> **最后更新**: 2026-06-02。v0.5.1。36 种算子，34/34 测试通过，BERT-base FP16 4.66ms (8.96× vs CPU)。F2 LLM 推理: GPT-2 端到端推理完成 (5 bug 修复，max_diff=4.77e-07，batched MatMul)。
+> **最后更新**: 2026-06-02。v0.6.0。36 种算子，35/35 测试通过，BERT-base FP16 4.66ms (8.96× vs CPU)。F2 LLM 推理: GPT-2 端到端推理完成 (5 bug 修复，max_diff=4.77e-07，batched MatMul)。

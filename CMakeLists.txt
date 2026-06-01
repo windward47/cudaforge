@@ -603,6 +603,26 @@ if(ENABLE_TESTS)
     set_tests_properties(test_bert PROPERTIES
         WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
 
+    add_executable(test_gpt2_generate
+        tests/test_gpt2_generate.c
+    )
+    target_include_directories(test_gpt2_generate PRIVATE
+        src/application/model
+        src/application/engine
+        src/application/include
+        src/operator/include
+        src/operator/blas
+        src/operator/nn
+        src/platform/include
+    )
+    target_link_libraries(test_gpt2_generate PRIVATE onnx_model application operator platform)
+    if(CMAKE_C_COMPILER_ID STREQUAL "MSVC")
+        target_compile_options(test_gpt2_generate PRIVATE /wd4189 /wd4456 /wd4101)
+    endif()
+    add_test(NAME test_gpt2_generate COMMAND test_gpt2_generate)
+    set_tests_properties(test_gpt2_generate PROPERTIES
+        WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+
     add_executable(test_bert_mha
         tests/test_bert_mha.c
     )
@@ -684,25 +704,6 @@ if(ENABLE_TESTS)
     add_test(NAME test_fp16_ops COMMAND test_fp16_ops)
     set_tests_properties(test_fp16_ops PROPERTIES
         WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
-
-    add_executable(test_gpt2_generate
-        tests/test_gpt2_generate.c
-    )
-    target_include_directories(test_gpt2_generate PRIVATE
-        src/application/model
-        src/application/engine
-        src/application/include
-        src/operator/include
-        src/operator/blas
-        src/operator/nn
-        src/platform/include
-    )
-    target_link_libraries(test_gpt2_generate PRIVATE onnx_model application operator platform)
-    if(CMAKE_C_COMPILER_ID STREQUAL "MSVC")
-        target_compile_options(test_gpt2_generate PRIVATE /wd4189 /wd4456 /wd4101)
-    endif()
-    # test_gpt2_generate: build only, not in test suite (LLM model loading WIP)
-    # add_test(NAME test_gpt2_generate COMMAND test_gpt2_generate)
 
     add_executable(test_gather_minimal
         tests/test_gather_minimal.c
