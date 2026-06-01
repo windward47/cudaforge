@@ -1424,16 +1424,38 @@ static inference_graph_t* build_graph_from_onnx(onnx_parsed_model_t* pm) {
             memset(&mp, 0, sizeof(mp));
             onnx_tensor_info_t* in_t = find_tensor(pm, node->input_names[0]);
             onnx_tensor_info_t* w_t  = find_tensor(pm, node->input_names[1]);
-            if (in_t && in_t->ndim >= 2) {
-                /* Flatten batch dims: M = product of all dims except last, K = last dim */
-                mp.M = 1;
-                for (int d = 0; d < in_t->ndim - 1; d++) mp.M *= in_t->shape[d];
-                mp.K = in_t->shape[in_t->ndim - 1];
-            }
             int64_t transB = node_attr_int(node, "transB", 0);
-            if (w_t && w_t->ndim >= 2) {
-                mp.N = transB ? w_t->shape[0] : w_t->shape[1];
+
+            if (in_t && in_t->ndim >= 2 && w_t && w_t->ndim >= 2) {
+                int a_ndim = in_t->ndim;
+                int b_ndim = w_t->ndim;
+                int max_ndim = a_ndim > b_ndim ? a_ndim : b_ndim;
+
+                /* M, K, N from the last 2 dims */
+                mp.M = in_t->shape[a_ndim - 2];
+                mp.K = in_t->shape[a_ndim - 1];
+                mp.N = transB ? w_t->shape[b_ndim - 2] : w_t->shape[b_ndim - 1];
+
+                /* Batch dims: product of dims [0..ndim-2) */
+                mp.batch_size = 1;
+                for (int d = 0; d < max_ndim - 2; d++) {
+                    int64_t a_dim = (d < a_ndim - 2) ? in_t->shape[d] : 1;
+                    int64_t b_dim = (d < b_ndim - 2) ? w_t->shape[d] : 1;
+                    int64_t bd = (a_dim > b_dim) ? a_dim : b_dim;
+                    mp.batch_size *= bd;
+                }
+                if (mp.batch_size < 1) mp.batch_size = 1;
+
+                /* Strides: elements between batch slices */
+                mp.stride_a = mp.M * mp.K;
+                mp.stride_b = mp.K * mp.N;
+                mp.stride_c = mp.M * mp.N;
+
+                /* For 2D inputs, strides are unused (batch_size=1) */
+                if (a_ndim == 2) mp.stride_a = 0;
+                if (b_ndim == 2) mp.stride_b = 0;
             }
+
             mp.transpose_a = node_attr_int(node, "transA", 0) != 0;
             mp.transpose_b = transB != 0;
             params = &mp; params_size = sizeof(mp);
