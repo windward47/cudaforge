@@ -59,13 +59,17 @@ static void test_bert_cpu(void) {
            (size_t)inference_session_num_inputs(sess),
            (size_t)inference_session_num_outputs(sess));
 
-    /* 2. Load input token IDs (1x8, stored as F32) */
+    /* 2. Load input token IDs (1x8, stored as F32, convert to I64) */
     int64_t input_shape[] = {1, 8};
-    tensor_t* input = tensor_create(DATA_TYPE_F32, 2, input_shape);
+    tensor_t* input = tensor_create(DATA_TYPE_I64, 2, input_shape);
     if (!input) { fprintf(stderr, "FAIL: tensor_create input\n"); goto cleanup_sess; }
-    if (load_binary("tests/bert_input.bin", input->data,
-                    1 * 8 * sizeof(float)) != 0) {
-        fprintf(stderr, "FAIL: load input binary\n"); goto cleanup_input;
+    {
+        float tmp[8];
+        if (load_binary("tests/bert_input.bin", tmp, 8 * sizeof(float)) != 0) {
+            fprintf(stderr, "FAIL: load input binary\n"); goto cleanup_input;
+        }
+        int64_t* ids = (int64_t*)input->data;
+        for (int i = 0; i < 8; i++) ids[i] = (int64_t)tmp[i];
     }
 
     /* 3. Create output tensor (1x8x256) */
@@ -135,13 +139,17 @@ static void test_bert_cuda(void) {
     inference_session_t* sess = inference_session_load("tests/bert_test.onnx");
     if (!sess) { fprintf(stderr, "FAIL: CUDA model load NULL\n"); return; }
 
-    /* 2. Load input */
+    /* 2. Load input (convert F32 → I64) */
     int64_t input_shape[] = {1, 8};
-    tensor_t* input = tensor_create(DATA_TYPE_F32, 2, input_shape);
+    tensor_t* input = tensor_create(DATA_TYPE_I64, 2, input_shape);
     if (!input) { fprintf(stderr, "FAIL: CUDA tensor_create input\n"); goto cu_cleanup_sess; }
-    if (load_binary("tests/bert_input.bin", input->data,
-                    1 * 8 * sizeof(float)) != 0) {
-        fprintf(stderr, "FAIL: CUDA load input\n"); goto cu_cleanup_input;
+    {
+        float tmp[8];
+        if (load_binary("tests/bert_input.bin", tmp, 8 * sizeof(float)) != 0) {
+            fprintf(stderr, "FAIL: CUDA load input\n"); goto cu_cleanup_input;
+        }
+        int64_t* ids = (int64_t*)input->data;
+        for (int i = 0; i < 8; i++) ids[i] = (int64_t)tmp[i];
     }
 
     /* 3. Create output */
@@ -208,11 +216,15 @@ static void test_bert_base_cpu(void) {
            (size_t)inference_session_num_outputs(sess));
 
     int64_t input_shape[] = {1, 8};
-    tensor_t* input = tensor_create(DATA_TYPE_F32, 2, input_shape);
+    tensor_t* input = tensor_create(DATA_TYPE_I64, 2, input_shape);
     if (!input) { fprintf(stderr, "FAIL: tensor_create input\n"); goto base_cpu_cleanup_sess; }
-    if (load_binary("tests/bert_base_input.bin", input->data,
-                    1 * 8 * sizeof(float)) != 0) {
-        fprintf(stderr, "FAIL: load input binary\n"); goto base_cpu_cleanup_input;
+    {
+        float tmp[8];
+        if (load_binary("tests/bert_base_input.bin", tmp, 8 * sizeof(float)) != 0) {
+            fprintf(stderr, "FAIL: load input binary\n"); goto base_cpu_cleanup_input;
+        }
+        int64_t* ids = (int64_t*)input->data;
+        for (int i = 0; i < 8; i++) ids[i] = (int64_t)tmp[i];
     }
 
     int64_t output_shape[] = {1, 257};
@@ -281,11 +293,15 @@ static void test_bert_base_cuda(void) {
     if (!sess) { fprintf(stderr, "FAIL: CUDA model load NULL\n"); return; }
 
     int64_t input_shape[] = {1, 8};
-    tensor_t* input = tensor_create(DATA_TYPE_F32, 2, input_shape);
+    tensor_t* input = tensor_create(DATA_TYPE_I64, 2, input_shape);
     if (!input) { fprintf(stderr, "FAIL: CUDA tensor_create input\n"); goto base_cu_cleanup_sess; }
-    if (load_binary("tests/bert_base_input.bin", input->data,
-                    1 * 8 * sizeof(float)) != 0) {
-        fprintf(stderr, "FAIL: CUDA load input\n"); goto base_cu_cleanup_input;
+    {
+        float tmp[8];
+        if (load_binary("tests/bert_base_input.bin", tmp, 8 * sizeof(float)) != 0) {
+            fprintf(stderr, "FAIL: CUDA load input\n"); goto base_cu_cleanup_input;
+        }
+        int64_t* ids = (int64_t*)input->data;
+        for (int i = 0; i < 8; i++) ids[i] = (int64_t)tmp[i];
     }
 
     int64_t output_shape[] = {1, 257};

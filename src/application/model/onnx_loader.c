@@ -476,7 +476,7 @@ static int parse_node_proto(pb_message_t* msg, onnx_node_info_t* info) {
  * Parse ValueInfoProto → extract name and shape
  * ============================================================ */
 static int parse_value_info_shape(pb_message_t* msg, char* name_buf, int name_sz,
-                                   int64_t* shape, int* ndim) {
+                                   int64_t* shape, int* ndim, int* out_dtype) {
     /* name (field 1) */
     size_t nlen = 0;
     const uint8_t* nm = pb_field_get_string(msg, F_ValueInfoProto_name, &nlen);
@@ -499,6 +499,11 @@ static int parse_value_info_shape(pb_message_t* msg, char* name_buf, int name_sz
     pb_message_t* tensor_msg = pb_field_as_message(tt, 2);
     pb_message_destroy(tmsg);
     if (!tensor_msg) return 0;
+
+    /* Extract elem_type (field 1 of TypeProto.Tensor) */
+    if (out_dtype) {
+        *out_dtype = (int)pb_field_get_int64(tensor_msg, 1, 0);
+    }
 
     /* TypeProto.Tensor.shape is field 2 → TensorShapeProto */
     pb_field_t* shape_field = pb_find_field(tensor_msg, 2);
@@ -1209,7 +1214,13 @@ static inference_graph_t* build_graph_from_onnx(onnx_parsed_model_t* pm) {
         onnx_tensor_info_t* t = find_tensor(pm, pm->graph_input_names[i]);
         if (!t) t = add_tensor(pm, pm->graph_input_names[i]);
 
-        tensor_t* tt = tensor_create(DATA_TYPE_F32, t->ndim, t->shape);
+        /* Map ONNX dtype to internal dtype */
+        data_type_t input_dtype = DATA_TYPE_F32;
+        if (t->dtype_onnx == 7) input_dtype = DATA_TYPE_I64;  /* INT64 */
+        else if (t->dtype_onnx == 6) input_dtype = DATA_TYPE_I32;  /* INT32 */
+        else if (t->dtype_onnx == 10) input_dtype = DATA_TYPE_F16;  /* FLOAT16 */
+
+        tensor_t* tt = tensor_create(input_dtype, t->ndim, t->shape);
         int tid = graph_add_tensor(g, tt);
         t->tensor_id = tid;
 
@@ -1414,7 +1425,10 @@ static inference_graph_t* build_graph_from_onnx(onnx_parsed_model_t* pm) {
             onnx_tensor_info_t* in_t = find_tensor(pm, node->input_names[0]);
             onnx_tensor_info_t* w_t  = find_tensor(pm, node->input_names[1]);
             if (in_t && in_t->ndim >= 2) {
-                mp.M = in_t->shape[0]; mp.K = in_t->shape[1];
+                /* Flatten batch dims: M = product of all dims except last, K = last dim */
+                mp.M = 1;
+                for (int d = 0; d < in_t->ndim - 1; d++) mp.M *= in_t->shape[d];
+                mp.K = in_t->shape[in_t->ndim - 1];
             }
             int64_t transB = node_attr_int(node, "transB", 0);
             if (w_t && w_t->ndim >= 2) {
@@ -1979,7 +1993,8 @@ onnx_model_t* onnx_load_from_file(const char* path) {
             char nm[MAX_TENSOR_NAME];
             int64_t sh[8] = {0};
             int nd = 0;
-            if (parse_value_info_shape(vim, nm, sizeof(nm), sh, &nd) == 0) {
+            int dt = 0;
+            if (parse_value_info_shape(vim, nm, sizeof(nm), sh, &nd, &dt) == 0) {
                 strncpy(pm->graph_input_names[pm->num_graph_inputs], nm,
                         MAX_TENSOR_NAME - 1);
                 pm->num_graph_inputs++;
@@ -1988,6 +2003,7 @@ onnx_model_t* onnx_load_from_file(const char* path) {
                 if (ti) {
                     ti->ndim = nd;
                     for (int d = 0; d < nd; d++) ti->shape[d] = sh[d];
+                    if (dt > 0 && ti->dtype_onnx == 0) ti->dtype_onnx = dt;
                 }
             }
             pb_message_destroy(vim);
@@ -2006,7 +2022,7 @@ onnx_model_t* onnx_load_from_file(const char* path) {
             char nm[MAX_TENSOR_NAME];
             int64_t sh[8] = {0};
             int nd = 0;
-            if (parse_value_info_shape(vim, nm, sizeof(nm), sh, &nd) == 0) {
+            if (parse_value_info_shape(vim, nm, sizeof(nm), sh, &nd, NULL) == 0) {
                 strncpy(pm->graph_output_names[pm->num_graph_outputs], nm,
                         MAX_TENSOR_NAME - 1);
                 pm->num_graph_outputs++;
@@ -2033,7 +2049,7 @@ onnx_model_t* onnx_load_from_file(const char* path) {
             char nm[MAX_TENSOR_NAME];
             int64_t sh[8] = {0};
             int nd = 0;
-            if (parse_value_info_shape(vim, nm, sizeof(nm), sh, &nd) == 0) {
+            if (parse_value_info_shape(vim, nm, sizeof(nm), sh, &nd, NULL) == 0) {
                 onnx_tensor_info_t* ti = find_tensor(pm, nm);
                 if (!ti) ti = add_tensor(pm, nm);
                 if (ti) {

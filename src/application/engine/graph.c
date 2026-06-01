@@ -811,7 +811,7 @@ int graph_execute(inference_graph_t* g, tensor_t* inputs[],
         int total_inputs = n->num_inputs + n->num_weights;
         int max_input_idx = total_inputs > 0 ? total_inputs - 1 : 0;
         if (n->type == OP_RELU || n->type == OP_SIGMOID || n->type == OP_GELU
-            || n->type == OP_SILU || n->type == OP_EXP)
+            || n->type == OP_SILU || n->type == OP_EXP || n->type == OP_TANH)
             if (max_input_idx < 1) max_input_idx = 1;
         if (n->type == OP_CONV2D || n->type == OP_MATMUL)
             if (max_input_idx < 2) max_input_idx = 2;  /* reserve for optional bias */
@@ -875,9 +875,9 @@ int graph_execute(inference_graph_t* g, tensor_t* inputs[],
         }
 
         /* Handle ops that need extra metadata via inputs[] slot */
-        /* relu/sigmoid/gelu: need numel as inputs[1] */
+        /* relu/sigmoid/gelu/tanh: need numel as inputs[1] */
         if (n->type == OP_RELU || n->type == OP_SIGMOID || n->type == OP_GELU
-            || n->type == OP_SILU || n->type == OP_EXP) {
+            || n->type == OP_SILU || n->type == OP_EXP || n->type == OP_TANH) {
             int tid = n->input_tensors[0];
             if (tid >= 0 && tid < g->num_tensors) {
                 op_inputs[1] = &g->tensors[tid].tensor->numel;

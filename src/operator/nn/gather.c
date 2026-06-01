@@ -17,7 +17,7 @@ int gather_f32(const void* inputs[], void* outputs[],
     int64_t ni = p->num_indices;
     int64_t bs = p->block_size;
     int64_t os = p->outer_size;
-    int indices_are_i64 = p->out_axis_dim;  /* reuse field as flag */
+    int indices_are_i64 = (int)p->out_axis_dim;  /* reuse field as flag */
 
     for (int64_t o = 0; o < os; o++) {
         for (int64_t i = 0; i < ni; i++) {
