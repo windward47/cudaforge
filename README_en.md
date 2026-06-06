@@ -77,11 +77,14 @@ cmake --build build -j$(nproc)
 # Smoke test — prints platform info
 ./build/Release/cudaforge.exe
 
-# Full test suite (32 test executables)
+# Full test suite (35 test executables)
 ctest --test-dir build -C Release -j$(nproc)
 
-# GPU memory safety check
-compute-sanitizer ./build/Release/test_onnx.exe
+# Batch benchmark (operator-level CUDA profiling)
+./scripts/run_benchmarks.sh --profile-only
+
+# Batch GPU memory check
+./scripts/run_sanitizer.sh
 ```
 
 Expected output:
@@ -213,7 +216,7 @@ Every operator follows the same pattern. Example for a hypothetical `Softmax`:
 1. **Create internal header** — `src/operator/nn/softmax_int.h` with `softmax_params_t`
 2. **Write CPU fallback** — `src/operator/nn/softmax.c` (pure C, always works)
 3. **Write CUDA kernel** — `src/operator/nn/softmax_cuda.cu` (GPU-accelerated)
-4. **Register the operator** — add to `operator_registry.c` and `operator.h` enum
+4. **Register the operator** — add `REGISTER_CPU`/`REGISTER_CUDA` entry to `operator_registry.def` (no need to modify `operator_init.c`)
 5. **Add shape inference** — update `infer_output_shape()` in `onnx_loader.c`
 6. **Add ONNX mapping** — map `"Softmax"` to the new op in `onnx_loader.c`
 7. **Write tests** — `src/operator/nn/test/test_softmax.c`
