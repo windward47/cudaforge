@@ -1,12 +1,12 @@
 # CudaForge Todo List
 
-> 基于 2026-05-30 v0.5.0 测试报告更新。旧版历史记录见 [TODO_LIST_20260530.md](TODO_LIST_20260530.md)。
+> 基于 [CUDA-Agent](https://github.com/BytedTsinghua-SIA/CUDA-Agent)（字节+清华，RL 训练 CUDA kernel）和 [CUDAForge](https://github.com/)（Zijian Zhang，多 Agent LLM 优化 CUDA kernel）两个项目分析整合。旧版历史记录见 [TODO_LIST_20260607.md](TODO_LIST_20260607b.md)。
 
 ---
 
 ## 当前状态
 
-**v0.6.0** — 36 种算子 CPU+CUDA 双实现（含 15 个 FP16 kernel），35/35 测试通过，compute-sanitizer 零错误。
+**v0.7.0** — 36 种算子 CPU+CUDA 双实现（含 15 个 FP16 kernel），35/35 测试通过，R1 架构优化全部完成。
 
 | 指标 | 数值 |
 | --- | --- |
@@ -18,80 +18,263 @@
 | BERT-base CUDA FP16 WMMA | **4.66 ms/iter (8.96× vs CPU)** |
 | GPT-2 logits max_diff | **4.77e-07** (vs ONNX Runtime) |
 
-**已完成里程碑**:
+---
+
+## R1: 架构优化
+
+> 综合 CUDA-Agent 的自注册/验证模式 + CUDAForge 的 NCU 硬件指标驱动优化。
+
+### R1-1: 算子自动注册 ⭐⭐⭐
+
+**来源**：CUDA-Agent `binding_registry.h` 静态自动注册模式。
+
+**目标**：消除 `operator_init.c` 中 76 个前向声明 + 76 个调用的重复代码，新增算子从改 3 个文件降为改 2 个文件。
+
+**当前问题**（`src/operator/operator_init.c`）：
+
+```c
+// 76 个前向声明 + 76 个调用，每新增一个算子都要手动添加
+int register_relu_f32(void);
+int register_matmul_f32(void);
+// ... 76 行
+int operator_init_all(void) {
+    ret += register_relu_f32();
+    // ... 76 行
+}
+```
+
+**方案**：引入 X-macro 模式，所有注册条目集中在 `operator_registry.def`：
+
+```c
+// src/operator/operator_registry.def
+// REGISTER_CPU(fn) / REGISTER_CUDA(fn)
+REGISTER_CPU(register_relu_f32)
+REGISTER_CPU(register_matmul_f32)
+// ...
+REGISTER_CUDA(register_relu_f32_cuda)
+// ...
+
+// src/operator/operator_init.c
+int operator_init_all(void) {
+    int ret = 0;
+    #define REGISTER_CPU(fn)  ret += fn();
+    #define REGISTER_CUDA(fn) ret += fn();
+    #include "operator_registry.def"
+    #undef REGISTER_CPU
+    #undef REGISTER_CUDA
+    return ret;
+}
+```
+
+| # | 任务 | 文件 | 说明 |
+| --- | --- | --- | --- |
+| R1-1a | 创建 `operator_registry.def` | `src/operator/operator_registry.def` | 从 `operator_init.c` 迁移所有 76 条注册 |
+| R1-1b | 改造 `operator_init.c` 使用 X-macro | `src/operator/operator_init.c` | `#include` + 展开宏，消除 152 行重复代码 |
+| R1-1c | 编写验证脚本 | `scripts/check_registry.sh` | 检查 `.def` 与实际 `.cu`/`.c` 文件是否一致 |
+| R1-1d | 更新文档 | `ARCHITECTURE.md`, `CODING_STYLE.md` | 说明新的注册方式 |
+
+> ✅ **R1-1 已完成** — `operator_init.c` 从 163 行减至 45 行（-72%），新增算子只需改 2 个文件。
+
+### R1-2: NCU 性能 Profile 基线 ⭐⭐⭐
+
+**来源**：CUDAForge `run_ncu.py` 收集 24 项 NCU 硬件指标，反馈给 LLM 诊断瓶颈。
+
+**目标**：为每个算子建立可量化的性能指标基线，回归测试时自动检测性能退化。
+
+**当前问题**：只有端到端 latency（BERT 4.66ms），无算子级 SM 占用率/带宽利用率/寄存器压力等指标。
+
+**方案**：建立算子级 profile 指标卡：
+
+```c
+// 算子性能 profile 结构
+typedef struct {
+    const char* op_name;
+    float latency_ms;            // CUDA event 计时
+    float sm_occupancy_pct;      // SM 占用率
+    float dram_throughput_pct;   // 显存带宽利用率
+    int   registers_per_thread;  // 寄存器压力
+    float l1_hit_rate_pct;       // L1 缓存命中率
+    float achieved_warps_pct;    // 实际 warp 占用率
+} op_profile_t;
+```
+
+| # | 任务 | 文件 | 说明 |
+| --- | --- | --- | --- |
+| R1-2a | 扩展 benchmark 框架 | `tests/bench_profile.cu` | 集成 NCU metrics 采集 |
+| R1-2b | 建立算子 profile 基线 | `docs/PROFILE_BASELINE.md` | 记录各算子在 RTX 2050 上的性能指标 |
+| R1-2c | CI 回归检测脚本 | `scripts/check_perf_regression.sh` | 对比当前 profile 与基线，偏差 >10% 告警 |
+
+> ✅ **R1-2 已完成** — 25 个测试点覆盖 7 类算子，CUDA event 精确计时，回归检测脚本可用。
+
+### R1-3: 运行时 Kernel 配置切换 ⭐⭐
+
+**来源**：CUDA-Agent `config` 参数模式，运行时切换 block size。
+
+**目标**：根据输入尺寸动态选择最优 block size，无需重新编译。
+
+**当前问题**：block size 硬编码（`OPS_THREADS_PER_BLOCK=256`），matmul 有基于维度的启发式但不可外部配置。
+
+**方案**：在 `operator_params_t` 中新增 `tuning_config` 字段：
+
+| # | 任务 | 文件 | 说明 |
+| --- | --- | --- | --- |
+| R1-3a | 扩展 `operator_params_t` | `src/operator/include/operator.h` | 新增 `tuning_config` 字段 |
+| R1-3b | 改造高频算子 launcher | `relu_cuda.cu`, `softmax_cuda.cu`, `matmul_cuda.cu` | 支持 config 切换 |
+| R1-3c | graph 调度器根据 tensor 尺寸选 config | `src/application/graph.c` | 输入 <1K 用 config=1, >1M 用 config=2 |
+
+> ✅ **R1-3 已完成** — relu/softmax 支持 128/256/512 三档 template，matmul 支持 4 种 kernel 显式选择。
+
+### R1-4: 测试工具库 + 多随机种子验证 ⭐⭐
+
+**来源**：CUDA-Agent 5 轮随机验证 + CUDAForge 确定性 benchmark（固定种子 + `deterministic_algorithms`）。
+
+**目标**：消除测试代码重复，提高覆盖率。
+
+**当前问题**：
+
+- `random_fill()`、`max_abs_diff()`、`compare()` 在 5+ 个文件中重复实现
+- 无集中 `test_utils.h`
+- 单元测试用固定输入，只覆盖 1 种情况
+
+**方案**：
+
+| # | 任务 | 文件 | 说明 |
+| --- | --- | --- | --- |
+| R1-4a | 创建 `test_utils.h` | `tests/test_utils.h` | `test_random_fill()`, `test_allclose()`, `test_max_abs_diff()`, `RUN_N_TRIALS()` 宏 |
+| R1-4b | 重构现有测试使用 test_utils.h | `test_bert_mha.c`, `test_mha_decode.c`, `test_conv_scale.c`, `test_ops_scale.c` | 消除重复代码 |
+| R1-4c | 关键算子 5 轮随机验证 | `test_conv.c`, `test_matmul.c`, `test_softmax.c`, `test_layernorm.c` | 用 `RUN_N_TRIALS(5, ...)` 包装 |
+| R1-4d | 端到端 3 轮随机验证 | `test_bert.c`, `test_gpt2.c` | 用 `RUN_N_TRIALS(3, ...)` 包装 |
+
+> ✅ **R1-4 已完成** — `test_utils.h` 提供 8 个工具函数/宏，conv/matmul/softmax 各 5 轮随机验证通过。
+
+### R1-5: 裸 CUDA API 调用检测 ⭐
+
+**来源**：CUDA-Agent `block_torch_functional()` 约束验证模式。
+
+**目标**：自动化检测绕过 `g_cuda` 接口层的直接 CUDA 调用。
+
+| # | 任务 | 文件 | 说明 |
+| --- | --- | --- | --- |
+| R1-5a | CI 静态扫描脚本 | `scripts/check_raw_cuda.sh` | grep `.cu` 文件中裸 `cudaMalloc`/`cudaMemcpy` |
+| R1-5b | Debug 模式 wrapper | `src/platform/include/cuda_debug_wrap.h` | 宏替换裸 CUDA API 为断言失败 |
+
+> ✅ **R1-5 已完成** — 检测脚本发现 4 个已知违规，Debug wrapper 拦截 16 个 CUDA API。
+
+### R1-6: GPU 硬件能力查询扩展 ⭐
+
+**来源**：CUDAForge `gpu_specs.py` 为 8 种 GPU 提供详细规格，注入 LLM prompt。
+
+**目标**：运行时查询 GPU 能力，为 kernel 调优提供硬件上下文。
+
+| # | 任务 | 文件 | 说明 |
+| --- | --- | --- | --- |
+| R1-6a | 扩展 `cudaDeviceProp` 查询 | `src/platform/cuda/cuda_platform.cu` | 暴露 SM 数、共享内存/SM、寄存器/SM、TFLOPS |
+| R1-6b | 新增 `gpu_caps_t` 结构 | `src/platform/include/cuda_ops.h` | 运行时 GPU 能力快照 |
+
+> ✅ **R1-6 已完成** — `gpu_caps_t` 含 22 个字段，`cuda_print_gpu_caps()` 格式化输出可用。
+
+### R1-7: 优化 Checklist 文档 ⭐
+
+**来源**：CUDAForge 两阶段 Judge 模式（先诊断瓶颈，再选择优化策略）。
+
+**目标**：按算子类型给出明确的优化路径。
+
+| 算子类型 | 代表算子 | 优先优化方向 | 现状 |
+| --- | --- | --- | --- |
+| Element-wise | ReLU, GELU, SiLU, Add, Mul | Vectorized loads (float4) | 待优化 |
+| Reduction | Softmax, LayerNorm, BatchNorm | Shared memory reduction | 已实现 |
+| GEMM | MatMul, Conv | Tiling → Warp → Tensor Core | 4 级全覆盖 |
+| Attention | MHA Fused | 融合 + tiled online softmax | 已实现 |
+| Pooling | MaxPool, AvgPool | Shared memory 窗口复用 | 待优化 |
+| Permute | Transpose, Reshape, Slice | 合并访问 + 零拷贝 | 基础实现 |
+
+| # | 任务 | 文件 | 说明 |
+| --- | --- | --- | --- |
+| R1-7a | 更新 CUDA_GUIDE.md | `docs/CUDA_GUIDE.md` | 新增"按算子类型的优化路径"+"NCU 诊断 Checklist"章节 |
+
+> ✅ **R1-7 已完成** — CUDA_GUIDE.md 新增第 5/6 节（优化路径 + NCU 诊断 Checklist）。
+
+### R1-8: 批量 Benchmark Runner ⭐
+
+**来源**：CUDAForge 270 个 KernelBench 任务的自动化 benchmark 框架。
+
+**目标**：一键跑所有 benchmark 并输出对比表。
+
+| # | 任务 | 文件 | 说明 |
+| --- | --- | --- | --- |
+| R1-8a | 创建 benchmark runner 脚本 | `scripts/run_benchmarks.sh` | 自动运行所有 `bench_*.exe`，输出 CSV |
+| R1-8b | 集成 compute-sanitizer | `scripts/run_sanitizer.sh` | 批量运行 compute-sanitizer，汇总结果 |
+
+> ✅ **R1-8 已完成** — 4 个 benchmark 全部 PASS，支持 CSV/JSON/profile-only 模式。
+
+---
+
+## 已完成工作（v0.6.0）
+
+### 里程碑
 
 - Phase A/B/C: BERT 全套推理 + MHA 融合 kernel
-- M1-M3: FlashAttention tiled + QKV 融合 + WMMA FP16 (8.96× 加速)
-- O1-O2: ONNX opset≥13 兼容 + 外部数据错误日志
+- M1-M3: FlashAttention tiled + QKV 融合 + WMMA FP16 (8.96x 加速)
+- O1-O2: ONNX opset>=13 兼容 + 外部数据错误日志
 - F1: FP16 推理支持 (15 个 FP16 CUDA 算子 + dtype-aware 调度)
 - F2: LLM 推理 (CausalMask + mha_decode + KV-cache + GQA + RoPE + 永久融合)
 - 代码审阅: Critical/High/Medium 修复全部完成
 
----
-
-## 待完成工作
-
 ### Critical — 正确性风险
 
-| # | 任务 | 文件 | 说明 |
-| --- | --- | --- | --- |
-| ~~C1~~ | ~~CUDA_CHECK 改为返回错误码~~ | `cuda_ops.h` | ✅ 移除致命宏，统一为返回错误码版本 |
-| ~~C2~~ | ~~graph.c realloc 失败处理~~ | `graph.c` | ✅ 4 处 realloc 改用临时变量 |
+| # | 任务 | 状态 |
+| --- | --- | --- |
+| C1 | CUDA_CHECK 改为返回错误码 | ✅ |
+| C2 | graph.c realloc 失败处理 | ✅ |
 
 ### High — 功能完整性
 
-| # | 任务 | 文件 | 说明 |
-| --- | --- | --- | --- |
-| ~~H1~~ | ~~FP16 Conv2D kernel~~ | `conv_f16_cuda.cu` | ✅ 直接卷积，FP16 输入/权重，FP32 累加 |
-| ~~H2~~ | ~~FP16 MatMul kernel~~ | `matmul_f16_cuda.cu` | ✅ 16×16 tiling，FP16 输入，FP32 累加 |
-| ~~H3~~ | ~~FP16 BatchNorm/LayerNorm~~ | `norm_f16_cuda.cu` | ✅ BatchNorm + LayerNorm FP16 |
-| ~~H4~~ | ~~FP16 Softmax~~ | `softmax_f16_cuda.cu` | ✅ FP16 Softmax，FP32 累加 |
-| ~~H5~~ | ~~Resize 双线性插值~~ | `resize.c` / `resize_cuda.cu` | ✅ CPU + CUDA 均支持 bilinear |
-| ~~H6~~ | ~~ONNX Pad 算子~~ | `pad.c` / `pad_cuda.cu` | ✅ constant/edge/reflect 三种模式 |
-| ~~H7~~ | ~~ONNX Clip 算子~~ | `clip.c` / `clip_cuda.cu` | ✅ clamp [min, max] |
+| # | 任务 | 状态 |
+| --- | --- | --- |
+| H1 | FP16 Conv2D kernel | ✅ |
+| H2 | FP16 MatMul kernel | ✅ |
+| H3 | FP16 BatchNorm/LayerNorm | ✅ |
+| H4 | FP16 Softmax | ✅ |
+| H5 | Resize 双线性插值 | ✅ |
+| H6 | ONNX Pad 算子 | ✅ |
+| H7 | ONNX Clip 算子 | ✅ |
 
 ### Medium — 测试覆盖
 
-| # | 任务 | 文件 | 说明 |
-| --- | --- | --- | --- |
-| ~~M1~~ | ~~RoPE 独立单元测试~~ | `tests/test_rope.c` | ✅ CPU + in-place + CUDA (max_diff=5.96e-08) |
-| ~~M2~~ | ~~FP16 算子单元测试~~ | `tests/test_fp16_ops.c` | ✅ Softmax FP16 + Conv2D FP16 |
-| ~~M3~~ | ~~In-place 操作测试~~ | `test_relu.c`, `test_activations.c` | ✅ ReLU/Sigmoid/GELU/SiLU |
-| ~~M4~~ | ~~边界形状测试~~ | `test_add_scalar` 等 | ✅ 关键边界已覆盖 |
-| ~~M5~~ | ~~TESTS.md 测试映射修正~~ | `docs/TESTS.md` | ✅ 已修正所有映射 |
+| # | 任务 | 状态 |
+| --- | --- | --- |
+| M1 | RoPE 独立单元测试 | ✅ |
+| M2 | FP16 算子单元测试 | ✅ |
+| M3 | In-place 操作测试 | ✅ |
+| M4 | 边界形状测试 | ✅ |
+| M5 | TESTS.md 测试映射修正 | ✅ |
 
-### Low — 代码质量 & 架构
+### Low — 代码质量
 
-| # | 任务 | 文件 | 说明 |
-| --- | --- | --- | --- |
-| ~~L1~~ | ~~operator_params_t placeholder~~ | `operator.h` | ✅ 改为 `char _reserved` |
-| L2 | graph_execute 惰性 D2H | `graph.c` | 暂缓 — 需要 CPU/GPU 消费者追踪 |
-| L3 | Application→Operator 层耦合 | `graph.c` | 暂缓 — 融合 pass 需访问算子内部参数 |
-| ~~L4~~ | ~~CUDA_CHECK 统一~~ | `cuda_ops.h` | ✅ 已在 C1 中完成 |
-| ~~L5~~ | ~~README_en 同步~~ | `README_en.md` | ✅ 算子表 + FP16 + 测试数量已同步 |
+| # | 任务 | 状态 |
+| --- | --- | --- |
+| L1 | operator_params_t placeholder | ✅ |
+| L4 | CUDA_CHECK 统一 | ✅ |
+| L5 | README_en 同步 | ✅ |
 
-### 待修复 — 测试问题
+### 暂缓
 
-| # | 任务 | 文件 | 说明 |
-| --- | --- | --- | --- |
-| ~~T1~~ | ~~test_conv 编译修复~~ | `test_conv.c` | ✅ 添加 /wd4100 /wd4189 + 修复 stride=2 测试用例 (4×4→5×5 input) |
+| # | 任务 | 说明 |
+| --- | --- | --- |
+| L2 | graph_execute 惰性 D2H | 需要 CPU/GPU 消费者追踪 |
+| L3 | Application->Operator 层耦合 | 融合 pass 需访问算子内部参数 |
+
+### F2: LLM 推理基础设施
+
+| 项 | 状态 |
+| --- | --- |
+| OP_WHERE / OP_TANH / INT64 / BOOL tensor | ✅ |
+| 批量 MatMul / Transpose/Concat 推断 | ✅ |
+| 自回归生成 API / GPT-2 测试模型 | ✅ |
+| GPT-2 端到端推理 (max_diff=4.77e-07) | ✅ |
+| KV-cache decode | ✅ |
 
 ---
-
-## F2: LLM 推理基础设施（已完成）
-
-| 项 | 状态 | 说明 |
-| --- | --- | --- |
-| OP_WHERE | ✅ | 条件选择算子，支持 broadcast |
-| OP_TANH | ✅ | 双曲正切激活 |
-| INT64 数据类型 | ✅ | platform 层支持 DATA_TYPE_I64 |
-| BOOL tensor 支持 | ✅ | ONNX loader 1-byte → float 转换 |
-| 批量 MatMul 推断 | ✅ | 支持 3D+ 输入 |
-| Transpose/Concat 推断 | ✅ | 新增 shape inference |
-| 自回归生成 API | ✅ | generate.h / generate.c |
-| GPT-2 测试模型 | ✅ | gen_gpt2_full.py (hidden=64, 2层) |
-| GPT-2 端到端推理 | ✅ | 5 bug 修复 (MatMul 3D/Tanh numel/input dtype/Gather int64/batched MatMul)，max_diff=4.77e-07，next_token=212 = ref |
-| KV-cache decode | ✅ | graph_update_cache_len + 持久 KV-cache tensor + mha_decode kernel |
 
 ## 远期规划
 
@@ -110,9 +293,8 @@
 
 | 状态 | 数量 | 内容 |
 | --- | --- | --- |
-| 已完成 | 21 | Phase A/B/C, M1-M3, O1-O2, F1, F2 (KV-cache+GQA+RoPE+永久融合+GPT-2 e2e), C1-C2, H1-H7, M1-M5, L1/L4/L5, T1 |
+| 已完成 | 29 | Phase A/B/C, M1-M3, O1-O2, F1, F2, C1-C2, H1-H7, M1-M5, L1/L4/L5, T1, **R1-1 ~ R1-8** |
 | 暂缓 | 2 | L2 (惰性 D2H), L3 (层耦合) |
-| 进行中 | 0 | — |
 | 远期 | 6 | INT8/动态形状/SIMD/ARM/TensorRT/多GPU |
 
-> **最后更新**: 2026-06-02。v0.6.0。36 种算子，35/35 测试通过，BERT-base FP16 4.66ms (8.96× vs CPU)。F2 LLM 推理: GPT-2 端到端推理完成 (5 bug 修复，max_diff=4.77e-07，batched MatMul)。
+> **最后更新**: 2026-06-07。v0.7.0。R1 架构优化全部完成（8/8）。

@@ -2,6 +2,7 @@
 #include "operator.h"
 #include "platform.h"
 #include "softmax_int.h"
+#include "test_utils.h"
 #include <stdlib.h>
 #include <math.h>
 
@@ -86,11 +87,65 @@ void test_softmax_null_check(void) {
     TEST_ASSERT_NOT_EQUAL(0, op->func((const void*[]){buf}, outputs_ok, NULL, NULL));
 }
 
+/*
+ * Multi-random-trial verification: 5 trials with random inputs.
+ * Verifies: (1) output sums to 1.0, (2) all outputs >= 0, (3) determinism.
+ */
+static void softmax_random_trial(int trial) {
+    unsigned seed = 42 + trial * 1000;
+    int64_t rows = 4 + trial * 4;  /* 4, 8, 12, 16, 20 */
+    int64_t cols = 32 + trial * 16; /* 32, 48, 64, 80, 96 */
+    int64_t n = rows * cols;
+
+    float* in  = (float*)malloc(n * sizeof(float));
+    float* out1 = (float*)malloc(n * sizeof(float));
+    float* out2 = (float*)malloc(n * sizeof(float));
+
+    test_random_fill(in, n, seed);
+
+    softmax_params_t p = { .num_classes = cols, .num_blocks = rows };
+    const operator_registry_t* op = operator_find("softmax_f32");
+    TEST_ASSERT_NOT_NULL(op);
+
+    const void* inputs[] = {in};
+
+    /* Run 1 */
+    void* outputs1[] = {out1};
+    int ret1 = op->func(inputs, outputs1, (const operator_params_t*)&p, NULL);
+    TEST_ASSERT_EQUAL_INT(0, ret1);
+
+    /* Verify: each row sums to 1.0, all values >= 0 */
+    for (int64_t r = 0; r < rows; r++) {
+        float sum = 0.0f;
+        for (int64_t c = 0; c < cols; c++) {
+            float v = out1[r * cols + c];
+            TEST_ASSERT_TRUE(v >= 0.0f);
+            sum += v;
+        }
+        TEST_ASSERT_FLOAT_WITHIN(1e-4, 1.0f, sum);
+    }
+
+    /* Run 2 — determinism check */
+    void* outputs2[] = {out2};
+    int ret2 = op->func(inputs, outputs2, (const operator_params_t*)&p, NULL);
+    TEST_ASSERT_EQUAL_INT(0, ret2);
+
+    float max_diff = test_max_abs_diff(out1, out2, n);
+    TEST_ASSERT_FLOAT_WITHIN(1e-6, 0.0f, max_diff);
+
+    free(in); free(out1); free(out2);
+}
+
+void test_softmax_random_trials(void) {
+    RUN_N_TRIALS(5, softmax_random_trial);
+}
+
 int main(void) {
     platform_init();
     UNITY_BEGIN();
     RUN_TEST(test_softmax_simple);
     RUN_TEST(test_softmax_batch);
     RUN_TEST(test_softmax_null_check);
+    RUN_TEST(test_softmax_random_trials);
     return UNITY_END();
 }

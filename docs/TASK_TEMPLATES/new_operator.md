@@ -31,10 +31,22 @@ src/operator/nn/
 - launch wrapper：网格/block 配置、error check
 - 通过 `g_cuda` 接口访问 GPU 资源，不直接调用 CUDA API
 
-### 4. 算子注册
+### 4. 算子注册（X-macro 模式）
 
-- 在 `operator_registry_t` 注册表中添加条目
+在 `src/operator/operator_registry.def` 中添加注册条目：
+
+```c
+/* CPU 算子 */
+REGISTER_CPU(register_xxx_f32)
+
+/* CUDA 算子 */
+REGISTER_CUDA(register_xxx_f32_cuda)
+```
+
+- **不要修改 `operator_init.c`** — 宏自动展开生成前向声明和初始化调用
+- 在 `xxx.c` 中实现 `register_xxx_f32()`，在 `xxx_cuda.cu` 中实现 `extern "C" register_xxx_f32_cuda()`
 - 验证 `flags` 是否正确标注（是否 in-place、是否支持 alias）
+- 运行 `scripts/check_registry.sh` 验证 .def 与源文件一致
 
 ### 5. 测试
 

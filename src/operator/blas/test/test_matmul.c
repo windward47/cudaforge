@@ -1,6 +1,7 @@
 #include "unity.h"
 #include "operator.h"
 #include "matmul_int.h"
+#include "test_utils.h"
 #include <stdlib.h>
 #include <string.h>
 
@@ -63,11 +64,57 @@ void test_matmul_f32_null_input(void) {
     TEST_ASSERT_TRUE(ret < 0);
 }
 
+/*
+ * Multi-random-trial verification: 5 trials with random inputs.
+ * Runs CPU matmul twice with same input, checks determinism.
+ */
+static void matmul_random_trial(int trial) {
+    unsigned seed = 42 + trial * 1000;
+    int M = 16 + trial * 8;  /* 16, 24, 32, 40, 48 */
+    int N = 16 + trial * 8;
+    int K = 32 + trial * 16; /* 32, 48, 64, 80, 96 */
+
+    float* A = (float*)malloc(M * K * sizeof(float));
+    float* B = (float*)malloc(K * N * sizeof(float));
+    float* C1 = (float*)malloc(M * N * sizeof(float));
+    float* C2 = (float*)malloc(M * N * sizeof(float));
+
+    test_random_fill(A, M * K, seed);
+    test_random_fill(B, K * N, seed + 1);
+    memset(C1, 0, M * N * sizeof(float));
+    memset(C2, 0, M * N * sizeof(float));
+
+    matmul_params_t p = {.M = M, .N = N, .K = K};
+    const operator_registry_t* op = operator_find("matmul_f32");
+    TEST_ASSERT_NOT_NULL(op);
+
+    const void* inputs[] = {A, B, NULL};
+
+    void* outputs1[] = {C1};
+    int ret1 = op->func(inputs, outputs1, (const operator_params_t*)&p, NULL);
+    void* outputs2[] = {C2};
+    int ret2 = op->func(inputs, outputs2, (const operator_params_t*)&p, NULL);
+
+    TEST_ASSERT_EQUAL_INT(0, ret1);
+    TEST_ASSERT_EQUAL_INT(0, ret2);
+
+    /* Verify determinism */
+    float max_diff = test_max_abs_diff(C1, C2, M * N);
+    TEST_ASSERT_FLOAT_WITHIN(1e-5, 0.0f, max_diff);
+
+    free(A); free(B); free(C1); free(C2);
+}
+
+void test_matmul_f32_random_trials(void) {
+    RUN_N_TRIALS(5, matmul_random_trial);
+}
+
 int main(void) {
     operator_init_all();
     UNITY_BEGIN();
     RUN_TEST(test_matmul_f32_basic);
     RUN_TEST(test_matmul_f32_1x1);
     RUN_TEST(test_matmul_f32_null_input);
+    RUN_TEST(test_matmul_f32_random_trials);
     return UNITY_END();
 }

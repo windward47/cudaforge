@@ -232,7 +232,22 @@ int relu_f32(const tensor_t* input, tensor_t* output, int64_t size);
 - 性能关键路径标注优化原因：`/* 循环展开 4 路以利用 SIMD */`
 - 禁止大段注释掉的死代码，改用 git 历史追溯
 
-## 10. 测试规范
+## 10. 算子注册规范
+
+算子注册使用 **X-macro** 模式（见 `src/operator/operator_registry.def`）。新增算子时：
+
+1. 在 `operator_registry.def` 中添加一行 `REGISTER(name, dtype, func, version, flags)`
+2. 实现算子函数（`.c` CPU fallback + `.cu` CUDA kernel）
+3. **不要修改 `operator.c`** — 宏自动展开生成注册数组
+
+```c
+/* operator_registry.def 示例 */
+REGISTER("my_op_f32", "f32", my_op_f32, 1, OP_FLAG_NONE)
+```
+
+> **为什么用 X-macro 而不是手动数组？** 36+ 个算子的手动注册数组容易遗漏或写错。X-macro 保证 `.def` 文件是唯一来源，编译器会在展开时捕获拼写错误。
+
+## 11. 测试规范
 
 - 使用 C 单元测试框架（Unity/CMocka/Criterion）
 - 每个算子的测试覆盖：
@@ -252,7 +267,7 @@ static void test_relu_f32_basic(void) {
 }
 ```
 
-## 11. Git 提交规范
+## 12. Git 提交规范
 
 ### 提交信息格式
 

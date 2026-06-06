@@ -85,6 +85,12 @@ typedef struct {
     int               version;       /* 算子版本 */
     uint32_t          flags;         /* 特性标记（IN_PLACE, ALLOW_ALIAS 等） */
 } operator_registry_t;
+
+/* 算子参数 — 由各算子按需扩展 */
+typedef struct {
+    int tuning_config;  /* 0=default, 1=small_tile, 2=large_tile（见 R1-2） */
+    char _reserved;
+} operator_params_t;
 ```
 
 ### 2.3 Application 层
@@ -146,18 +152,30 @@ int conv2d_f32(const void* inputs[],
 }
 ```
 
-### 算子注册
+### 算子注册（X-macro 模式）
+
+算子注册使用 **X-macro** 模式，所有条目集中在 `operator_registry.def` 中维护，新增算子无需修改 `operator.c`：
 
 ```c
-/* 注册表入口 */
-static const operator_registry_t s_registries[] = {
-    {"conv2d_f32",  "f32", conv2d_f32,  1, OP_FLAG_NONE},
-    {"matmul_f32",  "f32", matmul_f32,  1, OP_FLAG_NONE},
-    {"relu_f32",    "f32", relu_f32,    1, OP_FLAG_IN_PLACE},
-    {"reshape",     "any", reshape,     1, OP_FLAG_IN_PLACE},
-    /* ... */
-};
+/* src/operator/operator_registry.def — 算子注册表（单一来源） */
+/* REGISTER(name, dtype, func, version, flags) */
+REGISTER("conv2d_f32",  "f32", conv2d_f32,  1, OP_FLAG_NONE)
+REGISTER("matmul_f32",  "f32", matmul_f32,  1, OP_FLAG_NONE)
+REGISTER("relu_f32",    "f32", relu_f32,    1, OP_FLAG_IN_PLACE)
+REGISTER("reshape",     "any", reshape,     1, OP_FLAG_IN_PLACE)
+/* ... */
 ```
+
+```c
+/* src/operator/operator.c — 展开宏生成注册数组 */
+#define REGISTER(n, d, f, v, fl) {n, d, f, v, fl},
+static const operator_registry_t s_registries[] = {
+    #include "operator_registry.def"
+};
+#undef REGISTER
+```
+
+> **新增算子步骤**：在 `operator_registry.def` 中添加一行 `REGISTER(...)` 即可，无需修改其他文件。
 
 ## 4. 平台适配规范
 

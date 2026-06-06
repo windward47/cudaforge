@@ -1,6 +1,7 @@
 #include "unity.h"
 #include "operator.h"
 #include "conv_int.h"
+#include "test_utils.h"
 
 extern int operator_init_all(void);
 
@@ -71,10 +72,65 @@ void test_conv2d_f32_null_input(void) {
     TEST_ASSERT_TRUE(ret < 0);
 }
 
+/*
+ * Multi-random-trial verification: 5 trials with random inputs.
+ * Runs CPU conv2d twice with same input, checks determinism.
+ */
+static void conv_random_trial(int trial) {
+    unsigned seed = 42 + trial * 1000;
+    int64_t N=1, C=3, H=16, W=16, K=8, KH=3, KW=3;
+    int64_t OH = H - KH + 1, OW = W - KW + 1;
+    int64_t in_n = N * C * H * W;
+    int64_t w_n  = K * C * KH * KW;
+    int64_t out_n = N * K * OH * OW;
+
+    float* input  = (float*)malloc(in_n * sizeof(float));
+    float* weight = (float*)malloc(w_n  * sizeof(float));
+    float* out1   = (float*)malloc(out_n * sizeof(float));
+    float* out2   = (float*)malloc(out_n * sizeof(float));
+
+    test_random_fill(input,  in_n, seed);
+    test_random_fill(weight, w_n,  seed + 1);
+    memset(out1, 0, out_n * sizeof(float));
+    memset(out2, 0, out_n * sizeof(float));
+
+    conv_params_t p = {
+        .N=N, .C=C, .H=H, .W=W, .K=K,
+        .kernel_h=KH, .kernel_w=KW,
+        .pad_h=0, .pad_w=0, .stride_h=1, .stride_w=1,
+        .dilation_h=1, .dilation_w=1, .groups=1,
+    };
+
+    const operator_registry_t* op = operator_find("conv2d_f32");
+    TEST_ASSERT_NOT_NULL(op);
+
+    const void* inputs[]  = {input, weight, NULL};
+
+    /* Run twice — should be deterministic */
+    void* outputs1[] = {out1};
+    int ret1 = op->func(inputs, outputs1, (const operator_params_t*)&p, NULL);
+    void* outputs2[] = {out2};
+    int ret2 = op->func(inputs, outputs2, (const operator_params_t*)&p, NULL);
+
+    TEST_ASSERT_EQUAL_INT(0, ret1);
+    TEST_ASSERT_EQUAL_INT(0, ret2);
+
+    /* Verify determinism: same input → same output */
+    float max_diff = test_max_abs_diff(out1, out2, out_n);
+    TEST_ASSERT_FLOAT_WITHIN(1e-6, 0.0f, max_diff);
+
+    free(input); free(weight); free(out1); free(out2);
+}
+
+void test_conv2d_f32_random_trials(void) {
+    RUN_N_TRIALS(5, conv_random_trial);
+}
+
 int main(void) {
     operator_init_all();
     UNITY_BEGIN();
     RUN_TEST(test_conv2d_f32_basic);
     RUN_TEST(test_conv2d_f32_null_input);
+    RUN_TEST(test_conv2d_f32_random_trials);
     return UNITY_END();
 }

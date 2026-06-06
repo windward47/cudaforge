@@ -2,8 +2,10 @@
 #include "cuda_ops.h"
 #include "softmax_int.h"
 
-__global__ void softmax_f32_kernel(const float* input, float* output,
-                                     int64_t C, int64_t N) {
+/* ---- Templated kernel for different block sizes ---- */
+template<int BLOCK_SIZE>
+__global__ void softmax_f32_kernel_t(const float* input, float* output,
+                                      int64_t C, int64_t N) {
     int n = blockIdx.x;
     if (n >= N) return;
 
@@ -11,7 +13,7 @@ __global__ void softmax_f32_kernel(const float* input, float* output,
     float* out_n = output + n * C;
 
     /* Find max (parallel reduction in shared memory) */
-    __shared__ float smem[256];
+    __shared__ float smem[BLOCK_SIZE];
     int tid = threadIdx.x;
     float max_val = -3.4028235e38f;
     for (int i = tid; i < C; i += blockDim.x) {
@@ -50,6 +52,32 @@ __global__ void softmax_f32_kernel(const float* input, float* output,
     }
 }
 
+/* ---- Config-aware launcher ---- */
+static int softmax_launch(cudaStream_t s, const float* in, float* out,
+                          int64_t num_classes, int64_t num_blocks, int config) {
+    switch (config) {
+    case 1: { /* small: 128 threads */
+        dim3 block(128, 1, 1);
+        dim3 grid((unsigned int)num_blocks, 1, 1);
+        return CUDA_KERNEL_LAUNCH(softmax_f32_kernel_t<128>, grid, block, 0, s,
+                                  in, out, num_classes, num_blocks);
+    }
+    case 2: { /* large: 512 threads */
+        dim3 block(512, 1, 1);
+        dim3 grid((unsigned int)num_blocks, 1, 1);
+        return CUDA_KERNEL_LAUNCH(softmax_f32_kernel_t<512>, grid, block, 0, s,
+                                  in, out, num_classes, num_blocks);
+    }
+    default: { /* default: 256 threads */
+        dim3 block(OPS_THREADS_PER_BLOCK, 1, 1);
+        dim3 grid((unsigned int)num_blocks, 1, 1);
+        return CUDA_KERNEL_LAUNCH(softmax_f32_kernel_t<256>, grid, block, 0, s,
+                                  in, out, num_classes, num_blocks);
+    }
+    }
+}
+
+/* ---- Public entry point ---- */
 int softmax_f32_cuda(const void* inputs[], void* outputs[],
                      const operator_params_t* params, stream_t* stream) {
     if (!inputs || !inputs[0] || !outputs || !outputs[0])
@@ -61,11 +89,7 @@ int softmax_f32_cuda(const void* inputs[], void* outputs[],
     float* out = (float*)outputs[0];
     cudaStream_t s = stream ? (cudaStream_t)stream->cuda_stream : 0;
 
-    dim3 block(OPS_THREADS_PER_BLOCK, 1, 1);
-    dim3 grid((unsigned int)p->num_blocks, 1, 1);
-
-    return CUDA_KERNEL_LAUNCH(softmax_f32_kernel, grid, block, 0, s,
-                       in, out, p->num_classes, p->num_blocks);
+    return softmax_launch(s, in, out, p->num_classes, p->num_blocks, p->tuning_config);
 }
 
 extern "C" int register_softmax_f32_cuda(void) {

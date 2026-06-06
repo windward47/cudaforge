@@ -152,6 +152,13 @@ if(ENABLE_CUDA)
         src/operator/nn/where_cuda.cu
         src/operator/blas/matmul_cuda.cu
     )
+
+    # Debug 模式下拦截裸 CUDA API 调用（强制使用 g_cuda 接口）
+    # 通过 -include 在编译前自动包含 cuda_debug_wrap.h
+    # 取消注释以下行以启用：
+    # target_compile_options(operator PRIVATE
+    #     $<$<AND:$<CONFIG:Debug>,$<COMPILE_LANGUAGE:CUDA>>:-include${CMAKE_CURRENT_SOURCE_DIR}/src/platform/include/cuda_debug_wrap.h>
+    # )
 endif()
 
 target_include_directories(operator PUBLIC
@@ -243,6 +250,7 @@ if(ENABLE_TESTS)
     target_include_directories(test_matmul PRIVATE
         third_party/unity/src
         src/operator/blas       # for matmul_int.h
+        tests
     )
     target_link_libraries(test_matmul PRIVATE operator platform unity)
     add_test(NAME test_matmul COMMAND test_matmul)
@@ -254,6 +262,7 @@ if(ENABLE_TESTS)
         third_party/unity/src
         src/operator/nn
         src/operator/blas
+        tests
     )
     target_link_libraries(test_conv PRIVATE operator platform unity)
     if(CMAKE_C_COMPILER_ID STREQUAL "MSVC")
@@ -346,6 +355,7 @@ if(ENABLE_TESTS)
     target_include_directories(test_softmax PRIVATE
         third_party/unity/src
         src/operator/nn
+        tests
     )
     target_link_libraries(test_softmax PRIVATE operator platform unity)
     add_test(NAME test_softmax COMMAND test_softmax)
@@ -482,6 +492,16 @@ if(ENABLE_TESTS)
             src/operator/nn
         )
         target_link_libraries(bench_operators PRIVATE operator platform unity)
+
+        add_executable(bench_profile
+            tests/bench_profile.cu
+        )
+        target_include_directories(bench_profile PRIVATE
+            third_party/unity/src
+            src/operator/blas
+            src/operator/nn
+        )
+        target_link_libraries(bench_profile PRIVATE operator platform unity)
     endif()
 
     add_executable(test_onnx

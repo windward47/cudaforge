@@ -70,6 +70,38 @@ static inline kernel_config_t cuda_configure_1d(int64_t n, int threads) {
 }
 #endif
 
+/* --------------------------------------------------------------------------
+ *  GPU hardware capabilities — runtime snapshot
+ *  参考 CUDAForge 的 gpu_specs.py 硬件规格注入思路
+ * -------------------------------------------------------------------------- */
+typedef struct {
+    /* 设备基本信息 */
+    int   device_id;
+    char  name[256];                /* 设备名称 */
+    int   compute_major;            /* 计算能力主版本 */
+    int   compute_minor;            /* 计算能力次版本 */
+
+    /* SM 与线程 */
+    int   sm_count;                 /* SM 数量 */
+    int   max_threads_per_sm;       /* 每 SM 最大线程数 */
+    int   max_threads_per_block;    /* 每 block 最大线程数 */
+    int   warp_size;                /* warp 大小（通常 32） */
+
+    /* 寄存器与共享内存 */
+    int   regs_per_sm;              /* 每 SM 寄存器数 */
+    int   regs_per_block;           /* 每 block 最大寄存器数 */
+    int   shared_mem_per_sm;        /* 每 SM 共享内存（字节） */
+    int   shared_mem_per_block;     /* 每 block 最大共享内存（字节） */
+
+    /* 显存 */
+    size_t total_memory;            /* 总显存（字节） */
+
+    /* 理论峰值吞吐 (GFLOPS) */
+    float tflops_fp32;              /* FP32 理论峰值 */
+    float tflops_fp16;              /* FP16 理论峰值 */
+    float tflops_tensor;            /* Tensor Core 理论峰值 */
+} gpu_caps_t;
+
 /* CUDA platform ops — function pointer table */
 typedef struct {
     int   (*init)(int device_id);
@@ -86,6 +118,7 @@ typedef struct {
     int   (*stream_destroy)(cudaStream_t stream);
     int   (*get_device_count)(int* count);
     int   (*get_device_props)(struct cudaDeviceProp* props, int device_id);
+    int   (*get_gpu_caps)(gpu_caps_t* caps, int device_id);
 } cuda_ops_t;
 
 extern cuda_ops_t g_cuda;

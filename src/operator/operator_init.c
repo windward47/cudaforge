@@ -1,162 +1,45 @@
+/* ============================================================
+ * operator_init.c — 算子注册初始化
+ *
+ * 使用 operator_registry.def 中的 X-macro 自动展开，
+ * 新增算子只需在 .def 文件中添加条目，无需修改本文件。
+ * ============================================================ */
 #include "operator.h"
 
-int register_relu_f32(void);
-int register_matmul_f32(void);
-int register_conv2d_f32(void);
-int register_activations(void);
-int register_pooling(void);
-int register_batchnorm(void);
-int register_add_f32(void);
-int register_reshape_f32(void);
-int register_globalavgpool_f32(void);
-int register_softmax_f32(void);
-int register_mul_f32(void);
-int register_concat_f32(void);
-int register_resize_f32(void);
-int register_transpose_f32(void);
-int register_sub_f32(void);
-int register_div_f32(void);
-int register_slice_f32(void);
-int register_split_f32(void);
-int register_layernorm_f32(void);
-int register_gather_f32(void);
-int register_squeeze_unsqueeze_f32(void);
-int register_reduce_f32(void);
-int register_cast_f32(void);
-int register_argmax_f32(void);
-int register_mha_fused_f32(void);
-int register_causal_mask_f32(void);
+/* ---- 前向声明（CPU 算子）---- */
+#define REGISTER_CPU(fn)  int fn(void);
+#define REGISTER_CUDA(fn) /* no-op for forward decl of CUDA */
+#include "operator_registry.def"
+#undef REGISTER_CPU
+#undef REGISTER_CUDA
 
-/* CUDA operator registration (extern "C" from .cu files) */
-int register_relu_f32_cuda(void);
-int register_matmul_f32_cuda(void);
-int register_conv2d_f32_cuda(void);
-int register_activations_cuda(void);
-int register_pooling_cuda(void);
-int register_batchnorm_f32_cuda(void);
-int register_add_f32_cuda(void);
-int register_globalavgpool_f32_cuda(void);
-int register_softmax_f32_cuda(void);
-int register_reshape_f32_cuda(void);
-int register_mul_f32_cuda(void);
-int register_concat_f32_cuda(void);
-int register_resize_f32_cuda(void);
-int register_transpose_f32_cuda(void);
-int register_sub_f32_cuda(void);
-int register_div_f32_cuda(void);
-int register_slice_f32_cuda(void);
-int register_split_f32_cuda(void);
-int register_layernorm_f32_cuda(void);
-int register_gather_f32_cuda(void);
-int register_squeeze_unsqueeze_f32_cuda(void);
-int register_reduce_f32_cuda(void);
-int register_cast_f32_cuda(void);
-int register_argmax_f32_cuda(void);
-int register_mha_fused_f32_cuda(void);
-int register_mha_fused_f16_cuda(void);
-int register_relu_f16_cuda(void);
-int register_sigmoid_f16_cuda(void);
-int register_gelu_f16_cuda(void);
-int register_silu_f16_cuda(void);
-int register_exp_f16_cuda(void);
-int register_add_f16_cuda(void);
-int register_mul_f16_cuda(void);
-int register_sub_f16_cuda(void);
-int register_div_f16_cuda(void);
-int register_conv2d_f16_cuda(void);
-int register_matmul_f16_cuda(void);
-int register_batchnorm_f16_cuda(void);
-int register_layernorm_f16_cuda(void);
-int register_softmax_f16_cuda(void);
-int register_causal_mask_f32_cuda(void);
-int register_mha_decode_f32(void);
-int register_rope_f32(void);
-int register_pad_f32(void);
-int register_clip_f32(void);
-int register_where_f32(void);
-int register_mha_decode_f32_cuda(void);
-int register_rope_f32_cuda(void);
-int register_pad_f32_cuda(void);
-int register_clip_f32_cuda(void);
-int register_where_f32_cuda(void);
+#ifdef USE_CUDA
+/* ---- 前向声明（CUDA 算子）---- */
+#define REGISTER_CPU(fn)  /* no-op */
+#define REGISTER_CUDA(fn) int fn(void);
+#include "operator_registry.def"
+#undef REGISTER_CPU
+#undef REGISTER_CUDA
+#endif
 
 int operator_init_all(void) {
     int ret = 0;
-    ret += register_relu_f32();
-    ret += register_matmul_f32();
-    ret += register_conv2d_f32();
-    ret += register_activations();
-    ret += register_pooling();
-    ret += register_batchnorm();
-    ret += register_add_f32();
-    ret += register_reshape_f32();
-    ret += register_globalavgpool_f32();
-    ret += register_softmax_f32();
-    ret += register_mul_f32();
-    ret += register_concat_f32();
-    ret += register_resize_f32();
-    ret += register_transpose_f32();
-    ret += register_sub_f32();
-    ret += register_div_f32();
-    ret += register_slice_f32();
-    ret += register_split_f32();
-    ret += register_layernorm_f32();
-    ret += register_gather_f32();
-    ret += register_squeeze_unsqueeze_f32();
-    ret += register_reduce_f32();
-    ret += register_cast_f32();
-    ret += register_argmax_f32();
-    ret += register_mha_fused_f32();
-    ret += register_causal_mask_f32();
-    ret += register_rope_f32();
-    ret += register_pad_f32();
-    ret += register_clip_f32();
-    ret += register_where_f32();
-    ret += register_relu_f32_cuda();
-    ret += register_matmul_f32_cuda();
-    ret += register_conv2d_f32_cuda();
-    ret += register_activations_cuda();
-    ret += register_pooling_cuda();
-    ret += register_batchnorm_f32_cuda();
-    ret += register_add_f32_cuda();
-    ret += register_globalavgpool_f32_cuda();
-    ret += register_softmax_f32_cuda();
-    ret += register_reshape_f32_cuda();
-    ret += register_mul_f32_cuda();
-    ret += register_concat_f32_cuda();
-    ret += register_resize_f32_cuda();
-    ret += register_transpose_f32_cuda();
-    ret += register_sub_f32_cuda();
-    ret += register_div_f32_cuda();
-    ret += register_slice_f32_cuda();
-    ret += register_split_f32_cuda();
-    ret += register_layernorm_f32_cuda();
-    ret += register_gather_f32_cuda();
-    ret += register_squeeze_unsqueeze_f32_cuda();
-    ret += register_reduce_f32_cuda();
-    ret += register_cast_f32_cuda();
-    ret += register_argmax_f32_cuda();
-    ret += register_mha_fused_f32_cuda();
-    ret += register_mha_fused_f16_cuda();
-    ret += register_relu_f16_cuda();
-    ret += register_sigmoid_f16_cuda();
-    ret += register_gelu_f16_cuda();
-    ret += register_silu_f16_cuda();
-    ret += register_exp_f16_cuda();
-    ret += register_add_f16_cuda();
-    ret += register_mul_f16_cuda();
-    ret += register_sub_f16_cuda();
-    ret += register_div_f16_cuda();
-    ret += register_conv2d_f16_cuda();
-    ret += register_matmul_f16_cuda();
-    ret += register_batchnorm_f16_cuda();
-    ret += register_layernorm_f16_cuda();
-    ret += register_softmax_f16_cuda();
-    ret += register_causal_mask_f32_cuda();
-    ret += register_mha_decode_f32_cuda();
-    ret += register_rope_f32_cuda();
-    ret += register_pad_f32_cuda();
-    ret += register_clip_f32_cuda();
-    ret += register_where_f32_cuda();
+
+    /* CPU 算子注册 */
+    #define REGISTER_CPU(fn)  ret += fn();
+    #define REGISTER_CUDA(fn) /* no-op */
+    #include "operator_registry.def"
+    #undef REGISTER_CPU
+    #undef REGISTER_CUDA
+
+#ifdef USE_CUDA
+    /* CUDA 算子注册 */
+    #define REGISTER_CPU(fn)  /* no-op */
+    #define REGISTER_CUDA(fn) ret += fn();
+    #include "operator_registry.def"
+    #undef REGISTER_CPU
+    #undef REGISTER_CUDA
+#endif
+
     return ret;
 }

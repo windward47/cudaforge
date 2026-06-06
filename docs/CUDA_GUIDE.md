@@ -403,3 +403,74 @@ bool tensor_allclose(const tensor_t* a, const tensor_t* b,
     return true;
 }
 ```
+
+---
+
+## 5. 按算子类型的优化路径
+
+> 参考 CUDAForge 的两阶段 Judge 模式：先诊断瓶颈类型，再选择对应优化策略。
+
+| 算子类型 | 代表算子 | 瓶颈特征 | 优先优化方向 | 现状 |
+| --- | --- | --- | --- | --- |
+| Element-wise | ReLU, GELU, SiLU, Add, Mul | 带宽受限 | Vectorized loads (float4) | 待优化 |
+| Reduction | Softmax, LayerNorm, BatchNorm | 带宽+计算混合 | Shared memory reduction | 已实现 |
+| GEMM | MatMul, Conv | 计算受限 | Tiling -> Warp -> Tensor Core | 4 级全覆盖 |
+| Attention | MHA Fused | 带宽+计算混合 | 融合 + tiled online softmax | 已实现 |
+| Pooling | MaxPool, AvgPool | 带宽受限 | Shared memory 窗口复用 | 待优化 |
+| Permute | Transpose, Reshape, Slice | 带宽受限 | 合并访问 + 零拷贝 | 基础实现 |
+
+---
+
+## 6. NCU 诊断 Checklist
+
+> 参考 CUDAForge 收集的 24 项 Nsight Compute 硬件指标。使用 `compute-sanitizer` 和 `nsight-compute` 进行算子级性能分析。
+
+### 6.1 关键指标
+
+| 指标类别 | NCU Metric | 含义 | 健康范围 |
+| --- | --- | --- | --- |
+| SM 占用率 | `sm__warps_active.avg.pct_of_peak_sustained_active` | 实际活跃 warp 占峰值比例 | >60% |
+| 寄存器压力 | `launch__registers_per_thread` | 每线程寄存器数 | <64（避免 spilling） |
+| 显存带宽 | `dram__throughput.avg.pct_of_peak_sustained_elapsed` | DRAM 带宽利用率 | >70%（带宽受限算子） |
+| L1 命中率 | `l1tex__t_sector_hit_rate.pct` | L1 缓存命中率 | >80% |
+| L2 命中率 | `lts__t_sector_hit_rate.pct` | L2 缓存命中率 | >50% |
+| Warp 停顿 | `smsp__warps_issue_stalled_long_scoreboard_per_issue_active` | 长延迟停顿（显存访问） | <20% |
+| 分支发散 | `smsp__sass_average_branch_targets_threads_uniform.pct` | 分支目标一致性 | >90% |
+
+### 6.2 瓶颈诊断流程
+
+```text
+1. 运行 NCU profile:
+   ncu --metrics sm__warps_active.avg.pct_of_peak_sustained_active,
+                 launch__registers_per_thread,
+                 dram__throughput.avg.pct_of_peak_sustained_elapsed
+       ./build/Release/bench_xxx.exe
+
+2. 判断瓶颈类型:
+   IF dram_throughput > 70% AND sm_occupancy < 50%:
+     → 带宽受限：优化内存访问模式（合并访问、vectorized loads）
+   IF dram_throughput < 30% AND sm_occupancy > 60%:
+     → 计算受限：优化计算密度（tiling、Tensor Core）
+   IF registers_per_thread > 64:
+     → 寄存器溢出：减少中间变量、循环展开
+   IF l1_hit_rate < 50%:
+     → 局部性差：使用 shared memory 缓存
+   IF branch_divergence < 80%:
+     → 分支发散：重构条件逻辑、用算术替代分支
+```
+
+### 6.3 常用 NCU 命令
+
+```bash
+# 基本 profile（延迟 + SM 占用率）
+ncu --set basic ./build/Release/bench_matmul.exe
+
+# 详细 profile（内存 + 缓存 + warp 停顿）
+ncu --set full ./build/Release/bench_matmul.exe
+
+# 只看特定指标
+ncu --metrics sm__warps_active.avg.pct_of_peak_sustained_active,launch__registers_per_thread ./build/Release/bench_relu.exe
+
+# 输出为 CSV（便于脚本处理）
+ncu --csv --set basic ./build/Release/bench_matmul.exe > profile_matmul.csv
+```

@@ -251,6 +251,7 @@ int matmul_f32_cuda(const void* inputs[], void* outputs[],
     float* A_trans = NULL;
     float* B_trans = NULL;
     int ret = 0;
+    int config = p ? p->tuning_config : 0;  /* 0=heuristic, 1=naive, 2=tiled, 3=warp, 4=tc */
 
     /* Transpose A if needed (A is K×M, need M×K for standard kernel) */
     if (p->transpose_a) {
@@ -286,7 +287,8 @@ int matmul_f32_cuda(const void* inputs[], void* outputs[],
         stride_b = K * N;
     }
 
-    if (M <= 32 && N <= 32) {
+    if (config == 1 || (config == 0 && M <= 32 && N <= 32)) {
+        /* Naive: small matrices or explicit config */
         dim3 block(16, 16, 1);
         dim3 grid((unsigned int)((N + 15) / 16),
                   (unsigned int)((M + 15) / 16),
@@ -294,15 +296,17 @@ int matmul_f32_cuda(const void* inputs[], void* outputs[],
         ret = CUDA_KERNEL_LAUNCH(matmul_f32_naive, grid, block, 0, s,
                                   A, B, C, M, N, K,
                                   batch_size, stride_a, stride_b, stride_c);
-    } else if (M >= 512 && N >= 512 && K >= 512
-               && M % TC_TILE == 0 && N % TC_TILE == 0 && batch_size == 1) {
+    } else if (config == 4 || (config == 0 && M >= 512 && N >= 512 && K >= 512
+               && M % TC_TILE == 0 && N % TC_TILE == 0 && batch_size == 1)) {
+        /* Tensor Core: large aligned matrices or explicit config */
         dim3 block(32, 1, 1);
         dim3 grid((unsigned int)((N + TC_TILE - 1) / TC_TILE),
                   (unsigned int)((M + TC_TILE - 1) / TC_TILE), 1);
         ret = CUDA_KERNEL_LAUNCH(matmul_f32_tc_kernel, grid, block, 0, s,
                                   A, B, C, M, N, K,
                                   batch_size, stride_a, stride_b, stride_c);
-    } else if (M >= 64 && N >= 64) {
+    } else if (config == 3 || (config == 0 && M >= 64 && N >= 64)) {
+        /* Warp-tiled: medium matrices or explicit config */
         dim3 block(WARP_TILE, WARP_TILE, 1);
         dim3 grid((unsigned int)((N + WARP_TILE - 1) / WARP_TILE),
                   (unsigned int)((M + WARP_TILE - 1) / WARP_TILE),
@@ -311,6 +315,7 @@ int matmul_f32_cuda(const void* inputs[], void* outputs[],
                                   A, B, C, M, N, K,
                                   batch_size, stride_a, stride_b, stride_c);
     } else {
+        /* Shared-memory tiled: default fallback */
         dim3 block(MATMUL_TILE_SIZE, MATMUL_TILE_SIZE, 1);
         dim3 grid((unsigned int)((N + MATMUL_TILE_SIZE - 1) / MATMUL_TILE_SIZE),
                   (unsigned int)((M + MATMUL_TILE_SIZE - 1) / MATMUL_TILE_SIZE),

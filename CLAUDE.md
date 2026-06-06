@@ -55,12 +55,13 @@ cuda_dev/
 ### 必须遵守
 
 1. **算子成对实现**：新增一个算子时，`xxx.c`（CPU fallback）和 `xxx_cuda.cu`（CUDA kernel）同时实现
-2. **CUDA API 调用必须通过 `cuda_ops_t` 接口层**，禁止直接调用 CUDA Runtime API
-3. **CUDA kernel launch 使用 `CUDA_KERNEL_LAUNCH` 宏**（内部为 C++ variadic template，自动取 `&` 地址打包参数）
-4. **提交前 GPU 测试必须过 `compute-sanitizer`**（无 memory leak / out-of-bounds / misaligned access）
-5. **不要自动安装依赖**（CUDA Toolkit、GPU 驱动等）— 必须先问用户
-6. **不要修改 `build/` 目录下 CMake 生成的文件**
-7. **一个 commit 只做一个事**：不要混合 feat / fix / refactor
+2. **算子注册使用 X-macro**：在 `src/operator/operator_registry.def` 中添加 `REGISTER(...)` 条目，不要手动修改 `operator.c` 中的注册数组
+3. **CUDA API 调用必须通过 `cuda_ops_t` 接口层**，禁止直接调用 CUDA Runtime API
+4. **CUDA kernel launch 使用 `CUDA_KERNEL_LAUNCH` 宏**（内部为 C++ variadic template，自动取 `&` 地址打包参数）
+5. **提交前 GPU 测试必须过 `compute-sanitizer`**（无 memory leak / out-of-bounds / misaligned access）
+6. **不要自动安装依赖**（CUDA Toolkit、GPU 驱动等）— 必须先问用户
+7. **不要修改 `build/` 目录下 CMake 生成的文件**
+8. **一个 commit 只做一个事**：不要混合 feat / fix / refactor
 
 ### 推荐遵守
 
@@ -82,9 +83,18 @@ cmake --build build -j$(nproc)
 # === 运行测试 ===
 ctest --test-dir build -C Release -j$(nproc)
 
-# === GPU 内存检查（CUDA 12.0+）===
-compute-sanitizer ./build/Release/test_conv.exe
-compute-sanitizer --tool memcheck ./build/Release/test_matmul.exe
+# === 批量 benchmark ===
+./scripts/run_benchmarks.sh              # 运行所有 bench
+./scripts/run_benchmarks.sh --profile-only  # 只运行算子级 profile
+
+# === GPU 内存检查 ===
+./scripts/run_sanitizer.sh               # 批量 compute-sanitizer
+compute-sanitizer ./build/Release/test_matmul.exe
+
+# === 代码质量检查 ===
+./scripts/check_raw_cuda.sh              # 检测裸 CUDA API 调用
+./scripts/check_registry.sh              # 验证 .def 注册一致性
+./scripts/check_perf_regression.sh /tmp/current.csv docs/PROFILE_BASELINE.csv
 ```
 
 ## 文档索引

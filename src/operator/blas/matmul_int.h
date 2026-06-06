@@ -12,6 +12,7 @@ typedef struct {
     int64_t stride_a;     /* elements between batch slices of A */
     int64_t stride_b;     /* elements between batch slices of B */
     int64_t stride_c;     /* elements between batch slices of C */
+    int     tuning_config; /* 0=heuristic(default), 1=naive, 2=tiled, 3=warp, 4=tensor_core */
 } matmul_params_t;
 
 /* Tile size for CUDA shared memory tiling */
