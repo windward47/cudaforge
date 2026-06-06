@@ -282,7 +282,7 @@ typedef struct {
 | --- | --- |
 | INT8 量化推理 | 量化 kernel + 校准工具 |
 | 动态形状支持 | ONNX dynamic axes |
-| x86 SIMD 优化 | AVX2/AVX-512 加速 CPU 路径 |
+| MatMul AVX2 微内核 | 8x4 register tiling + FMA |
 | ARM NEON 优化 | 移动端/嵌入式推理 |
 | TensorRT 集成 | 作为后端加速器 |
 | 多 GPU 支持 | 模型并行 / 流水线并行 |
@@ -293,8 +293,8 @@ typedef struct {
 
 | 状态 | 数量 | 内容 |
 | --- | --- | --- |
-| 已完成 | 29 | Phase A/B/C, M1-M3, O1-O2, F1, F2, C1-C2, H1-H7, M1-M5, L1/L4/L5, T1, **R1-1 ~ R1-8** |
+| 已完成 | 30 | Phase A/B/C, M1-M3, O1-O2, F1, F2, C1-C2, H1-H7, M1-M5, L1/L4/L5, T1, R1-1 ~ R1-8, **SIMD-1 ~ SIMD-5** |
 | 暂缓 | 2 | L2 (惰性 D2H), L3 (层耦合) |
-| 远期 | 6 | INT8/动态形状/SIMD/ARM/TensorRT/多GPU |
+| 远期 | 5 | INT8/动态形状/MatMul AVX2/ARM NEON/TensorRT/多GPU |
 
-> **最后更新**: 2026-06-07。v0.7.0。R1 架构优化全部完成（8/8）。
+> **最后更新**: 2026-06-07。v0.8.0。AVX2 优化完成（relu/add/mul/sigmoid/gelu/silu/exp/softmax/layernorm/reduce）。

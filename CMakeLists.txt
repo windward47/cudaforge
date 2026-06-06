@@ -173,6 +173,28 @@ target_include_directories(operator PRIVATE
 
 target_link_libraries(operator PUBLIC platform)
 
+# x86 SIMD 优化：AVX2 / AVX-512
+# 仅对 C 源文件生效，不影响 nvcc 编译的 .cu 文件
+if(ENABLE_AVX2)
+    target_compile_definitions(operator PRIVATE USE_AVX2)
+    if(MSVC)
+        target_compile_options(operator PRIVATE $<$<COMPILE_LANGUAGE:C>:/arch:AVX2>)
+    else()
+        target_compile_options(operator PRIVATE $<$<COMPILE_LANGUAGE:C>:-mavx2 -mfma>)
+    endif()
+    message(STATUS "AVX2 optimizations enabled for operator library")
+endif()
+
+if(ENABLE_AVX512)
+    target_compile_definitions(operator PRIVATE USE_AVX512)
+    if(MSVC)
+        target_compile_options(operator PRIVATE $<$<COMPILE_LANGUAGE:C>:/arch:AVX2>)
+    else()
+        target_compile_options(operator PRIVATE $<$<COMPILE_LANGUAGE:C>:-mavx512f -mfma>)
+    endif()
+    message(STATUS "AVX-512 optimizations enabled for operator library")
+endif()
+
 # ============================================================
 # Application layer (static library / executable)
 # ============================================================

@@ -80,6 +80,10 @@ cmake --build build --config Release -j$(nproc)
 cmake -B build -DENABLE_CUDA=OFF -DENABLE_TESTS=ON
 cmake --build build -j$(nproc)
 
+# === AVX2 优化模式 ===
+cmake -B build-avx2 -G "Visual Studio 17 2022" -A x64 -DENABLE_CUDA=ON -DENABLE_TESTS=ON -DENABLE_AVX2=ON
+cmake --build build-avx2 --config Release -j$(nproc)
+
 # === 运行测试 ===
 ctest --test-dir build -C Release -j$(nproc)
 
