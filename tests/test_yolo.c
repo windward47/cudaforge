@@ -17,7 +17,7 @@
 
 #ifdef USE_CUDA
 #include "cuda_platform.h"
-#include <cuda_runtime.h>
+#include "cuda_ops.h"
 #endif
 #include <time.h>
 

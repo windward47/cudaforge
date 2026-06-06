@@ -6,7 +6,7 @@
 #include <stdlib.h>
 #include <stdint.h>
 
-#ifdef __CUDACC__
+#if defined(__CUDACC__) || defined(USE_CUDA)
 #include <cuda_runtime.h>
 #endif
 
@@ -18,9 +18,9 @@ extern "C" {
 #define OPS_THREADS_PER_BLOCK 256
 
 /* --------------------------------------------------------------------------
- *  CUDA error check — only meaningful when compiled by nvcc
+ *  CUDA error check — meaningful when CUDA headers are available
  * -------------------------------------------------------------------------- */
-#ifdef __CUDACC__
+#if defined(__CUDACC__) || defined(USE_CUDA)
 /* CUDA error check — logs error and returns error code (non-fatal) */
 #define CUDA_CHECK(call) \
     do { \
@@ -38,7 +38,7 @@ extern "C" {
 /* --------------------------------------------------------------------------
  *  CUDA types — when compiled by the host C compiler, use forward decls
  * -------------------------------------------------------------------------- */
-#ifndef __CUDACC__
+#if !defined(__CUDACC__) && !defined(USE_CUDA)
 typedef void* cudaStream_t;
 struct cudaDeviceProp;
 #endif
