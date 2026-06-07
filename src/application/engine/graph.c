@@ -630,9 +630,11 @@ static int detect_and_fuse_mha(inference_graph_t* g, int* fused_skip,
         fp->seq_len      = S;
         fp->hidden_size  = D;
         fp->num_heads    = H;
+        fp->num_kv_heads = H;   /* default: no GQA (H_kv = H_q) */
         fp->head_dim     = d;
         fp->scale        = 1.0f / sqrtf((float)d);
         fp->has_residual = (residual_tid >= 0);
+        fp->causal       = 0;   /* default: bidirectional (BERT-style) */
         target->params      = fp;
         target->params_size = sizeof(mha_fused_params_t);
         target->type        = OP_MHA_FUSED;

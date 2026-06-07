@@ -2,165 +2,206 @@
 #include "cuda_ops.h"
 #include "mha_fused_int.h"
 
-/* Maximum head_dim supported (BERT-base uses 64). */
-#define MHA_MAX_D       64
-/* Maximum S for direct shared-memory K/V fit. */
-#define MHA_MAX_S_SMEM  64
-
 /* ============================================================
- * Fused MHA kernel — one block per (batch, query_position)
+ * Flash Attention Fused MHA Kernel (FP32)
  *
- * grid  = (B * S, 1, 1)
- * block = (256, 1, 1)
+ * Design:
+ *   - Grid: one block per (batch, query_position)
+ *   - K/V computed per-head per-tile into shared memory
+ *   - Tiled softmax accumulation (online softmax)
+ *   - Supports arbitrary sequence length via tiling
+ *   - GQA and causal mask support
  *
- * M2 optimizations (QKV projection fusion):
- *   - Q computed in single pass over D: loads X once, accumulates
- *     all D output positions → 4x fewer X reads for Q projection
- *   - K/V inner loops merged: loads X once, computes both K and V
- *     → 33% fewer X reads for K/V projection
- *   - All heads' weights stay in L2 cache across blocks
+ * Shared memory layout:
+ *   K_smem[256 * d]  — Q broadcast + out_acc reduction workspace
+ *   V_smem[BC * d]   — V tile (BC = 64)
+ *   scores[BC]       — attention scores for current tile
+ *   red[256]         — reduction buffer
  * ============================================================ */
-__global__ void mha_fused_kernel(
-    const float* __restrict__ X,      /* (B, S, D) */
-    const float* __restrict__ WQ,     /* (D, D) */
-    const float* __restrict__ bQ,     /* (D,) */
-    const float* __restrict__ WK,     /* (D, D) */
-    const float* __restrict__ bK,     /* (D,) */
-    const float* __restrict__ WV,     /* (D, D) */
-    const float* __restrict__ bV,     /* (D,) */
-    const float* __restrict__ WO,     /* (D, D) */
-    const float* __restrict__ bO,     /* (D,) */
-    float* __restrict__ Y,            /* (B, S, D) */
-    const float* __restrict__ R,      /* (B, S, D) residual, may be NULL */
-    int64_t B, int64_t S, int64_t D, int64_t H, int64_t d,
-    float scale, int has_residual)
+
+__global__ void mha_flash_attn_kernel(
+    const float* __restrict__ X,
+    const float* __restrict__ WQ,
+    const float* __restrict__ bQ,
+    const float* __restrict__ WK,
+    const float* __restrict__ bK,
+    const float* __restrict__ WV,
+    const float* __restrict__ bV,
+    const float* __restrict__ WO,
+    const float* __restrict__ bO,
+    float* __restrict__ Y,
+    const float* __restrict__ R,
+    int64_t B, int64_t S, int64_t D, int64_t H_q, int64_t H_kv, int64_t d,
+    float scale, int has_residual, int causal)
 {
-    int bs = blockIdx.x;           /* flat: b * S + si */
-    int b  = bs / (int)S;
-    int si = bs % (int)S;
-    int tid = threadIdx.x;
-    int num_threads = blockDim.x;
+    const int bs = blockIdx.x;
+    const int b  = bs / (int)S;
+    const int si = bs % (int)S;
+    const int tid = threadIdx.x;
+    const int NT = blockDim.x;
 
-    if (b >= B) return;
+    if (b >= (int)B) return;
 
-    const float* X_b  = X + b * S * D;
-    float*       Y_bs = Y + (b * S + si) * D;
-    const float* R_bs = (has_residual && R) ? (R + (b * S + si) * D) : NULL;
+    const int S_int = (int)S;
+    const int D_int = (int)D;
+    const int d_int = (int)d;
+    const int H_q_int = (int)H_q;
+    const int H_kv_int = (int)H_kv;
+    const int group_size = H_q_int / H_kv_int;
+    const int BC = 64;
 
-    /* Dynamic shared memory:
-       K_smem[S*H*d] + V_smem[S*H*d]
-       BERT-base: 2*8*12*64*4 = 48KB (within default 48KB limit) */
+    const float* X_b  = X + (int64_t)b * S_int * D_int;
+    float*       Y_bs = Y + ((int64_t)b * S_int + si) * D_int;
+    const float* R_bs = (has_residual && R) ? (R + ((int64_t)b * S_int + si) * D_int) : NULL;
+
+    /* Shared memory layout */
     extern __shared__ float smem[];
-    float* K_smem = smem;
-    float* V_smem = smem + (int)(S * H * d);
+    float* K_smem = smem;                         /* 256 * d_int */
+    float* V_smem = smem + NT * d_int;            /* BC * d_int */
+    float* scores = smem + (NT + BC) * d_int;     /* BC */
+    float* red    = smem + (NT + BC) * d_int + BC; /* NT */
 
-    /* ---- Precompute K, V for ALL heads into shared memory ----
-       Single pass over S*H*d elements, each thread handles multiple (sj, h, dk).
-       M2: K and V inner loops merged — loads X once, computes both. */
-    int total_kv = (int)(S * H * d);
-    for (int i = tid; i < total_kv; i += num_threads) {
-        int dk = i % (int)d;
-        int tmp = i / (int)d;
-        int h  = tmp % (int)H;
-        int sj = tmp / (int)H;
-        int head_offset = h * (int)d;
-
-        float k_acc = 0.0f, v_acc = 0.0f;
-        for (int j = 0; j < (int)D; j++) {
-            float xv = X_b[sj * D + j];
-            k_acc += xv * WK[j * D + head_offset + dk];
-            v_acc += xv * WV[j * D + head_offset + dk];
-        }
-        K_smem[i] = k_acc + (bK ? bK[head_offset + dk] : 0.0f);
-        V_smem[i] = v_acc + (bV ? bV[head_offset + dk] : 0.0f);
-    }
-    __syncthreads();
-
-    /* Initialize output for this query position */
-    for (int j = tid; j < (int)D; j += num_threads) {
+    /* ---- Initialize output with bias + residual ---- */
+    for (int j = tid; j < D_int; j += NT) {
         float val = (bO ? bO[j] : 0.0f);
         if (R_bs) val += R_bs[j];
         Y_bs[j] = val;
     }
     __syncthreads();
 
-    /* ---- Tiled attention for each head ---- */
+    /* ---- Per-head attention ---- */
+    for (int h = 0; h < H_q_int; h++) {
+        const int head_offset = h * d_int;
+        const int kv_h = h / group_size;
+        const int kv_head_offset = kv_h * d_int;
 
-    /* ---- Tiled attention for each head ---- */
-    int S_int = (int)S;
-    int d_int = (int)d;
-    int D_int = (int)D;
-    int H_d   = (int)(H * d);
-
-    for (int h = 0; h < (int)H; h++) {
-        int head_offset = h * d_int;
-
-        /* ---- Compute Q_h[si, :] into registers ----
-           M2: restructured to load X once per D iteration. */
-        float Q_reg[MHA_MAX_D];
-        for (int di = 0; di < d_int; di++) {
+        /* ---- Compute Q_h[si, :] cooperatively ---- */
+        for (int di = tid; di < d_int; di += NT) {
             float acc = 0.0f;
             for (int j = 0; j < D_int; j++) {
                 acc += X_b[si * D_int + j] * WQ[j * D_int + head_offset + di];
             }
-            Q_reg[di] = acc + (bQ ? bQ[head_offset + di] : 0.0f);
+            K_smem[di] = acc + (bQ ? bQ[head_offset + di] : 0.0f);
         }
+        __syncthreads();
 
-        /* Online softmax attention */
+        /* Copy Q to registers */
+        float Q_reg[FA_MAX_D];
+        for (int di = 0; di < d_int; di++)
+            Q_reg[di] = K_smem[di];
+        __syncthreads();
+
+        /* ---- Online softmax attention ---- */
         float max_val = -1e38f;
         float sum_val = 0.0f;
-        float out_acc[MHA_MAX_D] = {0.0f};
+        float out_acc[FA_MAX_D];
+        for (int di = 0; di < d_int; di++) out_acc[di] = 0.0f;
 
-        int num_kv_tiles = (S_int + MHA_MAX_S_SMEM - 1) / MHA_MAX_S_SMEM;
+        int causal_limit = causal ? (si + 1) : S_int;
+        int num_kv_tiles = (causal_limit + BC - 1) / BC;
 
         for (int kt = 0; kt < num_kv_tiles; kt++) {
-            int sj_start = kt * MHA_MAX_S_SMEM;
-            int sj_end   = min(sj_start + MHA_MAX_S_SMEM, S_int);
-            int tile_s   = sj_end - sj_start;
+            int kv_start = kt * BC;
+            int kv_end   = min(kv_start + BC, causal_limit);
+            int tile_s   = kv_end - kv_start;
 
-            /* Compute scores for this tile */
-            float tile_scores[MHA_MAX_S_SMEM];
-            float tile_max = -1e38f;
-            for (int sk = 0; sk < tile_s; sk++) {
-                float dot = 0.0f;
-                int k_idx = (sj_start + sk) * H_d + head_offset;
-                for (int di = 0; di < d_int; di++) {
-                    dot += Q_reg[di] * K_smem[k_idx + di];
+            /* ---- K/V projection into shared memory ---- */
+            for (int i = tid; i < tile_s * d_int; i += NT) {
+                int sk = i / d_int;
+                int dk = i % d_int;
+                int gp = kv_start + sk;
+
+                float k_acc = 0.0f, v_acc = 0.0f;
+                for (int j = 0; j < D_int; j++) {
+                    float xv = X_b[gp * D_int + j];
+                    k_acc += xv * WK[j * D_int + kv_head_offset + dk];
+                    v_acc += xv * WV[j * D_int + kv_head_offset + dk];
                 }
-                tile_scores[sk] = dot * scale;
-                if (tile_scores[sk] > tile_max) tile_max = tile_scores[sk];
+                K_smem[sk * d_int + dk] = k_acc + (bK ? bK[kv_head_offset + dk] : 0.0f);
+                V_smem[sk * d_int + dk] = v_acc + (bV ? bV[kv_head_offset + dk] : 0.0f);
             }
+            __syncthreads();
 
-            /* Online softmax: rescale previous accumulators */
+            /* ---- Compute scores ---- */
+            float tile_max = -1e38f;
+            for (int sk = tid; sk < tile_s; sk += NT) {
+                float dot = 0.0f;
+                for (int di = 0; di < d_int; di++)
+                    dot += Q_reg[di] * K_smem[sk * d_int + di];
+                float s = dot * scale;
+                if (causal && (kv_start + sk) > si) s = -1e38f;
+                scores[sk] = s;
+                if (s > tile_max) tile_max = s;
+            }
+            __syncthreads();
+
+            /* ---- Tile max reduction ---- */
+            red[tid] = tile_max;
+            __syncthreads();
+            for (int stride = NT / 2; stride > 0; stride >>= 1) {
+                if (tid < stride && red[tid + stride] > red[tid])
+                    red[tid] = red[tid + stride];
+                __syncthreads();
+            }
+            tile_max = red[0];
+            __syncthreads();
+
+            /* ---- Online softmax rescale ---- */
             if (tile_max > max_val) {
-                float rescale = __expf(max_val - tile_max);
+                float rescale = expf(max_val - tile_max);
                 sum_val *= rescale;
                 for (int di = 0; di < d_int; di++) out_acc[di] *= rescale;
                 max_val = tile_max;
             }
 
-            /* Accumulate exp(scores) and weighted V */
-            for (int sk = 0; sk < tile_s; sk++) {
-                float p = __expf(tile_scores[sk] - max_val);
-                sum_val += p;
-                int v_idx = (sj_start + sk) * H_d + head_offset;
+            /* ---- Accumulate exp(scores - max) * V ---- */
+            float local_sum = 0.0f;
+            float local_acc[FA_MAX_D];
+            for (int di = 0; di < d_int; di++) local_acc[di] = 0.0f;
+
+            for (int sk = tid; sk < tile_s; sk += NT) {
+                float p = expf(scores[sk] - max_val);
+                local_sum += p;
+                for (int di = 0; di < d_int; di++)
+                    local_acc[di] += p * V_smem[sk * d_int + di];
+            }
+
+            /* ---- Reduce sum ---- */
+            red[tid] = local_sum;
+            __syncthreads();
+            for (int stride = NT / 2; stride > 0; stride >>= 1) {
+                if (tid < stride) red[tid] += red[tid + stride];
+                __syncthreads();
+            }
+            sum_val += red[0];
+
+            /* ---- Reduce out_acc (store per-thread, thread 0 sums) ---- */
+            for (int di = 0; di < d_int; di++)
+                K_smem[tid * d_int + di] = local_acc[di];
+            __syncthreads();
+
+            if (tid == 0) {
                 for (int di = 0; di < d_int; di++) {
-                    out_acc[di] += p * V_smem[v_idx + di];
+                    float acc = 0.0f;
+                    for (int t = 0; t < NT; t++)
+                        acc += K_smem[t * d_int + di];
+                    out_acc[di] += acc;
                 }
             }
             __syncthreads();
         }
 
-        /* Normalize and accumulate into output */
-        if (sum_val < 1e-12f) sum_val = 1e-12f;
-        float inv_sum = 1.0f / sum_val;
+        /* ---- Normalize and output projection (thread 0) ---- */
+        if (tid == 0) {
+            if (sum_val < 1e-12f) sum_val = 1e-12f;
+            float inv_sum = 1.0f / sum_val;
 
-        for (int j = tid; j < D_int; j += num_threads) {
-            float contrib = 0.0f;
-            for (int di = 0; di < d_int; di++) {
-                contrib += out_acc[di] * inv_sum * WO[(head_offset + di) * D_int + j];
+            for (int j = 0; j < D_int; j++) {
+                float contrib = 0.0f;
+                for (int di = 0; di < d_int; di++)
+                    contrib += out_acc[di] * inv_sum * WO[(head_offset + di) * D_int + j];
+                Y_bs[j] += contrib;
             }
-            Y_bs[j] += contrib;
         }
         __syncthreads();
     }
@@ -189,29 +230,36 @@ int mha_fused_f32_cuda(const void* inputs[], void* outputs[],
 
     cudaStream_t s = stream ? (cudaStream_t)stream->cuda_stream : 0;
 
-    int64_t B = p->batch_size;
-    int64_t S = p->seq_len;
-    int64_t D = p->hidden_size;
-    int64_t H = p->num_heads;
-    int64_t d = p->head_dim;
+    int64_t B    = p->batch_size;
+    int64_t S    = p->seq_len;
+    int64_t D    = p->hidden_size;
+    int64_t H_q  = p->num_heads;
+    int64_t H_kv = p->num_kv_heads > 0 ? p->num_kv_heads : H_q;
+    int64_t d    = p->head_dim;
 
     dim3 grid((unsigned int)(B * S), 1, 1);
     dim3 block(256, 1, 1);
 
-    /* K_smem[S*H*d] + V_smem[S*H*d] */
-    size_t smem_bytes = (size_t)(2 * S * H * d) * sizeof(float);
+    /* Shared memory: K_smem[256*d] + V_smem[64*d] + scores[64] + red[256] */
+    int NT = 256, BC = 64;
+    size_t smem_bytes = (size_t)((NT + BC) * d + BC + NT) * sizeof(float);
 
     int has_residual = p->has_residual && R ? 1 : 0;
+    int causal_mask  = p->causal ? 1 : 0;
 
-    return CUDA_KERNEL_LAUNCH(mha_fused_kernel, grid, block, smem_bytes, s,
+    cudaFuncSetAttribute(mha_flash_attn_kernel,
+                         cudaFuncAttributeMaxDynamicSharedMemorySize,
+                         (int)smem_bytes);
+
+    return CUDA_KERNEL_LAUNCH(mha_flash_attn_kernel, grid, block, smem_bytes, s,
         X, WQ, bQ, WK, bK, WV, bV, WO, bO, Y, R,
-        B, S, D, H, d, p->scale, has_residual);
+        B, S, D, H_q, H_kv, d, p->scale, has_residual, causal_mask);
 }
 
 extern "C" int register_mha_fused_f32_cuda(void) {
     static operator_registry_t reg = {
         .name = "mha_fused_f32_cuda", .data_type = "f32",
-        .func = mha_fused_f32_cuda, .version = 1, .flags = OP_FLAG_NONE,
+        .func = mha_fused_f32_cuda, .version = 2, .flags = OP_FLAG_NONE,
     };
     return operator_register(&reg);
 }
