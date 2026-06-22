@@ -1,12 +1,12 @@
 # CudaForge Todo List
 
-> 基于 [CUDA-Agent](https://github.com/BytedTsinghua-SIA/CUDA-Agent)（字节+清华，RL 训练 CUDA kernel）和 [CUDAForge](https://github.com/)（Zijian Zhang，多 Agent LLM 优化 CUDA kernel）两个项目分析整合。旧版历史记录见 [TODO_LIST_20260607.md](TODO_LIST_20260607b.md)。
+> 基于 [CUDA-Agent](https://github.com/BytedTsinghua-SIA/CUDA-Agent)（RL 训练 CUDA kernel）、[CUDAForge](https://github.com/)（多 Agent LLM 优化）、[ggml](https://github.com/ggml-org/ggml)（量化推理引擎）三个项目分析整合。旧版历史记录见 [TODO_LIST_20260607b.md](TODO_LIST_20260607b.md)。参考项目见 `ggml-ref/`、`CUDA-Agent-main/`。
 
 ---
 
 ## 当前状态
 
-**v0.7.0** — 36 种算子 CPU+CUDA 双实现（含 15 个 FP16 kernel），35/35 测试通过，R1 架构优化全部完成。
+**v0.9.0** — 36 种算子 CPU+CUDA 双实现（含 15 个 FP16 kernel），35/35 测试通过，AVX2 + Flash Attention 完成。
 
 | 指标 | 数值 |
 | --- | --- |
@@ -276,16 +276,126 @@ typedef struct {
 
 ---
 
+## R2: ggml 借鉴优化
+
+> 参考 [ggml](https://github.com/ggml-org/ggml) 的量化系统、算子融合、CUDA Graph、VMM 内存池等设计模式。
+> 参考项目已下载到 `ggml-ref/` 目录。
+
+### R2-1: INT8 量化推理 ⭐⭐⭐
+
+**来源**：ggml 的 42 种量化类型 + block quantization 设计。
+
+**目标**：权重 INT8 量化，显存减半，推理速度提升。
+
+**方案**：实现 `DATA_TYPE_I8` block quantization（每 128 个 float 一组，1 字节 scale + 128 字节量化值）。
+
+| # | 任务 | 文件 | 说明 |
+| --- | --- | --- | --- |
+| R2-1a | 定义 INT8 block 结构 | `src/platform/include/data_type.h` | `block_q8_0 { float scale; int8_t qs[128]; }` |
+| R2-1b | CPU 量化/反量化 | `src/operator/nn/quantize.c` | `quantize_f32_to_q8()`, `dequantize_q8_to_f32()` |
+| R2-1c | CUDA 量化 kernel | `src/operator/nn/quantize_cuda.cu` | GPU 侧量化 |
+| R2-1d | INT8 MatMul kernel | `src/operator/blas/matmul_q8_cuda.cu` | INT8×INT8 → FP32 累加 |
+| R2-1e | ONNX loader 量化支持 | `src/application/model/onnx_loader.c` | 加载时自动量化权重 |
+| R2-1f | 精度测试 | `tests/test_quantize.c` | INT8 vs FP32 精度对比 |
+
+### R2-2: 算子融合扩展 ⭐⭐⭐
+
+**来源**：ggml 的 10+ 种融合模式（MatMul+bias, RMSNorm+Mul+Add, SwiGLU 等）。
+
+**目标**：减少 kernel launch 次数和显存往返。
+
+**当前已实现**：Conv+Activation, MHA Fused。
+
+**新增融合**：
+
+| # | 融合模式 | 节省 | 说明 |
+| --- | --- | --- | --- |
+| R2-2a | MatMul + Add(bias) | 1 次 kernel launch + 1 次显存读写 | 参考 ggml `GGML_OP_MUL_MAT` bias 融合 |
+| R2-2b | LayerNorm + Mul(scale) + Add(residual) | 2 次 kernel launch | 参考 ggml `RMS_NORM + MUL + ADD` 融合 |
+| R2-2c | SiLU + Mul (SwiGLU gate) | 1 次 kernel launch | 参考 ggml `UNARY(SILU) + MUL` 融合 |
+| R2-2d | GELU + Mul (GeGLU gate) | 1 次 kernel launch | 同上，GELU 变体 |
+
+### R2-3: Warp-level 归约原语库 ⭐⭐
+
+**来源**：ggml `common.cuh` 的 `warp_reduce_sum()`, `warp_reduce_max()`, `block_reduce()` 模板。
+
+**目标**：统一 warp/block 归约接口，消除各算子中的重复实现。
+
+| # | 任务 | 文件 | 说明 |
+| --- | --- | --- | --- |
+| R2-3a | 创建 CUDA 归约原语 | `src/platform/cuda/cuda_reduce.cuh` | `warp_reduce_sum<T>()`, `warp_reduce_max<T>()`, `block_reduce<T>()` |
+| R2-3b | 重构现有算子使用 | `softmax_cuda.cu`, `layernorm_cuda.cu`, `reduce_cuda.cu` | 替换手写归约 |
+
+### R2-4: CUDA VMM 内存池 ⭐⭐
+
+**来源**：ggml 的 `ggml_cuda_pool_vmm`（虚拟内存管理池）。
+
+**目标**：消除 `cudaMalloc` 开销，推理时零分配。
+
+**方案**：预留 32GB 虚拟地址空间，按需映射物理页，LIFO 释放。
+
+| # | 任务 | 文件 | 说明 |
+| --- | --- | --- | --- |
+| R2-4a | 实现 VMM 池 | `src/platform/cuda/cuda_vmm_pool.cu` | `cuMemCreate` + `cuMemMap` + `cuMemSetAccess` |
+| R2-4b | 集成到 `g_cuda.device_alloc` | `src/platform/cuda/cuda_memory.cu` | 优先从 VMM 池分配 |
+| R2-4c | 显存池 benchmark | `tests/bench_mem_pool.cu` | 对比 cudaMalloc vs VMM 池 |
+
+### R2-5: CUDA Graph 集成 ⭐
+
+**来源**：ggml 的 `ggml_cuda_graph`（图捕获 + 重放）。
+
+**目标**：重复推理时减少 kernel launch 开销。
+
+| # | 任务 | 文件 | 说明 |
+| --- | --- | --- | --- |
+| R2-5a | graph_execute 支持 CUDA Graph 捕获 | `src/application/engine/graph.c` | `cudaStreamBeginCapture` / `cudaGraphLaunch` |
+| R2-5b | 图缓存管理 | `src/application/engine/graph_cache.c` | 按 input shape 缓存 CUDA Graph |
+
+### R2-6: Flash Attention FP16 优化 ⭐
+
+**来源**：ggml 的 3 种 Flash Attention 内核族（MMA/vec/tile）。
+
+**目标**：FP16 prefill 使用 Tensor Core MMA 加速。
+
+| # | 任务 | 文件 | 说明 |
+| --- | --- | --- | --- |
+| R2-6a | MMA Flash Attention FP16 | `mha_fused_f16_cuda.cu` | 使用 `nvcuda::wmma` 替代手动 FP16 计算 |
+| R2-6b | 与 FP32 混合调度集成 | `mha_fused_cuda.cu` | S≤64 预加载, S>64 Flash Attention, 均支持 FP16 |
+
+### R2-7: Flash Attention v2 参考优化 ⭐⭐⭐
+
+**来源**：`flash-attention-main/` 官方 FA2 实现（Tri Dao）。
+
+**目标**：参考官方 FA2 的 tiling/softmax/归约策略，优化 `mha_fused_cuda.cu` 的 FP32 Flash Attention kernel。当前实现每个 block 只处理 1 行 Q，且用 smem 做全局归约，与官方差距 2-5×。
+
+**参考文件**：
+
+- `flash-attention-main/csrc/flash_attn/src/kernel_traits.h` — tiling 配置
+- `flash-attention-main/csrc/flash_attn/src/softmax.h` — warp-level online softmax
+- `flash-attention-main/csrc/flash_attn/src/flash_fwd_kernel.h` — forward kernel
+- `flash-attention-main/csrc/flash_attn/src/flash_fwd_launch_template.h` — dispatch
+
+| # | 任务 | 文件 | 优先级 | 预期收益 | 说明 |
+| --- | --- | --- | --- | --- | --- |
+| R2-7a | 二维 Tiling | `mha_fused_cuda.cu`, `mha_fused_int.h` | P0 | 2-5× | grid 改为 `(S/kBlockM, B, H_q)`，每 block 处理 kBlockM=64 行 Q |
+| R2-7b | Warp-level 归约 | 新建 `cuda_reduce.cuh`, 修改 `mha_fused_cuda.cu` | P1 | 1.3-1.5× | `warp_reduce_sum/max` 替代 smem 归约 |
+| R2-7c | exp2f 优化 | `mha_fused_cuda.cu` | P1 | 1.1-1.2× | `exp2f(x*log2e)` 替代 `expf(x)` |
+| R2-7d | K/V 预计算 + 全局内存加载 | `mha_fused_cuda.cu` | P2 | 避免重复投影 | K/V 只计算一次存入 global buffer，attention kernel 直接读取 |
+| R2-7e | Split-KV 长序列 | `mha_fused_cuda.cu` | P3 | S>512 时并行 | K/V 分割成多份并行计算 + LSE 加权合并 |
+
+> ✅ **R2-7 全部完成** — warp 归约 + exp2f + K/V 预计算 + Split-KV 长序列。35/35 测试通过。
+
+---
+
 ## 远期规划
 
-| 方向 | 说明 |
-| --- | --- |
-| INT8 量化推理 | 量化 kernel + 校准工具 |
-| 动态形状支持 | ONNX dynamic axes |
-| MatMul AVX2 微内核 | 8x4 register tiling + FMA |
-| ARM NEON 优化 | 移动端/嵌入式推理 |
-| TensorRT 集成 | 作为后端加速器 |
-| 多 GPU 支持 | 模型并行 / 流水线并行 |
+| 方向 | 来源 | 说明 |
+| --- | --- | --- |
+| MatMul AVX2 微内核 | CudaForge | 8x4 register tiling + FMA |
+| ARM NEON 优化 | — | 移动端/嵌入式推理 |
+| 多 GPU 支持 | ggml | 模型并行 / 流水线并行 |
+| CUDA Graph 调度 | ggml | 图捕获 + 重放 |
+| 模板实例化生成 | ggml | Python 脚本自动生成 .cu 实例化文件 |
 
 ---
 
@@ -293,8 +403,9 @@ typedef struct {
 
 | 状态 | 数量 | 内容 |
 | --- | --- | --- |
-| 已完成 | 30 | Phase A/B/C, M1-M3, O1-O2, F1, F2, C1-C2, H1-H7, M1-M5, L1/L4/L5, T1, R1-1 ~ R1-8, **SIMD-1 ~ SIMD-5** |
+| 已完成 | 35 | Phase A/B/C, M1-M3, O1-O2, F1, F2, C1-C2, H1-H7, M1-M5, L1/L4/L5, T1, R1-1 ~ R1-8, SIMD-1 ~ SIMD-5, Flash Attention, R2-7 |
 | 暂缓 | 2 | L2 (惰性 D2H), L3 (层耦合) |
-| 远期 | 5 | INT8/动态形状/MatMul AVX2/ARM NEON/TensorRT/多GPU |
+| 计划中 | 6 | R2-1 ~ R2-6 |
+| 远期 | 5 | AVX2 微内核/ARM NEON/多GPU/CUDA Graph/模板生成 |
 
-> **最后更新**: 2026-06-07。v0.8.0。AVX2 优化完成（relu/add/mul/sigmoid/gelu/silu/exp/softmax/layernorm/reduce）。
+> **最后更新**: 2026-06-22。Flash Attention v2 参考优化全部完成（warp 归约 + exp2f + K/V 预计算 + Split-KV 长序列）。

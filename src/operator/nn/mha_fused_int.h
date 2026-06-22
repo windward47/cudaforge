@@ -16,9 +16,26 @@ typedef struct {
     bool    causal;           /* true = decoder causal mask (upper triangle masked) */
 } mha_fused_params_t;
 
-/* Flash Attention tile size: K/V tile rows loaded from global memory */
-#define FA_TILE_BR  64   /* query tile rows (not used in current 1-query-per-block design) */
-#define FA_TILE_BC  64   /* K/V tile columns (tile size for K/V loading) */
+/* Flash Attention v2 tile sizes (reference: flash-attention-main/csrc/flash_attn/src/kernel_traits.h)
+ *
+ * FA_TILE_BM: Q tile rows per block (each block processes this many query rows)
+ * FA_TILE_BN: K/V tile columns per block (each iteration loads this many K/V rows)
+ * FA_MAX_D:   maximum head dimension (limited by register/smem pressure)
+ *
+ * Grid layout: (ceil(S / FA_TILE_BM), B, H_q)
+ * Each block handles FA_TILE_BM query rows against all K/V tiles.
+ */
+#define FA_TILE_BM  64   /* query tile rows per block */
+#define FA_TILE_BN  64   /* K/V tile rows per iteration */
 #define FA_MAX_D    64   /* maximum head dimension */
+
+/* Warp/block config for Flash Attention kernel */
+#define FA_NUM_WARPS  4   /* number of warps per block (4 × 32 = 128 threads) */
+#define FA_NUM_THREADS (FA_NUM_WARPS * 32)  /* 128 threads per block */
+
+/* Max K/V positions a single thread can handle per tile:
+ *   ceil(FA_TILE_BN / FA_NUM_THREADS) — currently ceil(64/128) = 1
+ *   +1 for safety when tile_n is not a multiple of FA_NUM_THREADS */
+#define FA_MAX_SCORES_PER_THREAD (FA_TILE_BN / FA_NUM_THREADS + 1)
 
 #endif /* MHA_FUSED_INT_H_ */

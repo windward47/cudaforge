@@ -1,34 +1,103 @@
 #include "operator.h"
 #include "cuda_ops.h"
 #include "mha_fused_int.h"
+#include "cuda_reduce.cuh"
+#include <math.h>
 
 /* ============================================================
  * Hybrid MHA Dispatch:
- *   S <= 64:  Preloaded K/V kernel (fast, all K/V in smem)
- *   S > 64:   Flash Attention kernel (tiled K/V from global mem)
+ *   S <= 64:    Preloaded K/V kernel (all K/V in smem)
+ *   64 < S <= 512: Flash Attention v2 kernel (single pass)
+ *   S > 512:    Flash Attention v2 Split-KV kernel
  *
- * Both kernels support GQA and causal masking.
+ * Reference: flash-attention-main/csrc/flash_attn/src/flash_fwd_kernel.h
  * ============================================================ */
 
+#define LOG2E_F 1.44269504088896341f
+
+/* Threshold for enabling Split-KV */
+#define FA_SPLITKV_THRESHOLD 512
+
 /* ============================================================
- * Kernel 1: Preloaded K/V (original, fast for short sequences)
- *
- * All K/V for ALL heads loaded into shared memory upfront.
- * Shared memory: 2 * S * H * d floats
- * Max S ≈ 64 for BERT-base (H=12, d=64) within 48 KB limit.
+ * Kernel 0a: Pre-compute K, V for all positions.
+ * K_buf[b, sj, kv_h, dk] = X[b,sj,:] · WK[:, kv_h*d+dk] + bK[...]
+ * V_buf[b, sj, kv_h, dk] = X[b,sj,:] · WV[:, kv_h*d+dk] + bV[...]
+ * Grid: (B*S, H_kv, 1), Block: (256)
+ * ============================================================ */
+__global__ void mha_precompute_kv_kernel(
+    const float* __restrict__ X,
+    const float* __restrict__ WK, const float* __restrict__ bK,
+    const float* __restrict__ WV, const float* __restrict__ bV,
+    float* __restrict__ K_buf, float* __restrict__ V_buf,
+    int64_t B, int64_t S, int64_t D, int64_t H_kv, int64_t d)
+{
+    const int bs = blockIdx.x;
+    const int b  = bs / (int)S;
+    const int sj = bs % (int)S;
+    const int kv_h = blockIdx.y;
+    const int tid = threadIdx.x;
+    if (b >= (int)B || kv_h >= (int)H_kv) return;
+
+    const int S_int = (int)S, D_int = (int)D, d_int = (int)d;
+    const int kv_ho = kv_h * d_int;
+    const float* x = X + ((int64_t)b * S_int + sj) * D_int;
+    float* k_out = K_buf + (((int64_t)b * S_int + sj) * (int)H_kv + kv_h) * d_int;
+    float* v_out = V_buf + (((int64_t)b * S_int + sj) * (int)H_kv + kv_h) * d_int;
+
+    for (int dk = tid; dk < d_int; dk += 256) {
+        float k_acc = 0.0f, v_acc = 0.0f;
+        for (int j = 0; j < D_int; j++) {
+            float xv = x[j];
+            k_acc += xv * WK[j * D_int + kv_ho + dk];
+            v_acc += xv * WV[j * D_int + kv_ho + dk];
+        }
+        k_out[dk] = k_acc + (bK ? bK[kv_ho + dk] : 0.0f);
+        v_out[dk] = v_acc + (bV ? bV[kv_ho + dk] : 0.0f);
+    }
+}
+
+/* ============================================================
+ * Kernel 0b: Pre-compute Q for all positions.
+ * Q_buf[b, sj, h, dk] = X[b,sj,:] · WQ[:, h*d+dk] + bQ[h*d+dk]
+ * Grid: (B*S, H_q, 1), Block: (256)
+ * ============================================================ */
+__global__ void mha_precompute_q_kernel(
+    const float* __restrict__ X,
+    const float* __restrict__ WQ, const float* __restrict__ bQ,
+    float* __restrict__ Q_buf,
+    int64_t B, int64_t S, int64_t D, int64_t H_q, int64_t d)
+{
+    const int bs = blockIdx.x;
+    const int b  = bs / (int)S;
+    const int sj = bs % (int)S;
+    const int h  = blockIdx.y;
+    const int tid = threadIdx.x;
+    if (b >= (int)B || h >= (int)H_q) return;
+
+    const int S_int = (int)S, D_int = (int)D, d_int = (int)d;
+    const int ho = h * d_int;
+    const float* x = X + ((int64_t)b * S_int + sj) * D_int;
+    float* q_out = Q_buf + (((int64_t)b * S_int + sj) * (int)H_q + h) * d_int;
+
+    for (int dk = tid; dk < d_int; dk += 256) {
+        float acc = 0.0f;
+        for (int j = 0; j < D_int; j++)
+            acc += x[j] * WQ[j * D_int + ho + dk];
+        q_out[dk] = acc + (bQ ? bQ[ho + dk] : 0.0f);
+    }
+}
+
+
+/* ============================================================
+ * Kernel 1: Preloaded K/V (fast for short sequences S <= 64)
  * ============================================================ */
 __global__ void mha_preloaded_kernel(
     const float* __restrict__ X,
-    const float* __restrict__ WQ,
-    const float* __restrict__ bQ,
-    const float* __restrict__ WK,
-    const float* __restrict__ bK,
-    const float* __restrict__ WV,
-    const float* __restrict__ bV,
-    const float* __restrict__ WO,
-    const float* __restrict__ bO,
-    float* __restrict__ Y,
-    const float* __restrict__ R,
+    const float* __restrict__ WQ, const float* __restrict__ bQ,
+    const float* __restrict__ WK, const float* __restrict__ bK,
+    const float* __restrict__ WV, const float* __restrict__ bV,
+    const float* __restrict__ WO, const float* __restrict__ bO,
+    float* __restrict__ Y, const float* __restrict__ R,
     int64_t B, int64_t S, int64_t D, int64_t H_q, int64_t H_kv, int64_t d,
     float scale, int has_residual, int causal)
 {
@@ -37,14 +106,10 @@ __global__ void mha_preloaded_kernel(
     const int si = bs % (int)S;
     const int tid = threadIdx.x;
     const int NT = blockDim.x;
-
     if (b >= (int)B) return;
 
-    const int S_int = (int)S;
-    const int D_int = (int)D;
-    const int d_int = (int)d;
-    const int H_q_int = (int)H_q;
-    const int H_kv_int = (int)H_kv;
+    const int S_int = (int)S, D_int = (int)D, d_int = (int)d;
+    const int H_q_int = (int)H_q, H_kv_int = (int)H_kv;
     const int group_size = H_q_int / H_kv_int;
     const int H_d = H_kv_int * d_int;
 
@@ -56,27 +121,23 @@ __global__ void mha_preloaded_kernel(
     float* K_smem = smem;
     float* V_smem = smem + S_int * H_d;
 
-    /* ---- Precompute K, V for ALL KV heads into shared memory ---- */
-    int total_kv = S_int * H_d;
-    for (int i = tid; i < total_kv; i += NT) {
+    for (int i = tid; i < S_int * H_d; i += NT) {
         int dk = i % d_int;
         int tmp = i / d_int;
         int h  = tmp % H_kv_int;
         int sj = tmp / H_kv_int;
-        int kv_head_offset = h * d_int;
-
+        int kv_ho = h * d_int;
         float k_acc = 0.0f, v_acc = 0.0f;
         for (int j = 0; j < D_int; j++) {
             float xv = X_b[sj * D_int + j];
-            k_acc += xv * WK[j * D_int + kv_head_offset + dk];
-            v_acc += xv * WV[j * D_int + kv_head_offset + dk];
+            k_acc += xv * WK[j * D_int + kv_ho + dk];
+            v_acc += xv * WV[j * D_int + kv_ho + dk];
         }
-        K_smem[i] = k_acc + (bK ? bK[kv_head_offset + dk] : 0.0f);
-        V_smem[i] = v_acc + (bV ? bV[kv_head_offset + dk] : 0.0f);
+        K_smem[i] = k_acc + (bK ? bK[kv_ho + dk] : 0.0f);
+        V_smem[i] = v_acc + (bV ? bV[kv_ho + dk] : 0.0f);
     }
     __syncthreads();
 
-    /* Initialize output */
     for (int j = tid; j < D_int; j += NT) {
         float val = (bO ? bO[j] : 0.0f);
         if (R_bs) val += R_bs[j];
@@ -84,43 +145,37 @@ __global__ void mha_preloaded_kernel(
     }
     __syncthreads();
 
-    /* ---- Per-head attention ---- */
     for (int h = 0; h < H_q_int; h++) {
-        int head_offset = h * d_int;
+        int ho = h * d_int;
         int kv_h = h / group_size;
-        int kv_head_offset = kv_h * d_int;
+        int kv_ho = kv_h * d_int;
 
-        /* Compute Q_h[si, :] into registers */
         float Q_reg[FA_MAX_D];
         for (int di = 0; di < d_int; di++) {
             float acc = 0.0f;
             for (int j = 0; j < D_int; j++)
-                acc += X_b[si * D_int + j] * WQ[j * D_int + head_offset + di];
-            Q_reg[di] = acc + (bQ ? bQ[head_offset + di] : 0.0f);
+                acc += X_b[si * D_int + j] * WQ[j * D_int + ho + di];
+            Q_reg[di] = acc + (bQ ? bQ[ho + di] : 0.0f);
         }
 
-        /* Online softmax attention */
-        float max_val = -1e38f;
-        float sum_val = 0.0f;
+        float max_val = -1e38f, sum_val = 0.0f;
         float out_acc[FA_MAX_D] = {0.0f};
-
         int causal_limit = causal ? (si + 1) : S_int;
-        int num_kv_tiles = (causal_limit + 63) / 64;
+        int num_tiles = (causal_limit + FA_TILE_BN - 1) / FA_TILE_BN;
 
-        for (int kt = 0; kt < num_kv_tiles; kt++) {
-            int sj_start = kt * 64;
-            int sj_end   = min(sj_start + 64, causal_limit);
-            int tile_s   = sj_end - sj_start;
-
-            float tile_scores[64];
+        for (int kt = 0; kt < num_tiles; kt++) {
+            int sj0 = kt * FA_TILE_BN;
+            int tile_s = min(FA_TILE_BN, causal_limit - sj0);
             float tile_max = -1e38f;
+            float scores[FA_TILE_BN];
+
             for (int sk = 0; sk < tile_s; sk++) {
                 float dot = 0.0f;
-                int k_idx = (sj_start + sk) * H_d + kv_head_offset;
+                int k_idx = (sj0 + sk) * H_d + kv_ho;
                 for (int di = 0; di < d_int; di++)
                     dot += Q_reg[di] * K_smem[k_idx + di];
-                tile_scores[sk] = dot * scale;
-                if (tile_scores[sk] > tile_max) tile_max = tile_scores[sk];
+                scores[sk] = dot * scale;
+                if (scores[sk] > tile_max) tile_max = scores[sk];
             }
 
             if (tile_max > max_val) {
@@ -131,46 +186,39 @@ __global__ void mha_preloaded_kernel(
             }
 
             for (int sk = 0; sk < tile_s; sk++) {
-                float p = __expf(tile_scores[sk] - max_val);
+                float p = __expf(scores[sk] - max_val);
                 sum_val += p;
-                int v_idx = (sj_start + sk) * H_d + kv_head_offset;
+                int v_idx = (sj0 + sk) * H_d + kv_ho;
                 for (int di = 0; di < d_int; di++)
                     out_acc[di] += p * V_smem[v_idx + di];
             }
         }
 
-        /* Normalize and output projection */
         if (sum_val < 1e-12f) sum_val = 1e-12f;
         float inv_sum = 1.0f / sum_val;
-
         for (int j = tid; j < D_int; j += NT) {
             float contrib = 0.0f;
             for (int di = 0; di < d_int; di++)
-                contrib += out_acc[di] * inv_sum * WO[(head_offset + di) * D_int + j];
+                contrib += out_acc[di] * inv_sum * WO[(ho + di) * D_int + j];
             Y_bs[j] += contrib;
         }
         __syncthreads();
     }
 }
 
+
 /* ============================================================
- * Kernel 2: Flash Attention (for long sequences S > 64)
+ * Kernel 2: Flash Attention v2 (single pass, 64 < S <= 512)
  *
- * K/V computed per-head per-tile from global memory.
- * Shared memory independent of S.
+ * Uses pre-computed K_buf, V_buf.
+ * Grid: (B*S, 1, 1), Block: (FA_NUM_THREADS=128)
  * ============================================================ */
-__global__ void mha_flash_attn_kernel(
+__global__ void mha_flash_attn_v2_kernel(
     const float* __restrict__ X,
-    const float* __restrict__ WQ,
-    const float* __restrict__ bQ,
-    const float* __restrict__ WK,
-    const float* __restrict__ bK,
-    const float* __restrict__ WV,
-    const float* __restrict__ bV,
-    const float* __restrict__ WO,
-    const float* __restrict__ bO,
-    float* __restrict__ Y,
-    const float* __restrict__ R,
+    const float* __restrict__ WQ, const float* __restrict__ bQ,
+    const float* __restrict__ K_buf, const float* __restrict__ V_buf,
+    const float* __restrict__ WO, const float* __restrict__ bO,
+    float* __restrict__ Y, const float* __restrict__ R,
     int64_t B, int64_t S, int64_t D, int64_t H_q, int64_t H_kv, int64_t d,
     float scale, int has_residual, int causal)
 {
@@ -178,165 +226,151 @@ __global__ void mha_flash_attn_kernel(
     const int b  = bs / (int)S;
     const int si = bs % (int)S;
     const int tid = threadIdx.x;
-    const int NT = blockDim.x;
-
+    const int warp_id = tid / 32;
+    const int lane_id = tid % 32;
     if (b >= (int)B) return;
 
-    const int S_int = (int)S;
-    const int D_int = (int)D;
-    const int d_int = (int)d;
-    const int H_q_int = (int)H_q;
-    const int H_kv_int = (int)H_kv;
+    const int S_int = (int)S, D_int = (int)D, d_int = (int)d;
+    const int H_q_int = (int)H_q, H_kv_int = (int)H_kv;
     const int group_size = H_q_int / H_kv_int;
-    const int BC = 64;
+    const int num_warps = FA_NUM_THREADS / 32;
 
     const float* X_b  = X + (int64_t)b * S_int * D_int;
     float*       Y_bs = Y + ((int64_t)b * S_int + si) * D_int;
     const float* R_bs = (has_residual && R) ? (R + ((int64_t)b * S_int + si) * D_int) : NULL;
+    const int64_t kv_batch_stride = (int64_t)S_int * H_kv_int * d_int;
 
     extern __shared__ float smem[];
-    float* K_smem = smem;
-    float* V_smem = smem + NT * d_int;
-    float* scores = smem + (NT + BC) * d_int;
-    float* red    = smem + (NT + BC) * d_int + BC;
+    float* K_smem  = smem;
+    float* V_smem  = K_smem + FA_TILE_BN * d_int;
+    float* red_smem = V_smem + FA_TILE_BN * d_int;
 
-    /* Initialize output */
-    for (int j = tid; j < D_int; j += NT) {
+    for (int j = tid; j < D_int; j += FA_NUM_THREADS) {
         float val = (bO ? bO[j] : 0.0f);
         if (R_bs) val += R_bs[j];
         Y_bs[j] = val;
     }
     __syncthreads();
 
-    /* Per-head attention */
     for (int h = 0; h < H_q_int; h++) {
-        const int head_offset = h * d_int;
+        const int ho = h * d_int;
         const int kv_h = h / group_size;
-        const int kv_head_offset = kv_h * d_int;
+        const int kv_ho = kv_h * d_int;
 
-        /* Compute Q cooperatively */
-        for (int di = tid; di < d_int; di += NT) {
+        for (int di = tid; di < d_int; di += FA_NUM_THREADS) {
             float acc = 0.0f;
             for (int j = 0; j < D_int; j++)
-                acc += X_b[si * D_int + j] * WQ[j * D_int + head_offset + di];
-            K_smem[di] = acc + (bQ ? bQ[head_offset + di] : 0.0f);
+                acc += X_b[si * D_int + j] * WQ[j * D_int + ho + di];
+            K_smem[di] = acc + (bQ ? bQ[ho + di] : 0.0f);
         }
         __syncthreads();
 
         float Q_reg[FA_MAX_D];
-        for (int di = 0; di < d_int; di++)
-            Q_reg[di] = K_smem[di];
+        for (int di = 0; di < d_int; di++) Q_reg[di] = K_smem[di];
         __syncthreads();
 
-        /* Online softmax attention */
-        float max_val = -1e38f;
-        float sum_val = 0.0f;
+        float max_val = -1e38f, sum_val = 0.0f;
         float out_acc[FA_MAX_D];
         for (int di = 0; di < d_int; di++) out_acc[di] = 0.0f;
 
         int causal_limit = causal ? (si + 1) : S_int;
-        int num_kv_tiles = (causal_limit + BC - 1) / BC;
+        int num_tiles = (causal_limit + FA_TILE_BN - 1) / FA_TILE_BN;
 
-        for (int kt = 0; kt < num_kv_tiles; kt++) {
-            int kv_start = kt * BC;
-            int kv_end   = min(kv_start + BC, causal_limit);
-            int tile_s   = kv_end - kv_start;
+        for (int kt = 0; kt < num_tiles; kt++) {
+            int kv_start = kt * FA_TILE_BN;
+            int tile_n = min(FA_TILE_BN, causal_limit - kv_start);
 
-            /* K/V projection into shared memory */
-            for (int i = tid; i < tile_s * d_int; i += NT) {
+            const float* K_base = K_buf + (int64_t)b * kv_batch_stride + kv_ho;
+            const float* V_base = V_buf + (int64_t)b * kv_batch_stride + kv_ho;
+
+            for (int i = tid; i < tile_n * d_int; i += FA_NUM_THREADS) {
                 int sk = i / d_int;
                 int dk = i % d_int;
-                int gp = kv_start + sk;
-
-                float k_acc = 0.0f, v_acc = 0.0f;
-                for (int j = 0; j < D_int; j++) {
-                    float xv = X_b[gp * D_int + j];
-                    k_acc += xv * WK[j * D_int + kv_head_offset + dk];
-                    v_acc += xv * WV[j * D_int + kv_head_offset + dk];
-                }
-                K_smem[sk * d_int + dk] = k_acc + (bK ? bK[kv_head_offset + dk] : 0.0f);
-                V_smem[sk * d_int + dk] = v_acc + (bV ? bV[kv_head_offset + dk] : 0.0f);
+                int64_t offset = (int64_t)(kv_start + sk) * H_kv_int * d_int + dk;
+                K_smem[sk * d_int + dk] = K_base[offset];
+                V_smem[sk * d_int + dk] = V_base[offset];
             }
             __syncthreads();
 
-            /* Compute scores */
             float tile_max = -1e38f;
-            for (int sk = tid; sk < tile_s; sk += NT) {
+            int my_count = 0;
+            float my_scores[FA_MAX_SCORES_PER_THREAD];
+            int my_indices[FA_MAX_SCORES_PER_THREAD];
+
+            for (int sk = tid; sk < tile_n; sk += FA_NUM_THREADS) {
                 float dot = 0.0f;
                 for (int di = 0; di < d_int; di++)
                     dot += Q_reg[di] * K_smem[sk * d_int + di];
                 float s = dot * scale;
                 if (causal && (kv_start + sk) > si) s = -1e38f;
-                scores[sk] = s;
+                my_scores[my_count] = s;
+                my_indices[my_count] = sk;
                 if (s > tile_max) tile_max = s;
+                my_count++;
+            }
+
+            float warp_max = warp_reduce_max(tile_max);
+            if (lane_id == 0) red_smem[warp_id] = warp_max;
+            __syncthreads();
+            if (tid == 0) {
+                float bm = red_smem[0];
+                for (int w = 1; w < num_warps; w++)
+                    if (red_smem[w] > bm) bm = red_smem[w];
+                red_smem[0] = bm;
             }
             __syncthreads();
+            float block_max = red_smem[0];
 
-            /* Tile max reduction */
-            red[tid] = tile_max;
-            __syncthreads();
-            for (int stride = NT / 2; stride > 0; stride >>= 1) {
-                if (tid < stride && red[tid + stride] > red[tid])
-                    red[tid] = red[tid + stride];
-                __syncthreads();
-            }
-            tile_max = red[0];
-            __syncthreads();
-
-            /* Online softmax rescale */
-            if (tile_max > max_val) {
-                float rescale = expf(max_val - tile_max);
+            if (block_max > max_val) {
+                float rescale = __expf(max_val - block_max);
                 sum_val *= rescale;
                 for (int di = 0; di < d_int; di++) out_acc[di] *= rescale;
-                max_val = tile_max;
+                max_val = block_max;
             }
 
-            /* Accumulate exp(scores - max) * V */
             float local_sum = 0.0f;
-            float local_acc[FA_MAX_D];
-            for (int di = 0; di < d_int; di++) local_acc[di] = 0.0f;
+            float local_out[FA_MAX_D];
+            for (int di = 0; di < d_int; di++) local_out[di] = 0.0f;
 
-            for (int sk = tid; sk < tile_s; sk += NT) {
-                float p = expf(scores[sk] - max_val);
+            for (int i = 0; i < my_count; i++) {
+                float p = exp2f((my_scores[i] - max_val) * LOG2E_F);
                 local_sum += p;
+                int sk = my_indices[i];
                 for (int di = 0; di < d_int; di++)
-                    local_acc[di] += p * V_smem[sk * d_int + di];
+                    local_out[di] += p * V_smem[sk * d_int + di];
             }
 
-            /* Reduce sum */
-            red[tid] = local_sum;
+            float warp_sum = warp_reduce_sum(local_sum);
+            if (lane_id == 0) red_smem[warp_id] = warp_sum;
             __syncthreads();
-            for (int stride = NT / 2; stride > 0; stride >>= 1) {
-                if (tid < stride) red[tid] += red[tid + stride];
+            if (tid == 0) {
+                float s = 0.0f;
+                for (int w = 0; w < num_warps; w++) s += red_smem[w];
+                red_smem[0] = s;
+            }
+            __syncthreads();
+            sum_val += red_smem[0];
+            __syncthreads();
+
+            for (int di = 0; di < d_int; di++) {
+                float wv = warp_reduce_sum(local_out[di]);
+                if (lane_id == 0) red_smem[warp_id] = wv;
+                __syncthreads();
+                if (tid == 0) {
+                    float s = 0.0f;
+                    for (int w = 0; w < num_warps; w++) s += red_smem[w];
+                    out_acc[di] += s;
+                }
                 __syncthreads();
             }
-            sum_val += red[0];
-
-            /* Reduce out_acc */
-            for (int di = 0; di < d_int; di++)
-                K_smem[tid * d_int + di] = local_acc[di];
-            __syncthreads();
-
-            if (tid == 0) {
-                for (int di = 0; di < d_int; di++) {
-                    float acc = 0.0f;
-                    for (int t = 0; t < NT; t++)
-                        acc += K_smem[t * d_int + di];
-                    out_acc[di] += acc;
-                }
-            }
-            __syncthreads();
         }
 
-        /* Normalize and output projection */
         if (tid == 0) {
-            if (sum_val < 1e-12f) sum_val = 1e-12f;
-            float inv_sum = 1.0f / sum_val;
-
+            float inv_sum = (sum_val < 1e-12f) ? 1.0f : (1.0f / sum_val);
             for (int j = 0; j < D_int; j++) {
                 float contrib = 0.0f;
                 for (int di = 0; di < d_int; di++)
-                    contrib += out_acc[di] * inv_sum * WO[(head_offset + di) * D_int + j];
+                    contrib += out_acc[di] * inv_sum * WO[(ho + di) * D_int + j];
                 Y_bs[j] += contrib;
             }
         }
@@ -344,8 +378,263 @@ __global__ void mha_flash_attn_kernel(
     }
 }
 
+
 /* ============================================================
- * Host dispatch — hybrid: preloaded for S<=64, flash for S>64
+ * Kernel 3: Flash Attention v2 Split-KV (for very long sequences)
+ *
+ * Splits K/V into num_splits chunks. Each block processes one
+ * chunk for one query row, outputs partial O and LSE.
+ *
+ * Grid: (num_splits, B*S, H_q)
+ * Block: (FA_NUM_THREADS=128)
+ *
+ * Output:
+ *   O_accum[num_splits, B, S, D]  — partial output per split
+ *   LSE_accum[num_splits, B, S]   — partial log-sum-exp per split
+ * ============================================================ */
+__global__ void mha_flash_attn_splitkv_kernel(
+    const float* __restrict__ Q_buf,   /* pre-computed Q: (B, S, H_q, d) */
+    const float* __restrict__ K_buf,
+    const float* __restrict__ V_buf,
+    float* __restrict__ O_accum,
+    float* __restrict__ LSE_accum,
+    int64_t B, int64_t S, int64_t D, int64_t H_q, int64_t H_kv, int64_t d,
+    float scale, int has_residual, int causal, int num_splits)
+{
+    const int split_idx = blockIdx.x;
+    const int bs = blockIdx.y;
+    const int b  = bs / (int)S;
+    const int si = bs % (int)S;
+    const int h  = blockIdx.z;
+    const int tid = threadIdx.x;
+    const int warp_id = tid / 32;
+    const int lane_id = tid % 32;
+    if (b >= (int)B || h >= (int)H_q) return;
+
+    const int S_int = (int)S, D_int = (int)D, d_int = (int)d;
+    const int H_kv_int = (int)H_kv;
+    const int group_size = (int)H_q / H_kv_int;
+    const int num_warps = FA_NUM_THREADS / 32;
+    const int kv_h = h / group_size;
+    const int kv_ho = kv_h * d_int;
+    const int ho = h * d_int;
+    const int64_t kv_batch_stride = (int64_t)S_int * H_kv_int * d_int;
+    const int64_t q_batch_stride = (int64_t)S_int * (int)H_q * d_int;
+
+    /* Load pre-computed Q from buffer: Q_buf[b, si, h, :] */
+    const float* Q_base = Q_buf + (int64_t)b * q_batch_stride + (int64_t)si * (int)H_q * d_int + ho;
+    float Q_reg[FA_MAX_D];
+    for (int di = 0; di < d_int; di++) Q_reg[di] = Q_base[di];
+
+    /* Compute this split's K/V range */
+    int causal_limit = causal ? (si + 1) : S_int;
+    int tiles_per_split = (causal_limit + num_splits - 1) / num_splits;
+    int kv_start = split_idx * tiles_per_split;
+    int kv_end = min(kv_start + tiles_per_split, causal_limit);
+    if (kv_start >= kv_end) {
+        /* Empty split: write -inf LSE and zero O */
+        int64_t lse_idx = ((int64_t)split_idx * B * S + (int64_t)b * S + si);
+        LSE_accum[lse_idx] = -1e38f;
+        int64_t o_idx = ((int64_t)split_idx * B * S * D + ((int64_t)b * S + si) * D + ho);
+        for (int j = tid; j < d_int; j += FA_NUM_THREADS)
+            O_accum[o_idx + j] = 0.0f;
+        return;
+    }
+
+    extern __shared__ float smem[];
+    float* K_smem  = smem;
+    float* V_smem  = K_smem + FA_TILE_BN * d_int;
+    float* red_smem = V_smem + FA_TILE_BN * d_int;
+
+    /* Q is pre-computed in Q_buf, loaded into Q_reg above */
+
+    /* Online softmax over this split's K/V range */
+    float max_val = -1e38f, sum_val = 0.0f;
+    float out_acc[FA_MAX_D];
+    for (int di = 0; di < d_int; di++) out_acc[di] = 0.0f;
+
+    const float* K_base = K_buf + (int64_t)b * kv_batch_stride + kv_ho;
+    const float* V_base = V_buf + (int64_t)b * kv_batch_stride + kv_ho;
+
+    int num_tiles = (kv_end - kv_start + FA_TILE_BN - 1) / FA_TILE_BN;
+
+    for (int kt = 0; kt < num_tiles; kt++) {
+        int tile_start = kv_start + kt * FA_TILE_BN;
+        int tile_n = min(FA_TILE_BN, kv_end - tile_start);
+
+        for (int i = tid; i < tile_n * d_int; i += FA_NUM_THREADS) {
+            int sk = i / d_int;
+            int dk = i % d_int;
+            int64_t offset = (int64_t)(tile_start + sk) * H_kv_int * d_int + dk;
+            K_smem[sk * d_int + dk] = K_base[offset];
+            V_smem[sk * d_int + dk] = V_base[offset];
+        }
+        __syncthreads();
+
+        float tile_max = -1e38f;
+        int my_count = 0;
+        float my_scores[8];
+        int my_indices[8];
+
+        for (int sk = tid; sk < tile_n; sk += FA_NUM_THREADS) {
+            float dot = 0.0f;
+            for (int di = 0; di < d_int; di++)
+                dot += Q_reg[di] * K_smem[sk * d_int + di];
+            float s = dot * scale;
+            if (causal && (tile_start + sk) > si) s = -1e38f;
+            my_scores[my_count] = s;
+            my_indices[my_count] = sk;
+            if (s > tile_max) tile_max = s;
+            my_count++;
+        }
+
+        float warp_max = warp_reduce_max(tile_max);
+        if (lane_id == 0) red_smem[warp_id] = warp_max;
+        __syncthreads();
+        if (tid == 0) {
+            float bm = red_smem[0];
+            for (int w = 1; w < num_warps; w++)
+                if (red_smem[w] > bm) bm = red_smem[w];
+            red_smem[0] = bm;
+        }
+        __syncthreads();
+        float block_max = red_smem[0];
+        __syncthreads();
+
+        if (block_max > max_val) {
+            float rescale = __expf(max_val - block_max);
+            sum_val *= rescale;
+            for (int di = 0; di < d_int; di++) out_acc[di] *= rescale;
+            max_val = block_max;
+        }
+
+        float local_sum = 0.0f;
+        float local_out[FA_MAX_D];
+        for (int di = 0; di < d_int; di++) local_out[di] = 0.0f;
+
+        for (int i = 0; i < my_count; i++) {
+            float p = exp2f((my_scores[i] - max_val) * LOG2E_F);
+            local_sum += p;
+            int sk = my_indices[i];
+            for (int di = 0; di < d_int; di++)
+                local_out[di] += p * V_smem[sk * d_int + di];
+        }
+
+        float warp_sum = warp_reduce_sum(local_sum);
+        if (lane_id == 0) red_smem[warp_id] = warp_sum;
+        __syncthreads();
+        if (tid == 0) {
+            float s = 0.0f;
+            for (int w = 0; w < num_warps; w++) s += red_smem[w];
+            red_smem[0] = s;
+        }
+        __syncthreads();
+        sum_val += red_smem[0];
+        __syncthreads();
+
+        for (int di = 0; di < d_int; di++) {
+            float wv = warp_reduce_sum(local_out[di]);
+            if (lane_id == 0) red_smem[warp_id] = wv;
+            __syncthreads();
+            if (tid == 0) {
+                float s = 0.0f;
+                for (int w = 0; w < num_warps; w++) s += red_smem[w];
+                out_acc[di] += s;
+            }
+            __syncthreads();
+        }
+    }
+
+    /* Write partial O (normalized) and LSE.
+     * FA2 stores normalized O_accum = out_acc / sum_val, so that
+     * combine can use exp(lse_s - lse_global) as weight directly.
+     * O = sum_s(exp(lse_s - lse_global) * O_accum_s)
+     *   = sum_s(exp(max_s - lse_global) * out_acc_s)  [correct] */
+    int64_t lse_idx = ((int64_t)split_idx * B * S + (int64_t)b * S + si);
+    int64_t o_base = ((int64_t)split_idx * B * S * D + ((int64_t)b * S + si) * D);
+
+    if (tid == 0) {
+        float lse = (sum_val < 1e-12f) ? -1e38f : (max_val + logf(sum_val));
+        LSE_accum[lse_idx] = lse;
+    }
+
+    /* Normalize out_acc before writing to O_accum */
+    float inv_sum = (sum_val < 1e-12f) ? 0.0f : (1.0f / sum_val);
+    for (int j = tid; j < d_int; j += FA_NUM_THREADS)
+        O_accum[o_base + ho + j] = out_acc[j] * inv_sum;
+}
+
+
+/* ============================================================
+ * Kernel 4: Combine Split-KV results
+ *
+ * For each query row, combines partial O and LSE from all splits:
+ *   lse_global = logsumexp(lse_s)
+ *   O = sum_s(exp(lse_s - lse_global) * O_s) / sum_s(exp(lse_s - lse_global))
+ *
+ * Grid: (B*S, H_q, 1), Block: (256)
+ * ============================================================ */
+__global__ void mha_combine_splitkv_kernel(
+    const float* __restrict__ O_accum,
+    const float* __restrict__ LSE_accum,
+    const float* __restrict__ WO, const float* __restrict__ bO,
+    const float* __restrict__ R,
+    float* __restrict__ Y,
+    int64_t B, int64_t S, int64_t D, int64_t H_q, int64_t d,
+    int has_residual, int num_splits)
+{
+    const int bs = blockIdx.x;
+    const int b  = bs / (int)S;
+    const int si = bs % (int)S;
+    const int h  = blockIdx.y;
+    const int tid = threadIdx.x;
+    if (b >= (int)B || h >= (int)H_q) return;
+
+    const int S_int = (int)S, D_int = (int)D, d_int = (int)d;
+    const int ho = h * d_int;
+
+    /* Find global max LSE across splits */
+    float lse_max = -1e38f;
+    for (int s = 0; s < num_splits; s++) {
+        int64_t idx = (int64_t)s * B * S + (int64_t)b * S + si;
+        float lse = LSE_accum[idx];
+        if (lse > lse_max) lse_max = lse;
+    }
+
+    /* Compute exp(lse_s - lse_max) for each split and accumulate */
+    float scale_sum = 0.0f;
+    float out_acc[FA_MAX_D];
+    for (int di = 0; di < d_int; di++) out_acc[di] = 0.0f;
+
+    for (int s = 0; s < num_splits; s++) {
+        int64_t lse_idx = (int64_t)s * B * S + (int64_t)b * S + si;
+        float lse = LSE_accum[lse_idx];
+        float w = (lse <= -1e37f) ? 0.0f : __expf(lse - lse_max);
+        scale_sum += w;
+
+        int64_t o_base = (int64_t)s * B * S * D + ((int64_t)b * S + si) * D;
+        for (int di = tid; di < d_int; di += 256)
+            out_acc[di] += w * O_accum[o_base + ho + di];
+    }
+
+    /* Normalize and output projection */
+    float inv_sum = (scale_sum < 1e-12f) ? 1.0f : (1.0f / scale_sum);
+    float* Y_row = Y + ((int64_t)b * S_int + si) * D_int;
+    const float* R_row = (has_residual && R) ? (R + ((int64_t)b * S_int + si) * D_int) : NULL;
+
+    for (int j = tid; j < D_int; j += 256) {
+        float contrib = 0.0f;
+        for (int di = 0; di < d_int; di++)
+            contrib += out_acc[di] * inv_sum * WO[(ho + di) * D_int + j];
+        float val = contrib + (bO ? bO[j] : 0.0f);
+        if (R_row) val += R_row[j];
+        atomicAdd(&Y_row[j], val);
+    }
+}
+
+
+/* ============================================================
+ * Host dispatch
  * ============================================================ */
 int mha_fused_f32_cuda(const void* inputs[], void* outputs[],
                         const operator_params_t* params, stream_t* stream) {
@@ -374,36 +663,129 @@ int mha_fused_f32_cuda(const void* inputs[], void* outputs[],
     int64_t H_kv = p->num_kv_heads > 0 ? p->num_kv_heads : H_q;
     int64_t d    = p->head_dim;
 
-    dim3 grid((unsigned int)(B * S), 1, 1);
-    dim3 block(256, 1, 1);
     int has_residual = p->has_residual && R ? 1 : 0;
     int causal_mask  = p->causal ? 1 : 0;
 
     if (S <= 64) {
-        /* ---- Fast path: preloaded K/V (all in shared memory) ---- */
+        /* Fast path: preloaded K/V */
+        dim3 grid((unsigned int)(B * S), 1, 1);
+        dim3 block(256, 1, 1);
         size_t smem_bytes = (size_t)(2 * S * H_kv * d) * sizeof(float);
         return CUDA_KERNEL_LAUNCH(mha_preloaded_kernel, grid, block, smem_bytes, s,
             X, WQ, bQ, WK, bK, WV, bV, WO, bO, Y, R,
             B, S, D, H_q, H_kv, d, p->scale, has_residual, causal_mask);
-    } else {
-        /* ---- Flash Attention path: tiled K/V from global memory ---- */
-        int NT = 256, BC = 64;
-        size_t smem_bytes = (size_t)((NT + BC) * d + BC + NT) * sizeof(float);
-
-        cudaFuncSetAttribute(mha_flash_attn_kernel,
-                             cudaFuncAttributeMaxDynamicSharedMemorySize,
-                             (int)smem_bytes);
-
-        return CUDA_KERNEL_LAUNCH(mha_flash_attn_kernel, grid, block, smem_bytes, s,
-            X, WQ, bQ, WK, bK, WV, bV, WO, bO, Y, R,
-            B, S, D, H_q, H_kv, d, p->scale, has_residual, causal_mask);
     }
+
+    /* Pre-compute K/V into global buffer */
+    size_t kv_size = (size_t)B * S * H_kv * d * sizeof(float);
+    float* K_buf = NULL;
+    float* V_buf = NULL;
+    cudaMalloc(&K_buf, kv_size);
+    cudaMalloc(&V_buf, kv_size);
+    if (!K_buf || !V_buf) {
+        if (K_buf) cudaFree(K_buf);
+        if (V_buf) cudaFree(V_buf);
+        return -1;
+    }
+
+    {
+        dim3 kv_grid((unsigned int)(B * S), (unsigned int)H_kv, 1);
+        CUDA_KERNEL_LAUNCH(mha_precompute_kv_kernel, kv_grid, dim3(256), 0, s,
+            X, WK, bK, WV, bV, K_buf, V_buf, B, S, D, H_kv, d);
+    }
+
+    if (S <= FA_SPLITKV_THRESHOLD) {
+        /* Single-pass Flash Attention */
+        dim3 attn_grid((unsigned int)(B * S), 1, 1);
+        dim3 attn_block(FA_NUM_THREADS, 1, 1);
+        int num_warps = FA_NUM_THREADS / 32;
+        size_t smem_bytes = (size_t)(2 * FA_TILE_BN * d + num_warps) * sizeof(float);
+
+        if (smem_bytes > 48 * 1024) {
+            cudaFuncSetAttribute(mha_flash_attn_v2_kernel,
+                                 cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                 (int)smem_bytes);
+        }
+
+        CUDA_KERNEL_LAUNCH(mha_flash_attn_v2_kernel, attn_grid, attn_block, smem_bytes, s,
+            X, WQ, bQ, K_buf, V_buf, WO, bO, Y, R,
+            B, S, D, H_q, H_kv, d, p->scale, has_residual, causal_mask);
+    } else {
+        /* Split-KV Flash Attention */
+        int num_splits = (int)((S + FA_SPLITKV_THRESHOLD - 1) / FA_SPLITKV_THRESHOLD);
+        if (num_splits > 8) num_splits = 8;  /* cap at 8 splits */
+
+        /* Allocate Q buffer + accumulators */
+        size_t q_size = (size_t)B * S * H_q * d * sizeof(float);
+        size_t o_accum_size = (size_t)num_splits * B * S * D * sizeof(float);
+        size_t lse_accum_size = (size_t)num_splits * B * S * sizeof(float);
+        float* Q_buf = NULL;
+        float* O_accum = NULL;
+        float* LSE_accum = NULL;
+        cudaMalloc(&Q_buf, q_size);
+        cudaMalloc(&O_accum, o_accum_size);
+        cudaMalloc(&LSE_accum, lse_accum_size);
+        if (!Q_buf || !O_accum || !LSE_accum) {
+            if (Q_buf) cudaFree(Q_buf);
+            if (O_accum) cudaFree(O_accum);
+            if (LSE_accum) cudaFree(LSE_accum);
+            cudaFree(K_buf); cudaFree(V_buf);
+            return -1;
+        }
+
+        /* Pre-compute Q */
+        {
+            dim3 q_grid((unsigned int)(B * S), (unsigned int)H_q, 1);
+            CUDA_KERNEL_LAUNCH(mha_precompute_q_kernel, q_grid, dim3(256), 0, s,
+                X, WQ, bQ, Q_buf, B, S, D, H_q, d);
+        }
+
+        /* Zero-initialize Y (heads accumulate via atomicAdd in combine) */
+        cudaMemsetAsync(Y, 0, (size_t)B * S * D * sizeof(float), s);
+
+        /* Split-KV kernel */
+        {
+            dim3 splitkv_grid(num_splits, (unsigned int)(B * S), (unsigned int)H_q);
+            dim3 splitkv_block(FA_NUM_THREADS, 1, 1);
+            int num_warps = FA_NUM_THREADS / 32;
+            size_t smem_bytes = (size_t)(2 * FA_TILE_BN * d + num_warps) * sizeof(float);
+
+            if (smem_bytes > 48 * 1024) {
+                cudaFuncSetAttribute(mha_flash_attn_splitkv_kernel,
+                                     cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                     (int)smem_bytes);
+            }
+
+            CUDA_KERNEL_LAUNCH(mha_flash_attn_splitkv_kernel,
+                splitkv_grid, splitkv_block, smem_bytes, s,
+                Q_buf, K_buf, V_buf, O_accum, LSE_accum,
+                B, S, D, H_q, H_kv, d, p->scale, has_residual, causal_mask, num_splits);
+        }
+
+        cudaFree(Q_buf);
+
+        /* Combine kernel */
+        {
+            dim3 combine_grid((unsigned int)(B * S), (unsigned int)H_q, 1);
+            CUDA_KERNEL_LAUNCH(mha_combine_splitkv_kernel,
+                combine_grid, dim3(256), 0, s,
+                O_accum, LSE_accum, WO, bO, R, Y,
+                B, S, D, H_q, d, has_residual, num_splits);
+        }
+
+        cudaFree(O_accum);
+        cudaFree(LSE_accum);
+    }
+
+    cudaFree(K_buf);
+    cudaFree(V_buf);
+    return 0;
 }
 
 extern "C" int register_mha_fused_f32_cuda(void) {
     static operator_registry_t reg = {
         .name = "mha_fused_f32_cuda", .data_type = "f32",
-        .func = mha_fused_f32_cuda, .version = 2, .flags = OP_FLAG_NONE,
+        .func = mha_fused_f32_cuda, .version = 5, .flags = OP_FLAG_NONE,
     };
     return operator_register(&reg);
 }
