@@ -5,6 +5,7 @@
 /* Functions defined in cuda_memory.cu */
 extern void* cuda_device_alloc(size_t size);
 extern void  cuda_device_free(void* ptr);
+extern void  cuda_device_free_sized(void* ptr, size_t size);
 extern void* cuda_host_alloc_pinned(size_t size);
 extern void  cuda_host_free_pinned(void* ptr);
 extern int   cuda_memcpy_h2d(void* dst, const void* src, size_t bytes, cudaStream_t stream);
