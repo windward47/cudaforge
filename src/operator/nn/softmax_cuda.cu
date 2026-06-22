@@ -1,8 +1,11 @@
 #include "operator.h"
 #include "cuda_ops.h"
 #include "softmax_int.h"
+#include "cuda_reduce.cuh"
 
-/* ---- Templated kernel for different block sizes ---- */
+/* ---- Templated kernel for different block sizes ----
+ * Uses warp-level primitives from cuda_reduce.cuh for max/sum reduction,
+ * falling back to block-level reduction only when blockDim.x > 32. */
 template<int BLOCK_SIZE>
 __global__ void softmax_f32_kernel_t(const float* input, float* output,
                                       int64_t C, int64_t N) {
@@ -11,44 +14,40 @@ __global__ void softmax_f32_kernel_t(const float* input, float* output,
 
     const float* in_n = input + n * C;
     float* out_n = output + n * C;
-
-    /* Find max (parallel reduction in shared memory) */
-    __shared__ float smem[BLOCK_SIZE];
     int tid = threadIdx.x;
+
+    /* Find max — each thread scans its elements, then warp/block reduce */
     float max_val = -3.4028235e38f;
-    for (int i = tid; i < C; i += blockDim.x) {
+    for (int i = tid; i < C; i += BLOCK_SIZE)
         if (in_n[i] > max_val) max_val = in_n[i];
+
+    if constexpr (BLOCK_SIZE > 32) {
+        __shared__ float red_smem[BLOCK_SIZE / 32];
+        max_val = block_reduce_max(max_val, red_smem, tid);
+    } else {
+        max_val = warp_reduce_max(max_val);
     }
-    smem[tid] = max_val;
-    __syncthreads();
-    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-        if (tid < s && smem[tid + s] > smem[tid]) smem[tid] = smem[tid + s];
-        __syncthreads();
-    }
-    max_val = smem[0];
-    __syncthreads();
 
     /* Compute exp and sum */
     float sum = 0.0f;
-    for (int i = tid; i < C; i += blockDim.x) {
+    for (int i = tid; i < C; i += BLOCK_SIZE) {
         float v = expf(in_n[i] - max_val);
         out_n[i] = v;
         sum += v;
     }
-    smem[tid] = sum;
-    __syncthreads();
-    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-        if (tid < s) smem[tid] += smem[tid + s];
-        __syncthreads();
+
+    if constexpr (BLOCK_SIZE > 32) {
+        __shared__ float red_smem2[BLOCK_SIZE / 32];
+        sum = block_reduce_sum(sum, red_smem2, tid);
+    } else {
+        sum = warp_reduce_sum(sum);
     }
-    sum = smem[0];
 
     /* Normalize */
     if (sum > 0.0f) {
         float inv = 1.0f / sum;
-        for (int i = tid; i < C; i += blockDim.x) {
+        for (int i = tid; i < C; i += BLOCK_SIZE)
             out_n[i] *= inv;
-        }
     }
 }
 
