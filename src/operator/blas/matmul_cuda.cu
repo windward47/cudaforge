@@ -86,6 +86,37 @@ __global__ void matmul_f32_tiled(const float* A, const float* B, float* C,
 }
 
 /* ============================================================
+ * Fused MatMul + Bias: tiled version (saves one kernel launch)
+ * C = A*B + bias, bias broadcast across rows
+ * ============================================================ */
+__global__ void matmul_f32_tiled_bias(const float* A, const float* B, float* C,
+                                       const float* bias,
+                                       int64_t M, int64_t N, int64_t K,
+                                       int64_t batch_size,
+                                       int64_t stride_a, int64_t stride_b, int64_t stride_c) {
+    __shared__ float As[MATMUL_TILE_SIZE][MATMUL_TILE_SIZE];
+    __shared__ float Bs[MATMUL_TILE_SIZE][MATMUL_TILE_SIZE];
+    int tx = threadIdx.x, ty = threadIdx.y;
+    int row = blockIdx.y * MATMUL_TILE_SIZE + ty;
+    int col = blockIdx.x * MATMUL_TILE_SIZE + tx;
+    int64_t batch = blockIdx.z;
+    const float* Ab = A + batch * stride_a;
+    const float* Bb = B + batch * stride_b;
+    float*       Cb = C + batch * stride_c;
+    float sum = 0.0f;
+    for (int t = 0; t < (K + MATMUL_TILE_SIZE - 1) / MATMUL_TILE_SIZE; t++) {
+        int tiled_k = t * MATMUL_TILE_SIZE;
+        if (row < M && tiled_k + tx < K) As[ty][tx] = Ab[row * K + tiled_k + tx]; else As[ty][tx] = 0.0f;
+        if (tiled_k + ty < K && col < N) Bs[ty][tx] = Bb[(tiled_k + ty) * N + col]; else Bs[ty][tx] = 0.0f;
+        __syncthreads();
+        for (int k = 0; k < MATMUL_TILE_SIZE; k++) sum += As[ty][k] * Bs[k][tx];
+        __syncthreads();
+    }
+    if (row < M && col < N && batch < batch_size)
+        Cb[row * N + col] = sum + (bias ? bias[col] : 0.0f);
+}
+
+/* ============================================================
  * Warp-tiled: 32×32 tile with bank-conflict-avoiding padding (batched)
  * ============================================================ */
 #define WARP_TILE 32
@@ -136,6 +167,40 @@ __global__ void matmul_f32_warp(const float* __restrict__ A,
     if (row < M && col < N && batch < batch_size) {
         Cb[row * N + col] = sum;
     }
+}
+
+/* ============================================================
+ * Fused warp-tiled MatMul + Bias
+ * ============================================================ */
+__global__ void matmul_f32_warp_bias(const float* __restrict__ A,
+                                      const float* __restrict__ B,
+                                      float* __restrict__ C,
+                                      const float* __restrict__ bias,
+                                      int64_t M, int64_t N, int64_t K,
+                                      int64_t batch_size,
+                                      int64_t stride_a, int64_t stride_b, int64_t stride_c) {
+    __shared__ float As[WARP_TILE][WARP_TILE + 1];
+    __shared__ float Bs[WARP_TILE][WARP_TILE + 1];
+    int tx = threadIdx.x, ty = threadIdx.y;
+    int row = blockIdx.y * WARP_TILE + ty;
+    int col = blockIdx.x * WARP_TILE + tx;
+    int64_t batch = blockIdx.z;
+    const float* Ab = A + batch * stride_a;
+    const float* Bb = B + batch * stride_b;
+    float*       Cb = C + batch * stride_c;
+    float sum = 0.0f;
+    int num_tiles = (int)((K + WARP_TILE - 1) / WARP_TILE);
+    for (int t = 0; t < num_tiles; t++) {
+        int tk = t * WARP_TILE;
+        if (row < M && tk + tx < K) As[ty][tx] = Ab[row * K + tk + tx]; else As[ty][tx] = 0.0f;
+        if (tk + ty < K && col < N) Bs[ty][tx] = Bb[(tk + ty) * N + col]; else Bs[ty][tx] = 0.0f;
+        __syncthreads();
+        #pragma unroll
+        for (int k = 0; k < WARP_TILE; k++) sum += As[ty][k] * Bs[k][tx];
+        __syncthreads();
+    }
+    if (row < M && col < N && batch < batch_size)
+        Cb[row * N + col] = sum + (bias ? bias[col] : 0.0f);
 }
 
 /* ============================================================
@@ -288,7 +353,7 @@ int matmul_f32_cuda(const void* inputs[], void* outputs[],
     }
 
     if (config == 1 || (config == 0 && M <= 32 && N <= 32)) {
-        /* Naive: small matrices or explicit config */
+        /* Naive: small matrices or explicit config (no fused bias variant) */
         dim3 block(16, 16, 1);
         dim3 grid((unsigned int)((N + 15) / 16),
                   (unsigned int)((M + 15) / 16),
@@ -296,44 +361,57 @@ int matmul_f32_cuda(const void* inputs[], void* outputs[],
         ret = CUDA_KERNEL_LAUNCH(matmul_f32_naive, grid, block, 0, s,
                                   A, B, C, M, N, K,
                                   batch_size, stride_a, stride_b, stride_c);
+        if (ret != 0) goto matmul_cleanup;
+        if (bias) {
+            int64_t total = batch_size * M * N;
+            ret = CUDA_KERNEL_LAUNCH(matmul_bias_add_kernel, (int)((total + 255) / 256), 256, 0, s,
+                                      C, bias, M, N, batch_size, stride_c);
+        }
     } else if (config == 4 || (config == 0 && M >= 512 && N >= 512 && K >= 512
                && M % TC_TILE == 0 && N % TC_TILE == 0 && batch_size == 1)) {
-        /* Tensor Core: large aligned matrices or explicit config */
+        /* Tensor Core: large aligned matrices (no fused bias variant) */
         dim3 block(32, 1, 1);
         dim3 grid((unsigned int)((N + TC_TILE - 1) / TC_TILE),
                   (unsigned int)((M + TC_TILE - 1) / TC_TILE), 1);
         ret = CUDA_KERNEL_LAUNCH(matmul_f32_tc_kernel, grid, block, 0, s,
                                   A, B, C, M, N, K,
                                   batch_size, stride_a, stride_b, stride_c);
+        if (ret != 0) goto matmul_cleanup;
+        if (bias) {
+            int64_t total = batch_size * M * N;
+            ret = CUDA_KERNEL_LAUNCH(matmul_bias_add_kernel, (int)((total + 255) / 256), 256, 0, s,
+                                      C, bias, M, N, batch_size, stride_c);
+        }
     } else if (config == 3 || (config == 0 && M >= 64 && N >= 64)) {
-        /* Warp-tiled: medium matrices or explicit config */
+        /* Warp-tiled: fused bias when available */
         dim3 block(WARP_TILE, WARP_TILE, 1);
         dim3 grid((unsigned int)((N + WARP_TILE - 1) / WARP_TILE),
                   (unsigned int)((M + WARP_TILE - 1) / WARP_TILE),
                   (unsigned int)batch_size);
-        ret = CUDA_KERNEL_LAUNCH(matmul_f32_warp, grid, block, 0, s,
-                                  A, B, C, M, N, K,
-                                  batch_size, stride_a, stride_b, stride_c);
+        if (bias) {
+            ret = CUDA_KERNEL_LAUNCH(matmul_f32_warp_bias, grid, block, 0, s,
+                                      A, B, C, bias, M, N, K,
+                                      batch_size, stride_a, stride_b, stride_c);
+        } else {
+            ret = CUDA_KERNEL_LAUNCH(matmul_f32_warp, grid, block, 0, s,
+                                      A, B, C, M, N, K,
+                                      batch_size, stride_a, stride_b, stride_c);
+        }
     } else {
-        /* Shared-memory tiled: default fallback */
+        /* Shared-memory tiled: fused bias when available */
         dim3 block(MATMUL_TILE_SIZE, MATMUL_TILE_SIZE, 1);
         dim3 grid((unsigned int)((N + MATMUL_TILE_SIZE - 1) / MATMUL_TILE_SIZE),
                   (unsigned int)((M + MATMUL_TILE_SIZE - 1) / MATMUL_TILE_SIZE),
                   (unsigned int)batch_size);
-        ret = CUDA_KERNEL_LAUNCH(matmul_f32_tiled, grid, block, 0, s,
-                                  A, B, C, M, N, K,
-                                  batch_size, stride_a, stride_b, stride_c);
-    }
-    if (ret != 0) goto matmul_cleanup;
-
-    /* Add bias if present */
-    if (bias) {
-        int64_t total = batch_size * M * N;
-        int block_sz = 256;
-        int grid_sz = (int)((total + block_sz - 1) / block_sz);
-        ret = CUDA_KERNEL_LAUNCH(matmul_bias_add_kernel, grid_sz, block_sz, 0, s,
-                                  C, bias, M, N, batch_size, stride_c);
-        if (ret != 0) goto matmul_cleanup;
+        if (bias) {
+            ret = CUDA_KERNEL_LAUNCH(matmul_f32_tiled_bias, grid, block, 0, s,
+                                      A, B, C, bias, M, N, K,
+                                      batch_size, stride_a, stride_b, stride_c);
+        } else {
+            ret = CUDA_KERNEL_LAUNCH(matmul_f32_tiled, grid, block, 0, s,
+                                      A, B, C, M, N, K,
+                                      batch_size, stride_a, stride_b, stride_c);
+        }
     }
 
 matmul_cleanup:
