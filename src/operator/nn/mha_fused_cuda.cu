@@ -715,8 +715,16 @@ int mha_fused_f32_cuda(const void* inputs[], void* outputs[],
             B, S, D, H_q, H_kv, d, p->scale, has_residual, causal_mask);
     }
 
-    /* Pre-compute K/V into global buffer */
+    /* Pre-compute K/V into global buffer using cuBLAS SGEMM.
+     * K_flat = X · WK  (B*S, D) × (D, D) → (B*S, D)
+     * V_flat = X · WV  (B*S, D) × (D, D) → (B*S, D)
+     * Then add bias: K_flat += bK, V_flat += bV.
+     *
+     * cuBLAS is column-major: C^T = B^T · A^T
+     *   cublasSgemm(handle, N, N, D, B*S, D, α, WK, D, X, D, β, K, D)
+     *   computes K^T = WK^T · X^T  ↔  K = X · WK (row-major) ✓ */
     size_t kv_size = (size_t)B * S * H_kv * d * sizeof(float);
+    size_t flat_size = (size_t)B * S * D * sizeof(float);
     float* K_buf = NULL;
     float* V_buf = NULL;
     cudaMalloc(&K_buf, kv_size);
