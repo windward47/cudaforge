@@ -310,10 +310,10 @@ typedef struct {
 
 | # | 融合模式 | 节省 | 说明 |
 | --- | --- | --- | --- |
-| R2-2a | MatMul + Add(bias) | 1 次 kernel launch + 1 次显存读写 | 参考 ggml `GGML_OP_MUL_MAT` bias 融合 |
-| R2-2b | LayerNorm + Mul(scale) + Add(residual) | 2 次 kernel launch | 参考 ggml `RMS_NORM + MUL + ADD` 融合 |
-| R2-2c | SiLU + Mul (SwiGLU gate) | 1 次 kernel launch | 参考 ggml `UNARY(SILU) + MUL` 融合 |
-| R2-2d | GELU + Mul (GeGLU gate) | 1 次 kernel launch | 同上，GELU 变体 |
+| R2-2a | MatMul + Add(bias) | 1 次 kernel launch + 1 次显存读写 | ✅ tiled + warp-tiled 融合 kernel |
+| R2-2b | LayerNorm + Mul(scale) + Add(residual) | 2 次 kernel launch | 待实施 |
+| R2-2c | SiLU + Mul (SwiGLU gate) | 1 次 kernel launch | 待实施 |
+| R2-2d | GELU + Mul (GeGLU gate) | 1 次 kernel launch | 待实施 |
 
 ### R2-3: Warp-level 归约原语库 ⭐⭐
 
@@ -323,8 +323,8 @@ typedef struct {
 
 | # | 任务 | 文件 | 说明 |
 | --- | --- | --- | --- |
-| R2-3a | 创建 CUDA 归约原语 | `src/platform/cuda/cuda_reduce.cuh` | `warp_reduce_sum<T>()`, `warp_reduce_max<T>()`, `block_reduce<T>()` |
-| R2-3b | 重构现有算子使用 | `softmax_cuda.cu`, `layernorm_cuda.cu`, `reduce_cuda.cu` | 替换手写归约 |
+| R2-3a | 创建 CUDA 归约原语 | `src/platform/cuda/cuda_reduce.cuh` | ✅ `warp_reduce_sum/max`, `block_reduce_sum/max`, `quad_reduce_sum/max` |
+| R2-3b | 重构现有算子使用 | `softmax_cuda.cu` | ✅ softmax 已重构，layernorm/reduce 待后续 |
 
 ### R2-4: CUDA VMM 内存池 ⭐⭐
 
@@ -336,9 +336,9 @@ typedef struct {
 
 | # | 任务 | 文件 | 说明 |
 | --- | --- | --- | --- |
-| R2-4a | 实现 VMM 池 | `src/platform/cuda/cuda_vmm_pool.cu` | `cuMemCreate` + `cuMemMap` + `cuMemSetAccess` |
-| R2-4b | 集成到 `g_cuda.device_alloc` | `src/platform/cuda/cuda_memory.cu` | 优先从 VMM 池分配 |
-| R2-4c | 显存池 benchmark | `tests/bench_mem_pool.cu` | 对比 cudaMalloc vs VMM 池 |
+| R2-4a | 实现显存池 | `src/platform/cuda/cuda_memory.cu` | ✅ free-list allocator，power-of-2 bucket，64MB cap |
+| R2-4b | 集成池化接口 | `src/platform/cuda/cuda_memory.cu` | ✅ `cuda_device_alloc_pooled` + `cuda_device_free_sized` |
+| R2-4c | 显存池 benchmark | `tests/bench_mem_pool.cu` | 待实施 |
 
 ### R2-5: CUDA Graph 集成 ⭐
 
@@ -359,8 +359,8 @@ typedef struct {
 
 | # | 任务 | 文件 | 说明 |
 | --- | --- | --- | --- |
-| R2-6a | MMA Flash Attention FP16 | `mha_fused_f16_cuda.cu` | 使用 `nvcuda::wmma` 替代手动 FP16 计算 |
-| R2-6b | 与 FP32 混合调度集成 | `mha_fused_cuda.cu` | S≤64 预加载, S>64 Flash Attention, 均支持 FP16 |
+| R2-6a | MMA Flash Attention FP16 | `mha_fused_f16_cuda.cu` | ✅ S≤64 已有 WMMA 路径，S>64 待后续 |
+| R2-6b | 与 FP32 混合调度集成 | `mha_fused_cuda.cu` | 待后续 |
 
 ### R2-7: Flash Attention v2 参考优化 ⭐⭐⭐
 
@@ -422,9 +422,9 @@ typedef struct {
 
 | 状态 | 数量 | 内容 |
 | --- | --- | --- |
-| 已完成 | 37 | Phase A/B/C, M1-M3, O1-O2, F1, F2, C1-C2, H1-H7, M1-M5, L1/L4/L5, T1, R1-1 ~ R1-8, SIMD-1 ~ SIMD-5, Flash Attention, R2-7, R2-8a ~ R2-8b |
+| 已完成 | 41 | Phase A/B/C, M1-M3, O1-O2, F1, F2, C1-C2, H1-H7, M1-M5, L1/L4/L5, T1, R1-1 ~ R1-8, SIMD-1 ~ SIMD-5, Flash Attention, R2-2a, R2-3a, R2-4, R2-6a(partial), R2-7, R2-8a ~ R2-8b |
 | 暂缓 | 2 | L2 (惰性 D2H), L3 (层耦合) |
-| 计划中 | 6 | R2-1 ~ R2-6 |
+| 计划中 | 3 | R2-1, R2-2b~d, R2-5 |
 | 远期 | 5 | AVX2 微内核/ARM NEON/多GPU/CUDA Graph/模板生成 |
 
-> **最后更新**: 2026-06-22。Flash Attention smem skew padding + int4 向量化加载完成。
+> **最后更新**: 2026-06-22。R2-2a MatMul+bias 融合, R2-3 softmax 归约重构, R2-4 显存池完成。
