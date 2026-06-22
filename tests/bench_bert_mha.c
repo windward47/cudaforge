@@ -287,6 +287,106 @@ int main(void) {
     free(X); free(R); free(WQ); free(bQ); free(WK); free(bK);
     free(WV); free(bV); free(WO); free(bO);
 
+    /* ---- Long sequence benchmark (Flash Attention path) ---- */
+#ifdef USE_CUDA
+    cuda_platform_init(0);
+    fprintf(stderr, "\n=== Flash Attention Long Sequence Benchmark ===\n");
+
+    int64_t long_S_vals[] = {128, 256, 512};
+    int num_long = sizeof(long_S_vals) / sizeof(long_S_vals[0]);
+
+    for (int si = 0; si < num_long; si++) {
+        int64_t lS = long_S_vals[si];
+        int64_t lBS = B * lS;
+        int64_t l_elem = lBS * D;
+        int l_iters = (lS <= 256) ? 50 : 20;
+
+        float *lX = (float*)malloc(l_elem * sizeof(float));
+        float *lR = (float*)malloc(l_elem * sizeof(float));
+        float *lWQ = (float*)malloc(D * D * sizeof(float));
+        float *lbQ = (float*)malloc(D * sizeof(float));
+        float *lWK = (float*)malloc(D * D * sizeof(float));
+        float *lbK = (float*)malloc(D * sizeof(float));
+        float *lWV = (float*)malloc(D * D * sizeof(float));
+        float *lbV = (float*)malloc(D * sizeof(float));
+        float *lWO = (float*)malloc(D * D * sizeof(float));
+        float *lbO = (float*)malloc(D * sizeof(float));
+
+        random_fill(lX, l_elem, 42); random_fill(lR, l_elem, 99);
+        random_fill(lWQ, D*D, 123); random_fill(lbQ, D, 456);
+        random_fill(lWK, D*D, 789); random_fill(lbK, D, 234);
+        random_fill(lWV, D*D, 567); random_fill(lbV, D, 890);
+        random_fill(lWO, D*D, 345); random_fill(lbO, D, 678);
+
+        inference_graph_t* lg = graph_create();
+        tensor_t* ltX = tensor_create(DATA_TYPE_F32, 3, (int64_t[]){B, lS, D});
+        tensor_t* ltR = tensor_create(DATA_TYPE_F32, 3, (int64_t[]){B, lS, D});
+        tensor_t* ltY = tensor_create(DATA_TYPE_F32, 3, (int64_t[]){B, lS, D});
+        tensor_t* ltwQ = tensor_create(DATA_TYPE_F32, 2, (int64_t[]){D, D});
+        tensor_t* ltbQ = tensor_create(DATA_TYPE_F32, 1, (int64_t[]){D});
+        tensor_t* ltwK = tensor_create(DATA_TYPE_F32, 2, (int64_t[]){D, D});
+        tensor_t* ltbK = tensor_create(DATA_TYPE_F32, 1, (int64_t[]){D});
+        tensor_t* ltwV = tensor_create(DATA_TYPE_F32, 2, (int64_t[]){D, D});
+        tensor_t* ltbV = tensor_create(DATA_TYPE_F32, 1, (int64_t[]){D});
+        tensor_t* ltwO = tensor_create(DATA_TYPE_F32, 2, (int64_t[]){D, D});
+        tensor_t* ltbO = tensor_create(DATA_TYPE_F32, 1, (int64_t[]){D});
+
+        memcpy(ltX->data, lX, l_elem * sizeof(float));
+        memcpy(ltR->data, lR, l_elem * sizeof(float));
+        memcpy(ltwQ->data, lWQ, D*D*sizeof(float)); memcpy(ltbQ->data, lbQ, D*sizeof(float));
+        memcpy(ltwK->data, lWK, D*D*sizeof(float)); memcpy(ltbK->data, lbK, D*sizeof(float));
+        memcpy(ltwV->data, lWV, D*D*sizeof(float)); memcpy(ltbV->data, lbV, D*sizeof(float));
+        memcpy(ltwO->data, lWO, D*D*sizeof(float)); memcpy(ltbO->data, lbO, D*sizeof(float));
+
+        int ltidX = graph_add_tensor(lg, ltX);
+        int ltidR = graph_add_tensor(lg, ltR);
+        int ltidY = graph_add_tensor(lg, ltY);
+        graph_add_tensor(lg, ltwQ); graph_add_tensor(lg, ltbQ);
+        graph_add_tensor(lg, ltwK); graph_add_tensor(lg, ltbK);
+        graph_add_tensor(lg, ltwV); graph_add_tensor(lg, ltbV);
+        graph_add_tensor(lg, ltwO); graph_add_tensor(lg, ltbO);
+
+        mha_fused_params_t lp;
+        memset(&lp, 0, sizeof(lp));
+        lp.batch_size = B; lp.seq_len = lS; lp.hidden_size = D;
+        lp.num_heads = H; lp.head_dim = d; lp.scale = scale;
+        lp.has_residual = true;
+
+        int lin_tids[] = {ltidX, ltidR};
+        int lout_tids[] = {ltidY};
+        tensor_t* lw[] = {ltwQ, ltbQ, ltwK, ltbK, ltwV, ltbV, ltwO, ltbO};
+        graph_add_node(lg, OP_MHA_FUSED, 2, lin_tids, 1, lout_tids, 8, lw, &lp, sizeof(lp));
+        int lin_id = graph_add_node(lg, OP_INPUT, 0, NULL, 1, (int[]){ltidX}, 0, NULL, NULL, 0);
+        int lout_id = graph_add_node(lg, OP_OUTPUT, 1, (int[]){ltidY}, 0, NULL, 0, NULL, NULL, 0);
+        graph_set_input(lg, lin_id);
+        graph_set_output(lg, lout_id);
+        graph_build(lg);
+
+        /* Warmup + bench CUDA */
+        tensor_t* linputs[] = {ltX};
+        tensor_t* loutputs[] = {ltY};
+        for (int i = 0; i < 3; i++) {
+            memset(ltY->data, 0, l_elem * sizeof(float));
+            graph_execute(lg, linputs, loutputs, true);
+        }
+        double lt0 = now_ms();
+        for (int i = 0; i < l_iters; i++) {
+            memset(ltY->data, 0, l_elem * sizeof(float));
+            graph_execute(lg, linputs, loutputs, true);
+        }
+        double lt1 = now_ms();
+        double ltotal = lt1 - lt0;
+        const char* path = (lS <= 512) ? "flash_v2" : "split_kv";
+        fprintf(stderr, "  S=%-4lld CUDA: %.3f ms/iter  (%d iters, %s)\n",
+                (long long)lS, ltotal / l_iters, l_iters, path);
+
+        free(lX); free(lR); free(lWQ); free(lbQ); free(lWK); free(lbK);
+        free(lWV); free(lbV); free(lWO); free(lbO);
+        graph_destroy(lg);
+    }
+    cuda_platform_finalize();
+#endif
+
     platform_finalize();
     fprintf(stderr, "\nBench done.\n");
     return 0;
