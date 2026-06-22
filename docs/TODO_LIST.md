@@ -385,6 +385,25 @@ typedef struct {
 
 > ✅ **R2-7 全部完成** — warp 归约 + exp2f + K/V 预计算 + Split-KV 长序列。35/35 测试通过。
 
+### R2-8: Flash Attention 硬件级优化 ⭐⭐⭐
+
+**来源**：`cuda-samples-12.8/Samples/3_CUDA_Features/cudaTensorCoreGemm/cudaTensorCoreGemm.cu` NVIDIA 官方 Tensor Core GEMM 示例。
+
+**目标**：参考官方 GEMM 的 smem 布局、向量化拷贝、流水线技术，进一步优化 flash attention kernel 的 memory efficiency。
+
+**参考文件**：
+
+- `cuda-samples-12.8/.../cudaTensorCoreGemm.cu` — skew padding (line 151-163), int4 拷贝 (line 133,317), 双 buffer (line 295-363)
+- `flash-attention-main/csrc/flash_attn/src/kernel_traits.h` — smem swizzle (line 79-95)
+
+| # | 任务 | 文件 | 优先级 | 预期收益 | 说明 |
+| --- | --- | --- | --- | --- | --- |
+| R2-8a | smem skew padding | `mha_fused_cuda.cu` | 高 | 1.2-1.5× | K/V smem 每行加 SKEW padding 消除 bank conflict |
+| R2-8b | int4 向量化加载 | `mha_fused_cuda.cu` | 高 | 1.3-1.5× | K/V 从 global memory 用 int4 (16B) 加载替代逐 float |
+| R2-8c | 双 buffer 流水线 | `mha_fused_cuda.cu` | 中 | 1.1-1.3× | 加载下一个 K/V tile 的同时计算当前 tile |
+
+> ✅ **R2-8a ~ R2-8b 已完成** — smem skew padding (FA_SKEW=8) + int4 向量化加载。35/35 测试通过。R2-8c (双 buffer) 待后续优化。
+
 ---
 
 ## 远期规划
@@ -403,9 +422,9 @@ typedef struct {
 
 | 状态 | 数量 | 内容 |
 | --- | --- | --- |
-| 已完成 | 35 | Phase A/B/C, M1-M3, O1-O2, F1, F2, C1-C2, H1-H7, M1-M5, L1/L4/L5, T1, R1-1 ~ R1-8, SIMD-1 ~ SIMD-5, Flash Attention, R2-7 |
+| 已完成 | 37 | Phase A/B/C, M1-M3, O1-O2, F1, F2, C1-C2, H1-H7, M1-M5, L1/L4/L5, T1, R1-1 ~ R1-8, SIMD-1 ~ SIMD-5, Flash Attention, R2-7, R2-8a ~ R2-8b |
 | 暂缓 | 2 | L2 (惰性 D2H), L3 (层耦合) |
 | 计划中 | 6 | R2-1 ~ R2-6 |
 | 远期 | 5 | AVX2 微内核/ARM NEON/多GPU/CUDA Graph/模板生成 |
 
-> **最后更新**: 2026-06-22。Flash Attention v2 参考优化全部完成（warp 归约 + exp2f + K/V 预计算 + Split-KV 长序列）。
+> **最后更新**: 2026-06-22。Flash Attention smem skew padding + int4 向量化加载完成。

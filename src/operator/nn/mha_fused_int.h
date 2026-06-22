@@ -38,4 +38,12 @@ typedef struct {
  *   +1 for safety when tile_n is not a multiple of FA_NUM_THREADS */
 #define FA_MAX_SCORES_PER_THREAD (FA_TILE_BN / FA_NUM_THREADS + 1)
 
+/* Shared memory skew padding to reduce bank conflicts.
+ * Each row of K_smem/V_smem has (d + FA_SKEW) floats.
+ * The extra FA_SKEW floats shift successive rows to different banks.
+ * 8 floats = 32 bytes = 1 bank period for float (4B × 32 banks = 128B,
+ * but 8 floats offset is enough to break conflict patterns for d=64).
+ * Reference: cudaTensorCoreGemm.cu SKEW_HALF = 16 (for half type) */
+#define FA_SKEW 8
+
 #endif /* MHA_FUSED_INT_H_ */

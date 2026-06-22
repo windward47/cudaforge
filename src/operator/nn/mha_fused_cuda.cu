@@ -240,10 +240,17 @@ __global__ void mha_flash_attn_v2_kernel(
     const float* R_bs = (has_residual && R) ? (R + ((int64_t)b * S_int + si) * D_int) : NULL;
     const int64_t kv_batch_stride = (int64_t)S_int * H_kv_int * d_int;
 
+    /* Shared memory layout with skew padding to reduce bank conflicts.
+     * K_smem: FA_TILE_BN × (d + FA_SKEW)  — padded stride
+     * V_smem: FA_TILE_BN × (d + FA_SKEW)
+     * red_smem: num_warps floats
+     *
+     * Access: K_smem[sk * smem_stride + dk] where smem_stride = d + FA_SKEW */
     extern __shared__ float smem[];
+    const int smem_stride = d_int + FA_SKEW;
     float* K_smem  = smem;
-    float* V_smem  = K_smem + FA_TILE_BN * d_int;
-    float* red_smem = V_smem + FA_TILE_BN * d_int;
+    float* V_smem  = K_smem + FA_TILE_BN * smem_stride;
+    float* red_smem = V_smem + FA_TILE_BN * smem_stride;
 
     for (int j = tid; j < D_int; j += FA_NUM_THREADS) {
         float val = (bO ? bO[j] : 0.0f);
@@ -266,7 +273,7 @@ __global__ void mha_flash_attn_v2_kernel(
         __syncthreads();
 
         float Q_reg[FA_MAX_D];
-        for (int di = 0; di < d_int; di++) Q_reg[di] = K_smem[di];
+        for (int di = 0; di < d_int; di++) Q_reg[di] = K_smem[di];  /* K_smem[0..d-1] is contiguous */
         __syncthreads();
 
         float max_val = -1e38f, sum_val = 0.0f;
@@ -283,12 +290,29 @@ __global__ void mha_flash_attn_v2_kernel(
             const float* K_base = K_buf + (int64_t)b * kv_batch_stride + kv_ho;
             const float* V_base = V_buf + (int64_t)b * kv_batch_stride + kv_ho;
 
-            for (int i = tid; i < tile_n * d_int; i += FA_NUM_THREADS) {
-                int sk = i / d_int;
-                int dk = i % d_int;
-                int64_t offset = (int64_t)(kv_start + sk) * H_kv_int * d_int + dk;
-                K_smem[sk * d_int + dk] = K_base[offset];
-                V_smem[sk * d_int + dk] = V_base[offset];
+            /* Load K, V tiles with int4 vectorized copy (16 bytes per thread per iter).
+             * When d_int is divisible by 4, each thread copies 4 floats at once. */
+            if (d_int % 4 == 0) {
+                const int d4 = d_int / 4;
+                for (int i = tid; i < tile_n * d4; i += FA_NUM_THREADS) {
+                    int sk = i / d4;
+                    int dk4 = i % d4;
+                    int64_t g_offset = (int64_t)(kv_start + sk) * H_kv_int * d_int + dk4 * 4;
+                    int s_offset = sk * smem_stride + dk4 * 4;
+                    /* Reinterpret as int4 for 16-byte load */
+                    *reinterpret_cast<int4*>(&K_smem[s_offset]) =
+                        *reinterpret_cast<const int4*>(&K_base[g_offset]);
+                    *reinterpret_cast<int4*>(&V_smem[s_offset]) =
+                        *reinterpret_cast<const int4*>(&V_base[g_offset]);
+                }
+            } else {
+                for (int i = tid; i < tile_n * d_int; i += FA_NUM_THREADS) {
+                    int sk = i / d_int;
+                    int dk = i % d_int;
+                    int64_t offset = (int64_t)(kv_start + sk) * H_kv_int * d_int + dk;
+                    K_smem[sk * smem_stride + dk] = K_base[offset];
+                    V_smem[sk * smem_stride + dk] = V_base[offset];
+                }
             }
             __syncthreads();
 
@@ -300,7 +324,7 @@ __global__ void mha_flash_attn_v2_kernel(
             for (int sk = tid; sk < tile_n; sk += FA_NUM_THREADS) {
                 float dot = 0.0f;
                 for (int di = 0; di < d_int; di++)
-                    dot += Q_reg[di] * K_smem[sk * d_int + di];
+                    dot += Q_reg[di] * K_smem[sk * smem_stride + di];
                 float s = dot * scale;
                 if (causal && (kv_start + sk) > si) s = -1e38f;
                 my_scores[my_count] = s;
@@ -337,7 +361,7 @@ __global__ void mha_flash_attn_v2_kernel(
                 local_sum += p;
                 int sk = my_indices[i];
                 for (int di = 0; di < d_int; di++)
-                    local_out[di] += p * V_smem[sk * d_int + di];
+                    local_out[di] += p * V_smem[sk * smem_stride + di];
             }
 
             float warp_sum = warp_reduce_sum(local_sum);
@@ -442,9 +466,10 @@ __global__ void mha_flash_attn_splitkv_kernel(
     }
 
     extern __shared__ float smem[];
+    const int smem_stride = d_int + FA_SKEW;
     float* K_smem  = smem;
-    float* V_smem  = K_smem + FA_TILE_BN * d_int;
-    float* red_smem = V_smem + FA_TILE_BN * d_int;
+    float* V_smem  = K_smem + FA_TILE_BN * smem_stride;
+    float* red_smem = V_smem + FA_TILE_BN * smem_stride;
 
     /* Q is pre-computed in Q_buf, loaded into Q_reg above */
 
@@ -462,24 +487,39 @@ __global__ void mha_flash_attn_splitkv_kernel(
         int tile_start = kv_start + kt * FA_TILE_BN;
         int tile_n = min(FA_TILE_BN, kv_end - tile_start);
 
-        for (int i = tid; i < tile_n * d_int; i += FA_NUM_THREADS) {
-            int sk = i / d_int;
-            int dk = i % d_int;
-            int64_t offset = (int64_t)(tile_start + sk) * H_kv_int * d_int + dk;
-            K_smem[sk * d_int + dk] = K_base[offset];
-            V_smem[sk * d_int + dk] = V_base[offset];
+        /* Load K, V tiles with int4 vectorized copy when possible */
+        if (d_int % 4 == 0) {
+            const int d4 = d_int / 4;
+            for (int i = tid; i < tile_n * d4; i += FA_NUM_THREADS) {
+                int sk = i / d4;
+                int dk4 = i % d4;
+                int64_t g_offset = (int64_t)(tile_start + sk) * H_kv_int * d_int + dk4 * 4;
+                int s_offset = sk * smem_stride + dk4 * 4;
+                *reinterpret_cast<int4*>(&K_smem[s_offset]) =
+                    *reinterpret_cast<const int4*>(&K_base[g_offset]);
+                *reinterpret_cast<int4*>(&V_smem[s_offset]) =
+                    *reinterpret_cast<const int4*>(&V_base[g_offset]);
+            }
+        } else {
+            for (int i = tid; i < tile_n * d_int; i += FA_NUM_THREADS) {
+                int sk = i / d_int;
+                int dk = i % d_int;
+                int64_t offset = (int64_t)(tile_start + sk) * H_kv_int * d_int + dk;
+                K_smem[sk * smem_stride + dk] = K_base[offset];
+                V_smem[sk * smem_stride + dk] = V_base[offset];
+            }
         }
         __syncthreads();
 
         float tile_max = -1e38f;
         int my_count = 0;
-        float my_scores[8];
-        int my_indices[8];
+        float my_scores[FA_MAX_SCORES_PER_THREAD];
+        int my_indices[FA_MAX_SCORES_PER_THREAD];
 
         for (int sk = tid; sk < tile_n; sk += FA_NUM_THREADS) {
             float dot = 0.0f;
             for (int di = 0; di < d_int; di++)
-                dot += Q_reg[di] * K_smem[sk * d_int + di];
+                dot += Q_reg[di] * K_smem[sk * smem_stride + di];
             float s = dot * scale;
             if (causal && (tile_start + sk) > si) s = -1e38f;
             my_scores[my_count] = s;
@@ -499,7 +539,6 @@ __global__ void mha_flash_attn_splitkv_kernel(
         }
         __syncthreads();
         float block_max = red_smem[0];
-        __syncthreads();
 
         if (block_max > max_val) {
             float rescale = __expf(max_val - block_max);
@@ -517,7 +556,7 @@ __global__ void mha_flash_attn_splitkv_kernel(
             local_sum += p;
             int sk = my_indices[i];
             for (int di = 0; di < d_int; di++)
-                local_out[di] += p * V_smem[sk * d_int + di];
+                local_out[di] += p * V_smem[sk * smem_stride + di];
         }
 
         float warp_sum = warp_reduce_sum(local_sum);
@@ -699,7 +738,8 @@ int mha_fused_f32_cuda(const void* inputs[], void* outputs[],
         dim3 attn_grid((unsigned int)(B * S), 1, 1);
         dim3 attn_block(FA_NUM_THREADS, 1, 1);
         int num_warps = FA_NUM_THREADS / 32;
-        size_t smem_bytes = (size_t)(2 * FA_TILE_BN * d + num_warps) * sizeof(float);
+        int smem_stride = (int)d + FA_SKEW;
+        size_t smem_bytes = (size_t)(2 * FA_TILE_BN * smem_stride + num_warps) * sizeof(float);
 
         if (smem_bytes > 48 * 1024) {
             cudaFuncSetAttribute(mha_flash_attn_v2_kernel,
@@ -748,7 +788,8 @@ int mha_fused_f32_cuda(const void* inputs[], void* outputs[],
             dim3 splitkv_grid(num_splits, (unsigned int)(B * S), (unsigned int)H_q);
             dim3 splitkv_block(FA_NUM_THREADS, 1, 1);
             int num_warps = FA_NUM_THREADS / 32;
-            size_t smem_bytes = (size_t)(2 * FA_TILE_BN * d + num_warps) * sizeof(float);
+            int smem_stride = (int)d + FA_SKEW;
+            size_t smem_bytes = (size_t)(2 * FA_TILE_BN * smem_stride + num_warps) * sizeof(float);
 
             if (smem_bytes > 48 * 1024) {
                 cudaFuncSetAttribute(mha_flash_attn_splitkv_kernel,
