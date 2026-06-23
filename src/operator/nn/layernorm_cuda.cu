@@ -75,6 +75,69 @@ __global__ void layernorm_f32_kernel(
     }
 }
 
+/* ============================================================
+ * Fused LayerNorm + Residual Add
+ * y = LayerNorm(x + residual) * gamma + beta
+ * Saves one full read+write pass over the residual tensor.
+ * ============================================================ */
+__global__ void layernorm_residual_f32_kernel(
+    const float* __restrict__ x,
+    const float* __restrict__ residual,
+    const float* __restrict__ gamma,
+    const float* __restrict__ beta,
+    float* __restrict__ y,
+    int64_t N, int64_t D, float epsilon)
+{
+    extern __shared__ float s_buf[];
+    float* s_data = s_buf;
+
+    int64_t n = blockIdx.x;
+    if (n >= N) return;
+
+    int tid = threadIdx.x;
+    int D_int = (int)D;
+
+    const float* xn = x + n * D;
+    const float* rn = residual + n * D;
+    float*       yn = y + n * D;
+    const float* gn = gamma;
+    const float* bn = beta;
+
+    /* Compute mean of (x + residual) */
+    float local_sum = 0.0f;
+    for (int i = tid; i < D_int; i += blockDim.x)
+        local_sum += xn[i] + rn[i];
+
+    s_data[tid] = local_sum;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) s_data[tid] += s_data[tid + stride];
+        __syncthreads();
+    }
+    float mean = s_data[0] / (float)D;
+
+    /* Compute variance */
+    float local_var = 0.0f;
+    for (int i = tid; i < D_int; i += blockDim.x) {
+        float diff = xn[i] + rn[i] - mean;
+        local_var += diff * diff;
+    }
+
+    s_data[tid] = local_var;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) s_data[tid] += s_data[tid + stride];
+        __syncthreads();
+    }
+    float inv_std = rsqrtf(s_data[0] / (float)D + epsilon);
+
+    /* Normalize with fused residual */
+    for (int i = tid; i < D_int; i += blockDim.x) {
+        float val = xn[i] + rn[i];
+        yn[i] = (val - mean) * inv_std * gn[i] + bn[i];
+    }
+}
+
 int layernorm_f32_cuda(const void* inputs[], void* outputs[],
                        const operator_params_t* params, stream_t* stream) {
     if (!inputs || !inputs[0] || !inputs[1] || !inputs[2] || !outputs || !outputs[0])
