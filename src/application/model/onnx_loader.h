@@ -23,4 +23,8 @@ onnx_model_t* onnx_load_from_file(const char* path);
 /* Free all resources */
 void onnx_model_destroy(onnx_model_t* model);
 
+/* Post-load: quantize MatMul weight tensors to INT8 block format.
+ * Returns number of quantized weights. Requires quantize_int.h. */
+int onnx_quantize_weights(onnx_model_t* model);
+
 #endif /* ONNX_LOADER_H_ */

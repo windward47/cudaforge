@@ -1,6 +1,10 @@
 #include "onnx_loader.h"
 #include "onnx_parser.h"
 #include "operator.h"
+#include "quantize_int.h"
+
+extern void quantize_f32_to_q8(const float* src, block_q8_t* dst, int64_t n);
+extern void dequantize_q8_to_f32(const block_q8_t* src, float* dst, int64_t n);
 #include "matmul_int.h"
 #include "conv_int.h"
 #include "pooling_int.h"
@@ -2192,6 +2196,56 @@ onnx_model_t* onnx_load_from_file(const char* path) {
     free(pm);
 
     return model;
+}
+
+/* ============================================================
+ * Post-load weight quantization: FP32 → INT8 block format.
+ *
+ * Finds all MatMul nodes with 2D weight tensors (M×K) and
+ * quantizes the weight data to block_q8_t format in-place.
+ * The original FP32 data is replaced with quantized+dequantized
+ * version (simulated quantization for precision testing).
+ *
+ * For production use, the quantized blocks would be stored
+ * separately and the INT8 MatMul kernel would be dispatched.
+ * ============================================================ */
+int onnx_quantize_weights(onnx_model_t* model) {
+    if (!model || !model->graph) return 0;
+
+    inference_graph_t* g = model->graph;
+    int quantized_count = 0;
+
+    for (int i = 0; i < g->num_nodes; i++) {
+        graph_node_t* n = &g->nodes[i];
+        if (n->type != OP_MATMUL) continue;
+
+        /* MatMul weight is typically the second input (index 1) */
+        if (n->num_weights < 1 || !n->weights || !n->weights[0]) continue;
+
+        tensor_t* w = n->weights[0];
+        if (w->dtype != DATA_TYPE_F32 || w->ndim != 2) continue;
+
+        int64_t M = w->shape[0];
+        int64_t K = w->shape[1];
+        int64_t numel = M * K;
+        if (numel < Q8_BLOCK_SIZE) continue;
+
+        /* Quantize and dequantize in-place (simulated quantization) */
+        float* data = (float*)w->data;
+        if (!data) continue;
+
+        int64_t num_blocks = Q8_NUM_BLOCKS(numel);
+        block_q8_t* qbuf = (block_q8_t*)malloc(num_blocks * sizeof(block_q8_t));
+        if (!qbuf) continue;
+
+        quantize_f32_to_q8(data, qbuf, numel);
+        dequantize_q8_to_f32(qbuf, data, numel);
+        free(qbuf);
+
+        quantized_count++;
+    }
+
+    return quantized_count;
 }
 
 void onnx_model_destroy(onnx_model_t* model) {
