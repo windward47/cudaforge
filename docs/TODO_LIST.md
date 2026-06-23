@@ -68,8 +68,8 @@ out:    每个 warp 独立计算 16×d，最后 atomicAdd 到 Y
 | # | 任务 | 文件 | 说明 |
 | --- | --- | --- | --- |
 | R5-a | FP16 kernel 标记为 experimental | `mha_fused_cuda.cu` | ✅ 已标记，host dispatch 中注释说明 |
-| R5-b | 更新 ARCHITECTURE.md | `docs/ARCHITECTURE.md` | 新增 Flash Attention 架构说明 |
-| R5-c | 更新 CUDA_GUIDE.md | `docs/CUDA_GUIDE.md` | 新增 WMMA/FA2 优化指南 |
+| R5-b | 更新 ARCHITECTURE.md | `docs/ARCHITECTURE.md` | ✅ 新增 Flash Attention 架构说明 |
+| R5-c | 更新 CUDA_GUIDE.md | `docs/CUDA_GUIDE.md` | ✅ 新增 WMMA 实战注意 + FA2 优化路径 |
 
 ---
 
@@ -77,8 +77,8 @@ out:    每个 warp 独立计算 16×d，最后 atomicAdd 到 Y
 
 | 状态 | 内容 |
 | --- | --- |
-| 已完成 | R1 全部, R2 全部, R3-a, R4-a/b/c/d, R5-a, Flash Attention v2 多行 Q tiling (2-3× 提升) |
-| 进行中 | R5-b/c 文档更新 |
-| 计划中 | FP16 WMMA 调试 |
+| 已完成 | R1 全部, R2 全部, R3-a, R4-a/b/c/d, R5 全部, Flash Attention v2 多行 Q tiling (2-3× 提升) |
+| 进行中 | — |
+| 计划中 | FP16 WMMA Flash Attention 完整重写 (列分块 accumulator fragment) |
 
 > **最后更新**: 2026-06-23。

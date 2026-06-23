@@ -423,6 +423,41 @@ float mean = s_mean[0];
 
 与 warp-level reduction 不同，共享内存归约在 block 级（非 warp 级）做数据聚合，适合每个 block 负责一个归约单元的算子（如 LayerNorm 沿最后一维归约）。
 
+### Flash Attention（MHA Fused）
+
+`mha_fused` 算子实现了 Flash Attention 算法，是本项目最复杂的 CUDA kernel。它根据序列长度 `S` 分三条路径调度：
+
+| 路径 | 条件 | Kernel | 特点 |
+| --- | --- | --- | --- |
+| Preloaded K/V | `S ≤ 64` | `mha_preloaded_kernel` | 全量 K/V 预载入共享内存，短序列最快 |
+| Flash Attention v2 | `64 < S ≤ 512` | `mha_flash_attn_v2_kernel` | 分块加载 K/V + online softmax |
+| Split-KV | `S > 512` | `mha_flash_attn_splitkv_kernel` + `combine` | K/V 分割并行 + LSE 加权合并 |
+
+**多行 Q Tiling（R4 关键优化）**：
+
+Flash Attention v2 kernel 采用 FA2 论文 Section 3.3 的工作分配策略：
+
+```text
+Grid:  (ceil(S/64), B, H_q)      ← 每个 head 独立一个 block 维度
+Block: (128 threads = 4 warps)
+
+每个 warp 处理 Q 的 16 行 (64/4 = 16):
+  Warp 0: Q rows 0-15    Warp 1: Q rows 16-31
+  Warp 2: Q rows 32-47   Warp 3: Q rows 48-63
+
+K/V: 4 warps 共享同一份 smem tile
+scores: 每个 warp 独立计算自己的 16×tile_n，无需跨 warp 通信
+归约: warp_reduce_sum/max (shuffle 指令，无 smem)
+```
+
+这种 "warp 分 Q" 设计消除了 FlashAttention v1 的 split-K 跨 warp 通信（FA2 论文 Fig 3b），是性能提升 2-3× 的关键。
+
+**Online Softmax**：使用经典的两遍在线 softmax，通过 `exp2f(x * log2e)` 替代 `expf(x)` 加速（参考 `cuda_reduce.cuh` 的 warp 归约原语）。
+
+**K/V 预计算**：attention kernel 前先用独立 kernel (`mha_precompute_kv_kernel`) 把 K/V 投影结果存入 global buffer，避免每行 Q 重复计算投影。
+
+> **FP16 WMMA 路径**：`mha_flash_attn_v2_f16_kernel` 使用 WMMA 16×16 Tensor Core 加速 Q·Kᵀ 和 P·V。当前为 experimental，需配合正确的列分块 accumulator fragment 设计（见 [CUDA_GUIDE.md](CUDA_GUIDE.md)）。
+
 ## 8. 构建系统
 
 ### CMake 结构

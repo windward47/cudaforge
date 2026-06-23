@@ -237,6 +237,33 @@ __global__ void matmul_f16_tc(const half* A, const half* B, float* C,
 }
 ```
 
+#### WMMA 注意事项（RTX 2050 / sm_86 实战经验）
+
+1. **smem 对齐**：`wmma::load_matrix_sync` 要求 256-bit（32 字节）对齐。共享内存指针起始地址需对齐，每行 leading dimension 应为 16 的倍数。
+2. **smem skew padding**：朴素行优先布局会引发 bank conflict。参考 `cudaTensorCoreGemm.cu` 的 `SKEW_HALF`，每行末尾加 16 个 half 偏移（本项目 `FA_SKEW`）。
+3. **行/列主序与转置**：要计算 `Q · Kᵀ`，K 在 smem 中是 `(rows, d)` 行主序，用 `wmma::col_major` 加载即得到 `Kᵀ`（标准技巧，无需手动转置）。
+4. **寄存器压力**：accumulator fragment 每个 16×16 占 8 个 float/线程。**切勿**用 `float out[ROWS][D]` 这样的 per-thread 大数组（如 16×64=1024 floats）做 WMMA 输出累积——会导致寄存器溢出 / kernel 无法启动（"unspecified launch failure"）。正确做法是用多个 fragment（4 个 16×16 fragment 覆盖 64 列，共 32 floats/线程）。
+5. **partial tile 处理**：K/V tile 不足 16 行时，WMMA 仍读取 16 行，超出部分必须零填充，否则读到 garbage。
+
+#### Flash Attention 2 优化路径
+
+参考 `flash-attention-main/` 官方实现 + Tri Dao 论文。本项目 `mha_fused_cuda.cu` 的演进（FP32 路径）：
+
+| 阶段 | 优化 | S=512 耗时 | 关键改动 |
+| --- | --- | --- | --- |
+| 初始 | 标量循环 | 391 ms | 每 block 1 行 Q，smem 全局归约 |
+| R2-7 | warp 归约 + exp2f | 391 ms | `warp_reduce_sum/max` + `exp2f(x*log2e)` |
+| R3-a | grid H_q 维度 | 310 ms | `blockIdx.z = h`，消除 head 串行 |
+| R4-a/b | 多行 Q tiling | **93 ms** | BM=64，4 warps 各 16 行，warp 级归约无通信 |
+
+**FA2 对齐要点**（论文 Section 3.1-3.3）：
+- **Online softmax 不缩放中间 O**：每轮只 rescale 一次 `exp(m_old - m_new)`，最后才 `O = diag(ℓ)^{-1} · Õ`
+- **外层 Q / 内层 K-V 循环**：Q blocks 天然并行（grid 维度）
+- **Warp 分 Q 不分 K/V**（Fig 3b）：每个 warp 独立处理 Q 的不同行，K/V 共享，**无跨 warp 通信**
+- **non-matmul FLOP 贵 16×**：尽量把 Q·Kᵀ 和 P·V 走 Tensor Core（FP16 路径，见下）
+
+**未完成项**：FP16 WMMA Flash Attention（`mha_flash_attn_v2_f16_kernel`）需正确的列分块 accumulator fragment 设计（见上文第 4 点），当前为 experimental。
+
 ### Level 4: Kernel Fusion（算子融合）
 
 适用场景：Conv/MatMul → ReLU/Sigmoid/GELU 连续模式，或 Multi-Head Attention 子图融合，消除中间张量的显存往返。
