@@ -295,7 +295,7 @@ typedef struct {
 | R2-1b | CPU 量化/反量化 | `src/operator/nn/quantize.c` | ✅ `quantize_f32_to_q8()`, `dequantize_q8_to_f32()` |
 | R2-1c | CUDA 量化 kernel | `src/operator/nn/quantize_cuda.cu` | ✅ GPU 量化/反量化 + INT8 MatMul |
 | R2-1d | INT8 MatMul kernel | `src/operator/nn/quantize_cuda.cu` | ✅ `matmul_q8_f32_cuda` INT8×FP32 |
-| R2-1e | ONNX loader 量化支持 | `src/application/model/onnx_loader.c` | 待实施 |
+| R2-1e | ONNX loader 量化支持 | `src/application/model/onnx_loader.c` | ✅ `onnx_quantize_weights()` |
 | R2-1f | 精度测试 | `tests/test_quantize.cu` | ✅ max_rel=6.97e-04 |
 
 ### R2-2: 算子融合扩展 ⭐⭐⭐
@@ -324,7 +324,7 @@ typedef struct {
 | # | 任务 | 文件 | 说明 |
 | --- | --- | --- | --- |
 | R2-3a | 创建 CUDA 归约原语 | `src/platform/cuda/cuda_reduce.cuh` | ✅ `warp_reduce_sum/max`, `block_reduce_sum/max`, `quad_reduce_sum/max` |
-| R2-3b | 重构现有算子使用 | `softmax_cuda.cu` | ✅ softmax 已重构，layernorm/reduce 待后续 |
+| R2-3b | 重构现有算子使用 | `softmax_cuda.cu`, `layernorm_cuda.cu` | ✅ softmax + layernorm 已重构 |
 
 ### R2-4: CUDA VMM 内存池 ⭐⭐
 
@@ -348,8 +348,8 @@ typedef struct {
 
 | # | 任务 | 文件 | 说明 |
 | --- | --- | --- | --- |
-| R2-5a | graph_execute 支持 CUDA Graph 捕获 | `src/application/engine/graph.c` | 初步实现已回退（SEGFAULT），需更仔细的 stream 管理 |
-| R2-5b | 图缓存管理 | `src/application/engine/graph_cache.c` | 按 input shape 缓存 CUDA Graph |
+| R2-5a | graph_execute 支持 CUDA Graph 捕获 | `src/application/engine/graph.c` | ✅ 三阶段: 正常执行→捕获→重放 |
+| R2-5b | 图缓存管理 | `src/application/engine/graph.h` | ✅ 按 B/S 形状缓存，变化时自动失效 |
 
 ### R2-6: Flash Attention FP16 优化 ⭐
 
@@ -422,9 +422,9 @@ typedef struct {
 
 | 状态 | 数量 | 内容 |
 | --- | --- | --- |
-| 已完成 | 44 | Phase A/B/C, M1-M3, O1-O2, F1, F2, C1-C2, H1-H7, M1-M5, L1/L4/L5, T1, R1-1 ~ R1-8, SIMD-1 ~ SIMD-5, Flash Attention, R2-1, R2-2a~d, R2-3a, R2-4, R2-6a(partial), R2-7, R2-8a ~ R2-8b |
+| 已完成 | 47 | Phase A/B/C, M1-M3, O1-O2, F1, F2, C1-C2, H1-H7, M1-M5, L1/L4/L5, T1, R1-1 ~ R1-8, SIMD-1 ~ SIMD-5, Flash Attention, R2-1, R2-2a~d, R2-3, R2-4, R2-5, R2-6a(partial), R2-7, R2-8a ~ R2-8b |
 | 暂缓 | 2 | L2 (惰性 D2H), L3 (层耦合) |
-| 计划中 | 3 | R2-1e, R2-3b, R2-5 |
-| 远期 | 5 | AVX2 微内核/ARM NEON/多GPU/CUDA Graph/模板生成 |
+| 计划中 | 0 | — |
+| 远期 | 5 | AVX2 微内核/ARM NEON/多GPU/模板生成 |
 
-> **最后更新**: 2026-06-22。R2-1 INT8 量化, R2-2b~d 融合 kernel 完成。
+> **最后更新**: 2026-06-22。R2 全部完成。INT8 量化 + 融合 kernel + 归约重构 + 显存池 + CUDA Graph。
