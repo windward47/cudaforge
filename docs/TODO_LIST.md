@@ -385,6 +385,20 @@ typedef struct {
 
 > ✅ **R2-7 全部完成** — warp 归约 + exp2f + K/V 预计算 + Split-KV 长序列。35/35 测试通过。
 
+### R3: Flash Attention 瓶颈优化 ⭐⭐⭐
+
+**来源**：Nsight Systems profiling (S=512 场景)
+
+**问题**：`mha_flash_attn_v2_kernel` 占 99.1% 时间 (384ms)，grid 只有 (B×S)=512 blocks，每个 block 串行处理 12 个 head。RTX 2050 有 16 SM，每 SM 仅 32 blocks，head 间完全串行。
+
+| # | 任务 | 文件 | 优先级 | 预期收益 | 说明 |
+| --- | --- | --- | --- | --- | --- |
+| R3-a | Grid 加 H_q 维度 | `mha_fused_cuda.cu` | P0 | 8-12× | grid 改为 `(ceil(S/64), B, H_q)`，消除 head 串行循环 |
+| R3-b | Split-KV 同步更新 | `mha_fused_cuda.cu` | P0 | 配合 R3-a | splitkv kernel 已有 H_q 维度，确保一致性 |
+| R3-c | 寄存器优化 | `mha_fused_int.h` | P1 | 1.2-1.5× | 限制 maxrregcount=32 提高 occupancy |
+
+> 进度：待实施。
+
 ### R2-8: Flash Attention 硬件级优化 ⭐⭐⭐
 
 **来源**：`cuda-samples-12.8/Samples/3_CUDA_Features/cudaTensorCoreGemm/cudaTensorCoreGemm.cu` NVIDIA 官方 Tensor Core GEMM 示例。
