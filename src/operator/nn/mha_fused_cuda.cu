@@ -210,12 +210,16 @@ __global__ void mha_preloaded_kernel(
 
 
 /* ============================================================
- * Kernel 2: Flash Attention v2 (single pass, 64 < S <= 512)
+ * Kernel 2: Flash Attention v2 — Multi-row Q Tiling
  *
- * Uses pre-computed K_buf, V_buf.
- * Grid: (ceil(S/FA_TILE_BM), B, H_q), Block: (FA_NUM_THREADS=128)
+ * Each block processes FA_TILE_BM query rows for one head.
+ * 4 warps, each handles FA_TILE_BM/4 = 16 rows of Q.
+ * K/V shared across all warps — no inter-warp communication.
  *
- * R3-a: blockIdx.z = h, no head loop. Each block handles one head.
+ * Grid:  (ceil(S/FA_TILE_BM), B, H_q)
+ * Block: (FA_NUM_THREADS=128, 4 warps)
+ *
+ * Reference: FA2 Section 3.3 — warp partitioning
  * ============================================================ */
 __global__ void mha_flash_attn_v2_kernel(
     const float* __restrict__ X,
@@ -226,10 +230,9 @@ __global__ void mha_flash_attn_v2_kernel(
     int64_t B, int64_t S, int64_t D, int64_t H_q, int64_t H_kv, int64_t d,
     float scale, int has_residual, int causal)
 {
-    const int bs = blockIdx.x;       /* batch * S index */
-    const int b  = bs / (int)S;     /* batch */
-    const int si = bs % (int)S;     /* query row */
-    const int h  = blockIdx.z;      /* head */
+    const int m_block = blockIdx.x;  /* Q tile index */
+    const int b       = blockIdx.y;  /* batch */
+    const int h       = blockIdx.z;  /* head */
     const int tid     = threadIdx.x;
     const int warp_id = tid / 32;
     const int lane_id = tid % 32;
@@ -243,6 +246,10 @@ __global__ void mha_flash_attn_v2_kernel(
     const int kv_h = h / group_size;
     const int kv_ho = kv_h * d_int;
 
+    /* Each warp handles ROWS_PER_WARP rows of Q */
+    constexpr int ROWS_PER_WARP = FA_TILE_BM / FA_NUM_WARPS;  /* 64/4 = 16 */
+    const int warp_row_start = m_block * FA_TILE_BM + warp_id * ROWS_PER_WARP;
+
     const float* X_b  = X + (int64_t)b * S_int * D_int;
     const float* R_b  = (has_residual && R) ? (R + (int64_t)b * S_int * D_int) : NULL;
     const int64_t kv_batch_stride = (int64_t)S_int * H_kv_int * d_int;
@@ -253,26 +260,36 @@ __global__ void mha_flash_attn_v2_kernel(
     float* V_smem  = K_smem + FA_TILE_BN * smem_stride;
     float* red_smem = V_smem + FA_TILE_BN * smem_stride;
 
-    /* Compute Q for this head into smem, then broadcast to registers */
-    for (int di = tid; di < d_int; di += FA_NUM_THREADS) {
-        float acc = 0.0f;
-        for (int j = 0; j < D_int; j++)
-            acc += X_b[si * D_int + j] * WQ[j * D_int + ho + di];
-        K_smem[di] = acc + (bQ ? bQ[ho + di] : 0.0f);
+    /* ---- Load Q tile for this warp's rows into registers ---- */
+    float Q_reg[ROWS_PER_WARP][FA_MAX_D];
+    for (int r = 0; r < ROWS_PER_WARP; r++) {
+        int global_row = warp_row_start + r;
+        if (global_row < S_int) {
+            for (int di = 0; di < d_int; di++) {
+                float acc = 0.0f;
+                for (int j = 0; j < D_int; j++)
+                    acc += X_b[global_row * D_int + j] * WQ[j * D_int + ho + di];
+                Q_reg[r][di] = acc + (bQ ? bQ[ho + di] : 0.0f);
+            }
+        } else {
+            for (int di = 0; di < d_int; di++) Q_reg[r][di] = 0.0f;
+        }
     }
-    __syncthreads();
 
-    float Q_reg[FA_MAX_D];
-    for (int di = 0; di < d_int; di++) Q_reg[di] = K_smem[di];
-    __syncthreads();
+    /* ---- Per-row online softmax accumulators ---- */
+    float row_max[ROWS_PER_WARP], row_sum[ROWS_PER_WARP];
+    float out_acc[ROWS_PER_WARP][FA_MAX_D];
+    for (int r = 0; r < ROWS_PER_WARP; r++) {
+        row_max[r] = -1e38f;
+        row_sum[r] = 0.0f;
+        for (int di = 0; di < d_int; di++) out_acc[r][di] = 0.0f;
+    }
 
-    /* Online softmax attention */
-    float max_val = -1e38f, sum_val = 0.0f;
-    float out_acc[FA_MAX_D];
-    for (int di = 0; di < d_int; di++) out_acc[di] = 0.0f;
-
-    int causal_limit = causal ? min(si + 1, S_int) : S_int;
+    /* Causal limit: max across all rows in this warp */
+    int max_row = min(warp_row_start + ROWS_PER_WARP, S_int) - 1;
+    int causal_limit = causal ? min(max_row + 1, S_int) : S_int;
     int num_tiles = (causal_limit + FA_TILE_BN - 1) / FA_TILE_BN;
+
     const float* K_base = K_buf + (int64_t)b * kv_batch_stride + kv_ho;
     const float* V_base = V_buf + (int64_t)b * kv_batch_stride + kv_ho;
 
@@ -280,7 +297,7 @@ __global__ void mha_flash_attn_v2_kernel(
         int kv_start = kt * FA_TILE_BN;
         int tile_n = min(FA_TILE_BN, causal_limit - kv_start);
 
-        /* Load K, V tiles with int4 vectorized copy */
+        /* ---- Load K, V tiles (all warps cooperate) ---- */
         if (d_int % 4 == 0) {
             const int d4 = d_int / 4;
             for (int i = tid; i < tile_n * d4; i += FA_NUM_THREADS) {
@@ -300,100 +317,79 @@ __global__ void mha_flash_attn_v2_kernel(
         }
         __syncthreads();
 
-        /* Compute scores */
-        float tile_max = -1e38f;
-        int my_count = 0;
-        float my_scores[FA_MAX_SCORES_PER_THREAD];
-        int my_indices[FA_MAX_SCORES_PER_THREAD];
+        /* ---- Each warp computes scores for its rows independently ---- */
+        for (int wr = 0; wr < ROWS_PER_WARP; wr++) {
+            int global_row = warp_row_start + wr;
+            if (global_row >= S_int) continue;
 
-        for (int sk = tid; sk < tile_n; sk += FA_NUM_THREADS) {
-            float dot = 0.0f;
-            for (int di = 0; di < d_int; di++)
-                dot += Q_reg[di] * K_smem[sk * smem_stride + di];
-            float s = dot * scale;
-            if (causal && (kv_start + sk) > si) s = -1e38f;
-            my_scores[my_count] = s;
-            my_indices[my_count] = sk;
-            if (s > tile_max) tile_max = s;
-            my_count++;
-        }
+            /* Compute scores = Q[wr] · K^T */
+            float tile_max = -1e38f;
+            int my_count = 0;
+            float my_scores[FA_TILE_BN / FA_NUM_THREADS + 1];
+            int my_indices[FA_TILE_BN / FA_NUM_THREADS + 1];
 
-        /* Block-level max reduction */
-        float warp_max = warp_reduce_max(tile_max);
-        if (lane_id == 0) red_smem[warp_id] = warp_max;
-        __syncthreads();
-        if (tid == 0) {
-            float bm = red_smem[0];
-            for (int w = 1; w < num_warps; w++)
-                if (red_smem[w] > bm) bm = red_smem[w];
-            red_smem[0] = bm;
-        }
-        __syncthreads();
-        float block_max = red_smem[0];
-
-        if (block_max > max_val) {
-            float rescale = __expf(max_val - block_max);
-            sum_val *= rescale;
-            for (int di = 0; di < d_int; di++) out_acc[di] *= rescale;
-            max_val = block_max;
-        }
-
-        /* Accumulate exp(scores - max) * V */
-        float local_sum = 0.0f;
-        float local_out[FA_MAX_D];
-        for (int di = 0; di < d_int; di++) local_out[di] = 0.0f;
-
-        for (int i = 0; i < my_count; i++) {
-            float p = exp2f((my_scores[i] - max_val) * LOG2E_F);
-            local_sum += p;
-            int sk = my_indices[i];
-            for (int di = 0; di < d_int; di++)
-                local_out[di] += p * V_smem[sk * smem_stride + di];
-        }
-
-        /* Block-level sum reduction for local_sum */
-        float warp_sum = warp_reduce_sum(local_sum);
-        if (lane_id == 0) red_smem[warp_id] = warp_sum;
-        __syncthreads();
-        if (tid == 0) {
-            float s = 0.0f;
-            for (int w = 0; w < num_warps; w++) s += red_smem[w];
-            red_smem[0] = s;
-        }
-        __syncthreads();
-        sum_val += red_smem[0];
-        __syncthreads();
-
-        /* Block-level reduction for out_acc (per dimension) */
-        for (int di = 0; di < d_int; di++) {
-            float wv = warp_reduce_sum(local_out[di]);
-            if (lane_id == 0) red_smem[warp_id] = wv;
-            __syncthreads();
-            if (tid == 0) {
-                float s = 0.0f;
-                for (int w = 0; w < num_warps; w++) s += red_smem[w];
-                out_acc[di] += s;
+            for (int sk = lane_id; sk < tile_n; sk += 32) {
+                float dot = 0.0f;
+                for (int di = 0; di < d_int; di++)
+                    dot += Q_reg[wr][di] * K_smem[sk * smem_stride + di];
+                float s = dot * scale;
+                if (causal && (kv_start + sk) > global_row) s = -1e38f;
+                my_scores[my_count] = s;
+                my_indices[my_count] = sk;
+                if (s > tile_max) tile_max = s;
+                my_count++;
             }
-            __syncthreads();
+
+            /* Warp-level max reduction (no smem needed) */
+            float warp_max = warp_reduce_max(tile_max);
+
+            /* Online softmax rescale */
+            if (warp_max > row_max[wr]) {
+                float rescale = __expf(row_max[wr] - warp_max);
+                row_sum[wr] *= rescale;
+                for (int di = 0; di < d_int; di++) out_acc[wr][di] *= rescale;
+                row_max[wr] = warp_max;
+            }
+
+            /* Accumulate exp(scores - max) * V */
+            float local_sum = 0.0f;
+            float local_out[FA_MAX_D];
+            for (int di = 0; di < d_int; di++) local_out[di] = 0.0f;
+
+            for (int i = 0; i < my_count; i++) {
+                float p = exp2f((my_scores[i] - row_max[wr]) * LOG2E_F);
+                local_sum += p;
+                int sk = my_indices[i];
+                for (int di = 0; di < d_int; di++)
+                    local_out[di] += p * V_smem[sk * smem_stride + di];
+            }
+
+            /* Warp-level sum reduction */
+            row_sum[wr] += warp_reduce_sum(local_sum);
+            for (int di = 0; di < d_int; di++)
+                out_acc[wr][di] += warp_reduce_sum(local_out[di]);
         }
+        __syncthreads();
     }
 
-    /* Normalize and accumulate output for this head.
-     * Each head contributes to ALL D dimensions via WO (D×D).
-     * Use atomicAdd since multiple heads write to the same Y location.
-     * h==0 also adds bias + residual (base value). */
-    if (tid == 0) {
-        float inv_sum = (sum_val < 1e-12f) ? 1.0f : (1.0f / sum_val);
-        float* Y_row = Y + ((int64_t)b * S_int + si) * D_int;
-        for (int j = 0; j < D_int; j++) {
+    /* ---- Normalize and write output for this warp's rows ---- */
+    for (int wr = 0; wr < ROWS_PER_WARP; wr++) {
+        int global_row = warp_row_start + wr;
+        if (global_row >= S_int) continue;
+
+        float inv_sum = (row_sum[wr] < 1e-12f) ? 1.0f : (1.0f / row_sum[wr]);
+        float* Y_row = Y + ((int64_t)b * S_int + global_row) * D_int;
+
+        /* Output projection: Y += out_acc · WO
+         * Each lane handles a subset of D columns */
+        for (int j = lane_id; j < D_int; j += 32) {
             float contrib = 0.0f;
             for (int di = 0; di < d_int; di++)
-                contrib += out_acc[di] * inv_sum * WO[(ho + di) * D_int + j];
-            /* h==0 adds bias + residual as base; all heads atomicAdd contribution */
+                contrib += out_acc[wr][di] * inv_sum * WO[(ho + di) * D_int + j];
             float val = contrib;
             if (h == 0) {
                 val += (bO ? bO[j] : 0.0f);
-                if (R_b) val += R_b[si * D_int + j];
+                if (R_b) val += R_b[global_row * D_int + j];
             }
             atomicAdd(&Y_row[j], val);
         }
@@ -971,10 +967,12 @@ int mha_fused_f32_cuda(const void* inputs[], void* outputs[],
     }
 
     if (S <= FA_SPLITKV_THRESHOLD) {
-        /* Single-pass Flash Attention — R3-a: grid includes H_q */
+        /* Single-pass Flash Attention — R4: multi-row Q tiling */
         cudaMemsetAsync(Y, 0, (size_t)B * S * D * sizeof(float), s);
 
-        dim3 attn_grid((unsigned int)(B * S), 1, (unsigned int)H_q);
+        dim3 attn_grid((unsigned int)((S + FA_TILE_BM - 1) / FA_TILE_BM),
+                        (unsigned int)B,
+                        (unsigned int)H_q);
         dim3 attn_block(FA_NUM_THREADS, 1, 1);
         int num_warps = FA_NUM_THREADS / 32;
         int smem_stride = (int)d + FA_SKEW;
