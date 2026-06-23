@@ -397,7 +397,7 @@ typedef struct {
 | R3-b | Split-KV 同步更新 | `mha_fused_cuda.cu` | P0 | 配合 R3-a | splitkv kernel 已有 H_q 维度，确保一致性 |
 | R3-c | 寄存器优化 | `mha_fused_int.h` | P1 | 1.2-1.5× | 限制 maxrregcount=32 提高 occupancy |
 
-> 进度：待实施。
+> ✅ **R3-a 已完成** — grid 加 H_q 维度，S=128~512 提升 ~30%。Split-KV 已有 H_q 维度无需修改。
 
 ### R2-8: Flash Attention 硬件级优化 ⭐⭐⭐
 
@@ -436,9 +436,9 @@ typedef struct {
 
 | 状态 | 数量 | 内容 |
 | --- | --- | --- |
-| 已完成 | 47 | Phase A/B/C, M1-M3, O1-O2, F1, F2, C1-C2, H1-H7, M1-M5, L1/L4/L5, T1, R1-1 ~ R1-8, SIMD-1 ~ SIMD-5, Flash Attention, R2-1, R2-2a~d, R2-3, R2-4, R2-5, R2-6a(partial), R2-7, R2-8a ~ R2-8b |
+| 已完成 | 48 | Phase A/B/C, M1-M3, O1-O2, F1, F2, C1-C2, H1-H7, M1-M5, L1/L4/L5, T1, R1-1 ~ R1-8, SIMD-1 ~ SIMD-5, Flash Attention, R2-1~8, R3-a |
 | 暂缓 | 2 | L2 (惰性 D2H), L3 (层耦合) |
 | 计划中 | 0 | — |
 | 远期 | 5 | AVX2 微内核/ARM NEON/多GPU/模板生成 |
 
-> **最后更新**: 2026-06-22。R2 全部完成。INT8 量化 + 融合 kernel + 归约重构 + 显存池 + CUDA Graph。
+> **最后更新**: 2026-06-22。R3-a Flash Attention grid H_q 维度优化，S=128~512 提升 ~30%。
