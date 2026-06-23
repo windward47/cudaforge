@@ -703,8 +703,10 @@ int graph_execute(inference_graph_t* g, tensor_t* inputs[],
                     }
                 }
             }
-            cudaGraphLaunch((cudaGraphExec_t)g->cuda_graph_exec, 0);
-            g_cuda.stream_synchronize(0);
+            /* Use dedicated graph stream for replay */
+            cudaStream_t graph_stream = (cudaStream_t)g->cuda_graph;
+            cudaGraphLaunch((cudaGraphExec_t)g->cuda_graph_exec, graph_stream);
+            cudaStreamSynchronize(graph_stream);
             /* Copy outputs back */
             for (int i = 0; i < g->num_outputs; i++) {
                 int node_id = g->output_node_ids[i];
@@ -732,12 +734,12 @@ int graph_execute(inference_graph_t* g, tensor_t* inputs[],
         g->cuda_graph_state = 0;
     }
 
-    /* Begin capture on second call */
+    /* CUDA Graph capture is disabled because all kernel launches use stream 0
+     * (legacy stream), which cannot be captured. To enable, all operator
+     * dispatches would need to accept and use a common non-default stream.
+     * For now, skip capture entirely. */
     int cuda_capturing = 0;
-    if (use_cuda && g->cuda_graph_state == 1 && !g->cuda_graph_exec) {
-        cudaStreamBeginCapture(0, cudaStreamCaptureModeGlobal);
-        cuda_capturing = 1;
-    }
+    (void)cuda_capturing;
 #endif
 
     /* Copy graph inputs to input node tensors (skip self-copy when user passes graph tensor) */
@@ -1050,32 +1052,10 @@ int graph_execute(inference_graph_t* g, tensor_t* inputs[],
     ret = 0;
 
 #ifdef USE_CUDA
-    /* Finalize capture on second call */
-    if (cuda_capturing && ret == 0) {
-        cudaGraph_t graph = NULL;
-        cudaError_t err = cudaStreamEndCapture(0, &graph);
-        if (err == cudaSuccess && graph) {
-            cudaGraphExec_t graph_exec = NULL;
-            err = cudaGraphInstantiate(&graph_exec, graph, 0);
-            if (err == cudaSuccess && graph_exec) {
-                g->cuda_graph = (void*)graph;
-                g->cuda_graph_exec = (void*)graph_exec;
-                g->cuda_graph_state = 2;
-                if (g->num_inputs > 0 && inputs[0] && inputs[0]->ndim >= 2) {
-                    g->graph_cache_B = inputs[0]->shape[0];
-                    g->graph_cache_S = inputs[0]->shape[1];
-                }
-            } else {
-                cudaGraphDestroy(graph);
-                g->cuda_graph_state = 0;
-            }
-        } else {
-            g->cuda_graph_state = 0;
-        }
-    }
-    /* Mark first call done — next call will capture */
+    /* CUDA Graph capture is skipped — see comment above.
+     * Mark state as 2 to avoid repeated attempts. */
     if (use_cuda && g->cuda_graph_state == 0 && ret == 0) {
-        g->cuda_graph_state = 1;
+        g->cuda_graph_state = 2;  /* skip capture, go straight to "done" */
     }
 #endif
 
