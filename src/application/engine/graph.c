@@ -221,6 +221,16 @@ int graph_build(inference_graph_t* g) {
 
 void graph_destroy(inference_graph_t* g) {
     if (!g) return;
+#ifdef USE_CUDA
+    if (g->cuda_graph_exec) {
+        cudaGraphExecDestroy((cudaGraphExec_t)g->cuda_graph_exec);
+        g->cuda_graph_exec = NULL;
+    }
+    if (g->cuda_graph) {
+        cudaGraphDestroy((cudaGraph_t)g->cuda_graph);
+        g->cuda_graph = NULL;
+    }
+#endif
     for (int i = 0; i < g->num_nodes; i++) {
         free(g->nodes[i].input_tensors);
         free(g->nodes[i].output_tensors);
@@ -667,6 +677,69 @@ int graph_execute(inference_graph_t* g, tensor_t* inputs[],
     memset(&mha_restore, 0, sizeof(mha_restore));
     mha_restore.node_id = -1;
 
+#ifdef USE_CUDA
+    /* ---- CUDA Graph fast path: replay cached graph if shapes match ---- */
+    if (use_cuda && g->cuda_graph_state == 2 && g->cuda_graph_exec) {
+        int64_t cur_B = 0, cur_S = 0;
+        if (g->num_inputs > 0 && inputs[0] && inputs[0]->ndim >= 2) {
+            cur_B = inputs[0]->shape[0];
+            cur_S = inputs[0]->shape[1];
+        }
+        if (cur_B == g->graph_cache_B && cur_S == g->graph_cache_S) {
+            /* Copy inputs to device */
+            for (int i = 0; i < g->num_inputs; i++) {
+                int node_id = g->input_node_ids[i];
+                if (node_id < 0 || node_id >= g->num_nodes) continue;
+                graph_node_t* n = &g->nodes[node_id];
+                if (n->num_outputs > 0) {
+                    int tid = n->output_tensors[0];
+                    if (tid >= 0 && tid < g->num_tensors) {
+                        tensor_t* dst = g->tensors[tid].tensor;
+                        if (dst->data != inputs[i]->data) {
+                            const data_type_info_t* info = data_type_get_info(dst->dtype);
+                            memcpy(dst->data, inputs[i]->data, (size_t)dst->numel * info->size);
+                        }
+                        tensor_copy_to_device(dst);
+                    }
+                }
+            }
+            cudaGraphLaunch((cudaGraphExec_t)g->cuda_graph_exec, 0);
+            g_cuda.stream_synchronize(0);
+            /* Copy outputs back */
+            for (int i = 0; i < g->num_outputs; i++) {
+                int node_id = g->output_node_ids[i];
+                if (node_id < 0 || node_id >= g->num_nodes) continue;
+                graph_node_t* n = &g->nodes[node_id];
+                if (n->type == OP_OUTPUT && n->num_inputs > 0) {
+                    int tid = n->input_tensors[0];
+                    if (tid >= 0 && tid < g->num_tensors) {
+                        tensor_t* src = g->tensors[tid].tensor;
+                        tensor_copy_to_host(src);
+                        if (outputs[i]->data != src->data) {
+                            const data_type_info_t* info = data_type_get_info(src->dtype);
+                            memcpy(outputs[i]->data, src->data, (size_t)src->numel * info->size);
+                        }
+                    }
+                }
+            }
+            return 0;
+        }
+        /* Shape changed — invalidate */
+        cudaGraphExecDestroy((cudaGraphExec_t)g->cuda_graph_exec);
+        g->cuda_graph_exec = NULL;
+        cudaGraphDestroy((cudaGraph_t)g->cuda_graph);
+        g->cuda_graph = NULL;
+        g->cuda_graph_state = 0;
+    }
+
+    /* Begin capture on second call */
+    int cuda_capturing = 0;
+    if (use_cuda && g->cuda_graph_state == 1 && !g->cuda_graph_exec) {
+        cudaStreamBeginCapture(0, cudaStreamCaptureModeGlobal);
+        cuda_capturing = 1;
+    }
+#endif
+
     /* Copy graph inputs to input node tensors (skip self-copy when user passes graph tensor) */
     for (int i = 0; i < g->num_inputs; i++) {
         int node_id = g->input_node_ids[i];
@@ -975,6 +1048,36 @@ int graph_execute(inference_graph_t* g, tensor_t* inputs[],
     }
 
     ret = 0;
+
+#ifdef USE_CUDA
+    /* Finalize capture on second call */
+    if (cuda_capturing && ret == 0) {
+        cudaGraph_t graph = NULL;
+        cudaError_t err = cudaStreamEndCapture(0, &graph);
+        if (err == cudaSuccess && graph) {
+            cudaGraphExec_t graph_exec = NULL;
+            err = cudaGraphInstantiate(&graph_exec, graph, 0);
+            if (err == cudaSuccess && graph_exec) {
+                g->cuda_graph = (void*)graph;
+                g->cuda_graph_exec = (void*)graph_exec;
+                g->cuda_graph_state = 2;
+                if (g->num_inputs > 0 && inputs[0] && inputs[0]->ndim >= 2) {
+                    g->graph_cache_B = inputs[0]->shape[0];
+                    g->graph_cache_S = inputs[0]->shape[1];
+                }
+            } else {
+                cudaGraphDestroy(graph);
+                g->cuda_graph_state = 0;
+            }
+        } else {
+            g->cuda_graph_state = 0;
+        }
+    }
+    /* Mark first call done — next call will capture */
+    if (use_cuda && g->cuda_graph_state == 0 && ret == 0) {
+        g->cuda_graph_state = 1;
+    }
+#endif
 
 cleanup:
     /* Restore MHA-fused node to its original type and configuration */

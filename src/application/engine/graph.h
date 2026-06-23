@@ -86,6 +86,12 @@ typedef struct {
     int             kv_cache_K_tid;  /* tensor index for K cache, -1 if unused */
     int             kv_cache_V_tid;  /* tensor index for V cache, -1 if unused */
     int             permanent_fusion; /* if 1, skip MHA restore after execution */
+    /* CUDA Graph cache (0=not started, 1=first call done, 2=captured) */
+    int             cuda_graph_state;
+    void*           cuda_graph;        /* cudaGraph_t */
+    void*           cuda_graph_exec;   /* cudaGraphExec_t */
+    int64_t         graph_cache_B;     /* cached batch size */
+    int64_t         graph_cache_S;     /* cached seq len */
 } inference_graph_t;
 
 /* Graph construction */
