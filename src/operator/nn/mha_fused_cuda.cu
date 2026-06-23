@@ -400,11 +400,12 @@ __global__ void mha_flash_attn_v2_kernel(
 /* ============================================================
  * Kernel 2b: Flash Attention v2 with FP16 Tensor Core (WMMA)
  *
- * Uses WMMA 16×16×16 for Q·Kᵀ and P·V matrix multiplications.
+ * Multi-row Q tiling (BM=64) + WMMA 16×16 for Q·Kᵀ and P·V.
  * Softmax remains FP32 for numerical stability.
  *
- * Grid: (B*S, 1, H_q), Block: (FA_NUM_THREADS=128, 4 warps)
- * Each warp handles BM/4 = 16 rows of Q (FA2 warp-partitioning).
+ * Grid:  (ceil(S/FA_TILE_BM), B, H_q)
+ * Block: (FA_NUM_THREADS=128, 4 warps)
+ * Each warp handles ROWS_PER_WARP = 16 rows of Q.
  *
  * Reference:
  *   cudaTensorCoreGemm.cu — WMMA GEMM pattern
@@ -425,10 +426,9 @@ __global__ void mha_flash_attn_v2_f16_kernel(
 {
     using namespace nvcuda;
 
-    const int bs = blockIdx.x;
-    const int b  = bs / (int)S;
-    const int si = bs % (int)S;
-    const int h  = blockIdx.z;
+    const int m_block = blockIdx.x;  /* Q tile index */
+    const int b       = blockIdx.y;  /* batch */
+    const int h       = blockIdx.z;  /* head */
     const int tid     = threadIdx.x;
     const int warp_id = tid / 32;
     const int lane_id = tid % 32;
@@ -440,60 +440,51 @@ __global__ void mha_flash_attn_v2_f16_kernel(
     const int ho = h * d_int;
     const int kv_h = h / group_size;
     const int kv_ho = kv_h * d_int;
-    const int64_t kv_batch_stride = (int64_t)S_int * H_kv_int * d_int;
 
-    /* Each warp handles 16 rows of Q (BM=64, 4 warps) */
-    const int warp_row = warp_id * WMMA_M;  /* 0, 16, 32, 48 */
+    constexpr int ROWS_PER_WARP = FA_TILE_BM / FA_NUM_WARPS;  /* 16 */
+    const int warp_row_start = m_block * FA_TILE_BM + warp_id * ROWS_PER_WARP;
 
     const float* X_b  = X + (int64_t)b * S_int * D_int;
     const float* R_b  = (has_residual && R) ? (R + (int64_t)b * S_int * D_int) : NULL;
+    const int64_t kv_batch_stride = (int64_t)S_int * H_kv_int * d_int;
 
-    /* Shared memory: Q as FP16 + K/V as FP16 + reduction buffer */
+    /* Shared memory: K/V as FP16 + P as FP16 */
     extern __shared__ __half smem_h[];
-    const int smem_stride = d_int + FA_SKEW;  /* padded stride for bank conflict avoidance */
+    const int smem_stride = d_int + FA_SKEW;
+    __half* K_hsmem = smem_h;                                      /* FA_TILE_BN × smem_stride */
+    __half* V_hsmem = K_hsmem + FA_TILE_BN * smem_stride;          /* FA_TILE_BN × smem_stride */
+    __half* P_hsmem = V_hsmem + FA_TILE_BN * smem_stride;          /* ROWS_PER_WARP × smem_stride */
 
-    /* Q_hsmem: FA_TILE_BM × smem_stride as __half */
-    __half* Q_hsmem = smem_h;
-    /* K_hsmem: FA_TILE_BN × smem_stride as __half */
-    __half* K_hsmem = Q_hsmem + FA_TILE_BM * smem_stride;
-    /* V_hsmem: FA_TILE_BN × smem_stride as __half */
-    __half* V_hsmem = K_hsmem + FA_TILE_BN * smem_stride;
-    /* red_smem: num_warps floats (aligned to 4 bytes) */
-    float* red_smem = reinterpret_cast<float*>(V_hsmem + FA_TILE_BN * smem_stride);
-
-    /* ---- Step 1: Compute Q in FP32, convert to FP16 in smem ----
-     * Q is only 1 row (si), but we store it replicated across BM rows
-     * so all warps can load their Q fragment from smem.
-     * Actually, for BM=64 we need 4 different Q rows. Since we only have
-     * 1 query row (si), we replicate it BM times — this is correct for
-     * the single-row-per-block design. Each warp's Q fragment will be
-     * the same row repeated. */
-    for (int di = tid; di < d_int; di += FA_NUM_THREADS) {
-        float acc = 0.0f;
-        for (int j = 0; j < D_int; j++)
-            acc += X_b[si * D_int + j] * WQ[j * D_int + ho + di];
-        float val = acc + (bQ ? bQ[ho + di] : 0.0f);
-        /* Replicate across all BM rows */
-        for (int r = 0; r < FA_TILE_BM; r++)
-            Q_hsmem[r * smem_stride + di] = __float2half(val);
+    /* ---- Load Q for this warp's rows (FP32 → FP16 in registers) ---- */
+    __half Q_h[ROWS_PER_WARP][FA_MAX_D];
+    for (int r = 0; r < ROWS_PER_WARP; r++) {
+        int global_row = warp_row_start + r;
+        if (global_row < S_int) {
+            for (int di = 0; di < d_int; di++) {
+                float acc = 0.0f;
+                for (int j = 0; j < D_int; j++)
+                    acc += X_b[global_row * D_int + j] * WQ[j * D_int + ho + di];
+                Q_h[r][di] = __float2half(acc + (bQ ? bQ[ho + di] : 0.0f));
+            }
+        } else {
+            for (int di = 0; di < d_int; di++) Q_h[r][di] = __float2half(0.0f);
+        }
     }
-    __syncthreads();
 
-    /* ---- Online softmax accumulators (FP32) ---- */
-    float max_val = -1e38f, sum_val = 0.0f;
-    float out_acc[FA_MAX_D];
-    for (int di = 0; di < d_int; di++) out_acc[di] = 0.0f;
+    /* ---- Per-row online softmax accumulators (FP32) ---- */
+    float row_max[ROWS_PER_WARP], row_sum[ROWS_PER_WARP];
+    float out_acc[ROWS_PER_WARP][FA_MAX_D];
+    for (int r = 0; r < ROWS_PER_WARP; r++) {
+        row_max[r] = -1e38f;
+        row_sum[r] = 0.0f;
+        for (int di = 0; di < d_int; di++) out_acc[r][di] = 0.0f;
+    }
 
-    int causal_limit = causal ? min(si + 1, S_int) : S_int;
+    int max_row = min(warp_row_start + ROWS_PER_WARP, S_int) - 1;
+    int causal_limit = causal ? min(max_row + 1, S_int) : S_int;
     int num_tiles = (causal_limit + FA_TILE_BN - 1) / FA_TILE_BN;
     const float* K_base = K_buf + (int64_t)b * kv_batch_stride + kv_ho;
     const float* V_base = V_buf + (int64_t)b * kv_batch_stride + kv_ho;
-
-    /* WMMA fragments for scores = Q · Kᵀ */
-    wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> acc_s;
-    /* WMMA fragments for out = P · V */
-    wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> acc_o;
-    wmma::fill_fragment(acc_o, 0.0f);
 
     for (int kt = 0; kt < num_tiles; kt++) {
         int kv_start = kt * FA_TILE_BN;
@@ -508,39 +499,40 @@ __global__ void mha_flash_attn_v2_f16_kernel(
         __syncthreads();
 
         /* ---- Compute scores = Q · Kᵀ using WMMA ----
-         * Q_hsmem is (BM, d) row-major, K_hsmem is (BN, d) row-major.
-         * We need scores = Q · Kᵀ which is (BM, BN).
-         * Kᵀ is (d, BN) col-major = K is (BN, d) row-major loaded as col-major.
-         *
-         * For WMMA: A=Q (row-major), B=K (col-major for Kᵀ), C=scores
-         * Each warp computes a (16, 16) tile of scores.
-         * With BM=64, BN=64: 4×4 = 16 tiles, 4 warps → 4 tiles per warp.
-         * But we only have 1 unique Q row, so we only need 1 row of tiles. */
+         * Q_h is (ROWS_PER_WARP, d), K_hsmem is (tile_n, d).
+         * scores = Q · Kᵀ → (ROWS_PER_WARP, tile_n)
+         * Only 1 WMMA tile needed: 16×16 × 16×tile_n → 16×tile_n */
+        wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> acc_s;
         wmma::fill_fragment(acc_s, 0.0f);
 
-        /* Compute scores for this warp's rows against all BN columns */
         for (int k_step = 0; k_step < d_int; k_step += WMMA_K) {
             wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, __half, wmma::row_major> a_frag;
             wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, __half, wmma::col_major> b_frag;
 
-            wmma::load_matrix_sync(a_frag, Q_hsmem + warp_row * smem_stride + k_step, smem_stride);
-            /* Load K transposed: K is (BN, d) row-major, we need (d, BN) = K as col-major */
-            wmma::load_matrix_sync(b_frag, K_hsmem + k_step, smem_stride);
+            /* Load Q fragment from registers → smem → WMMA */
+            /* We need Q in smem for WMMA load. Use P_hsmem as temp. */
+            for (int r = 0; r < ROWS_PER_WARP; r++)
+                for (int di = tid; di < WMMA_K && k_step + di < d_int; di += FA_NUM_THREADS)
+                    P_hsmem[r * smem_stride + di] = Q_h[r][k_step + di];
+            __syncthreads();
 
+            wmma::load_matrix_sync(a_frag, P_hsmem, smem_stride);
+            wmma::load_matrix_sync(b_frag, K_hsmem + k_step, smem_stride);
             wmma::mma_sync(acc_s, a_frag, b_frag, acc_s);
+            __syncthreads();
         }
 
-        /* ---- Store scores to FP32, apply scale + causal mask + online softmax ---- */
+        /* ---- Store scores to FP32, apply scale + causal mask ---- */
         float scores_local[WMMA_M * WMMA_N];
         wmma::store_matrix_sync(scores_local, acc_s, WMMA_N, wmma::mem_row_major);
 
-        /* Only the first row matters (since Q is replicated), but we process
-         * warp_row..warp_row+WMMA_M-1. For single-row Q, only row 0 is valid. */
         float tile_max = -1e38f;
-        for (int r = 0; r < WMMA_M && warp_row + r < FA_TILE_BM; r++) {
+        for (int r = 0; r < ROWS_PER_WARP; r++) {
+            int global_row = warp_row_start + r;
+            if (global_row >= S_int) continue;
             for (int c = 0; c < tile_n; c++) {
                 float s = scores_local[r * WMMA_N + c] * scale;
-                if (causal && (kv_start + c) > si) s = -1e38f;
+                if (causal && (kv_start + c) > global_row) s = -1e38f;
                 scores_local[r * WMMA_N + c] = s;
                 if (s > tile_max) tile_max = s;
             }
@@ -550,23 +542,29 @@ __global__ void mha_flash_attn_v2_f16_kernel(
         float warp_max = warp_reduce_max(tile_max);
 
         /* Online softmax rescale */
-        if (warp_max > max_val) {
-            float rescale = __expf(max_val - warp_max);
-            sum_val *= rescale;
-            for (int di = 0; di < d_int; di++) out_acc[di] *= rescale;
-            max_val = warp_max;
+        for (int r = 0; r < ROWS_PER_WARP; r++) {
+            if (warp_max > row_max[r]) {
+                float rescale = __expf(row_max[r] - warp_max);
+                row_sum[r] *= rescale;
+                for (int di = 0; di < d_int; di++) out_acc[r][di] *= rescale;
+                row_max[r] = warp_max;
+            }
         }
 
         /* Compute exp(scores - max) and accumulate sum */
-        float local_sum = 0.0f;
-        for (int r = 0; r < WMMA_M && warp_row + r < FA_TILE_BM; r++) {
+        float local_sum[ROWS_PER_WARP];
+        for (int r = 0; r < ROWS_PER_WARP; r++) local_sum[r] = 0.0f;
+
+        for (int r = 0; r < ROWS_PER_WARP; r++) {
+            int global_row = warp_row_start + r;
+            if (global_row >= S_int) continue;
             for (int c = 0; c < tile_n; c++) {
-                float p = exp2f((scores_local[r * WMMA_N + c] - max_val) * LOG2E_F);
+                float p = exp2f((scores_local[r * WMMA_N + c] - row_max[r]) * LOG2E_F);
                 scores_local[r * WMMA_N + c] = p;
-                local_sum += p;
+                local_sum[r] += p;
             }
         }
-        sum_val += local_sum;
+        for (int r = 0; r < ROWS_PER_WARP; r++) row_sum[r] += local_sum[r];
 
         /* ---- Load V tile as FP16 ---- */
         for (int i = tid; i < tile_n * d_int; i += FA_NUM_THREADS) {
@@ -576,51 +574,56 @@ __global__ void mha_flash_attn_v2_f16_kernel(
         }
         __syncthreads();
 
-        /* ---- out += P · V using WMMA ----
-         * P is (BM, BN), V is (BN, d), result is (BM, d).
-         * Store P as FP16 in a temp smem area (reuse K_hsmem since K is done). */
-        __half* P_hsmem = K_hsmem;  /* reuse K smem after K is consumed */
-        for (int r = 0; r < WMMA_M && warp_row + r < FA_TILE_BM; r++) {
+        /* ---- Store P as FP16 in P_hsmem ---- */
+        for (int r = 0; r < ROWS_PER_WARP; r++) {
+            int global_row = warp_row_start + r;
+            if (global_row >= S_int) continue;
             for (int c = tid; c < tile_n; c += FA_NUM_THREADS)
                 P_hsmem[r * smem_stride + c] = __float2half(scores_local[r * WMMA_N + c]);
         }
         __syncthreads();
 
-        /* out_acc += P · V via WMMA */
+        /* ---- out_acc += P · V using WMMA ---- */
         for (int k_step = 0; k_step < tile_n; k_step += WMMA_K) {
             wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, __half, wmma::row_major> p_frag;
             wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, __half, wmma::row_major> v_frag;
 
-            wmma::load_matrix_sync(p_frag, P_hsmem + warp_row * smem_stride + k_step, smem_stride);
+            wmma::load_matrix_sync(p_frag, P_hsmem + k_step, smem_stride);
             wmma::load_matrix_sync(v_frag, V_hsmem + k_step * smem_stride, smem_stride);
 
             wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> pv_frag;
             wmma::fill_fragment(pv_frag, 0.0f);
             wmma::mma_sync(pv_frag, p_frag, v_frag, pv_frag);
 
-            /* Accumulate into out_acc (only row 0 matters for single-row Q) */
+            /* Accumulate into out_acc */
             float pv_local[WMMA_M * WMMA_N];
             wmma::store_matrix_sync(pv_local, pv_frag, WMMA_N, wmma::mem_row_major);
-            if (warp_row == 0) {
+            for (int r = 0; r < ROWS_PER_WARP; r++) {
+                int global_row = warp_row_start + r;
+                if (global_row >= S_int) continue;
                 for (int c = 0; c < d_int && c < WMMA_N; c++)
-                    out_acc[c] += pv_local[c];  /* row 0, col c */
+                    out_acc[r][c] += pv_local[r * WMMA_N + c];
             }
         }
         __syncthreads();
     }
 
-    /* ---- Normalize and write output (only warp 0, lane 0) ---- */
-    if (warp_id == 0 && lane_id == 0) {
-        float inv_sum = (sum_val < 1e-12f) ? 1.0f : (1.0f / sum_val);
-        float* Y_row = Y + ((int64_t)b * S_int + si) * D_int;
-        for (int j = 0; j < D_int; j++) {
+    /* ---- Normalize and write output for this warp's rows ---- */
+    for (int r = 0; r < ROWS_PER_WARP; r++) {
+        int global_row = warp_row_start + r;
+        if (global_row >= S_int) continue;
+
+        float inv_sum = (row_sum[r] < 1e-12f) ? 1.0f : (1.0f / row_sum[r]);
+        float* Y_row = Y + ((int64_t)b * S_int + global_row) * D_int;
+
+        for (int j = lane_id; j < D_int; j += 32) {
             float contrib = 0.0f;
             for (int di = 0; di < d_int; di++)
-                contrib += out_acc[di] * inv_sum * WO[(ho + di) * D_int + j];
+                contrib += out_acc[r][di] * inv_sum * WO[(ho + di) * D_int + j];
             float val = contrib;
             if (h == 0) {
                 val += (bO ? bO[j] : 0.0f);
-                if (R_b) val += R_b[si * D_int + j];
+                if (R_b) val += R_b[global_row * D_int + j];
             }
             atomicAdd(&Y_row[j], val);
         }
@@ -993,9 +996,9 @@ int mha_fused_f32_cuda(const void* inputs[], void* outputs[],
 #endif
 
         /* FP32 Flash Attention kernel.
-         * FP16 Tensor Core path is deferred — single-row Q per block
-         * does not benefit from WMMA 16×16 tiles (vector-matrix, not matrix-matrix).
-         * To benefit, need multi-row Q tiling (BM=64, 4 warps × 16 rows). */
+         * FP16 WMMA kernel exists (mha_flash_attn_v2_f16_kernel) but needs
+         * debugging — smem layout and WMMA fragment loading need validation.
+         * Enable with: if (use_f16 && d <= FA_MAX_D) { ... } */
         {
             size_t smem_bytes = (size_t)(2 * FA_TILE_BN * smem_stride + num_warps) * sizeof(float);
 
