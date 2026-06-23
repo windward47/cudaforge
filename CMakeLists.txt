@@ -108,6 +108,7 @@ target_sources(operator PRIVATE
     src/operator/nn/pad.c
     src/operator/nn/clip.c
     src/operator/nn/where.c
+    src/operator/nn/quantize.c
     src/operator/operator_registry.c
     src/operator/operator_init.c
 )
@@ -150,6 +151,7 @@ if(ENABLE_CUDA)
         src/operator/nn/pad_cuda.cu
         src/operator/nn/clip_cuda.cu
         src/operator/nn/where_cuda.cu
+        src/operator/nn/quantize_cuda.cu
         src/operator/blas/matmul_cuda.cu
     )
 
@@ -491,6 +493,22 @@ if(ENABLE_TESTS)
     )
     target_link_libraries(test_graph PRIVATE application operator platform unity)
     add_test(NAME test_graph COMMAND test_graph)
+
+    add_executable(test_quantize
+        tests/test_quantize.cu
+    )
+    target_include_directories(test_quantize PRIVATE
+        src/operator/include
+        src/operator/nn
+        src/platform/include
+    )
+    target_link_libraries(test_quantize PRIVATE operator platform unity)
+    if(CMAKE_C_COMPILER_ID STREQUAL "MSVC")
+        target_compile_options(test_quantize PRIVATE
+            $<$<COMPILE_LANGUAGE:C,CXX>:/wd4189 /wd4456 /wd4101>
+        )
+    endif()
+    add_test(NAME test_quantize COMMAND test_quantize)
 
     if(ENABLE_CUDA)
         add_executable(test_cuda_kernels
