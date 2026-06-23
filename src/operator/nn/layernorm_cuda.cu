@@ -1,14 +1,10 @@
 #include "operator.h"
 #include "cuda_ops.h"
 #include "layernorm_int.h"
+#include "cuda_reduce.cuh"
 
-/* Block-level parallel reduction for mean and variance.
- * Each block handles one normalization instance.
- * Block size must be a power of 2 <= OPS_THREADS_PER_BLOCK. */
-
-#define LN_WARP_SIZE 32
-
-/* Compute mean via shared-memory reduction, then normalize in-place */
+/* Compute mean via warp/block reduction, then normalize in-place.
+ * Uses cuda_reduce.cuh primitives instead of hand-written smem reduction. */
 __global__ void layernorm_f32_kernel(
     const float* __restrict__ x,
     const float* __restrict__ gamma,
@@ -17,7 +13,7 @@ __global__ void layernorm_f32_kernel(
     int64_t N, int64_t D, float epsilon)
 {
     extern __shared__ float s_buf[];
-    float* s_data = s_buf;                    /* D elements (if D <= blockDim.x) */
+    float* red_smem = s_buf;  /* blockDim.x / 32 floats for block_reduce */
 
     int64_t n = blockIdx.x;
     if (n >= N) return;
@@ -30,25 +26,14 @@ __global__ void layernorm_f32_kernel(
     const float* gn = gamma;
     const float* bn = beta;
 
-    /* Load elements into shared memory, compute local sum for mean */
+    /* Compute local sum for mean */
     float local_sum = 0.0f;
-    for (int i = tid; i < D_int; i += blockDim.x) {
-        float val = xn[i];
-        s_data[i] = val;
-        local_sum += val;
-    }
+    for (int i = tid; i < D_int; i += blockDim.x)
+        local_sum += xn[i];
 
-    /* Shared-memory parallel reduction for mean */
-    s_data[tid] = local_sum;
-    __syncthreads();
-
-    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-        if (tid < stride)
-            s_data[tid] += s_data[tid + stride];
-        __syncthreads();
-    }
-
-    float mean = s_data[0] / (float)D;
+    /* Block-level sum reduction */
+    float total_sum = block_reduce_sum(local_sum, red_smem, tid);
+    float mean = total_sum / (float)D;
 
     /* Compute variance: local sum of squared diffs */
     float local_var = 0.0f;
@@ -57,16 +42,8 @@ __global__ void layernorm_f32_kernel(
         local_var += diff * diff;
     }
 
-    s_data[tid] = local_var;
-    __syncthreads();
-
-    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-        if (tid < stride)
-            s_data[tid] += s_data[tid + stride];
-        __syncthreads();
-    }
-
-    float inv_std = rsqrtf(s_data[0] / (float)D + epsilon);
+    float total_var = block_reduce_sum(local_var, red_smem, tid);
+    float inv_std = rsqrtf(total_var / (float)D + epsilon);
 
     /* Normalize and write */
     for (int i = tid; i < D_int; i += blockDim.x) {
@@ -89,7 +66,7 @@ __global__ void layernorm_residual_f32_kernel(
     int64_t N, int64_t D, float epsilon)
 {
     extern __shared__ float s_buf[];
-    float* s_data = s_buf;
+    float* red_smem = s_buf;
 
     int64_t n = blockIdx.x;
     if (n >= N) return;
@@ -108,13 +85,8 @@ __global__ void layernorm_residual_f32_kernel(
     for (int i = tid; i < D_int; i += blockDim.x)
         local_sum += xn[i] + rn[i];
 
-    s_data[tid] = local_sum;
-    __syncthreads();
-    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-        if (tid < stride) s_data[tid] += s_data[tid + stride];
-        __syncthreads();
-    }
-    float mean = s_data[0] / (float)D;
+    float total_sum = block_reduce_sum(local_sum, red_smem, tid);
+    float mean = total_sum / (float)D;
 
     /* Compute variance */
     float local_var = 0.0f;
@@ -123,13 +95,8 @@ __global__ void layernorm_residual_f32_kernel(
         local_var += diff * diff;
     }
 
-    s_data[tid] = local_var;
-    __syncthreads();
-    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-        if (tid < stride) s_data[tid] += s_data[tid + stride];
-        __syncthreads();
-    }
-    float inv_std = rsqrtf(s_data[0] / (float)D + epsilon);
+    float total_var = block_reduce_sum(local_var, red_smem, tid);
+    float inv_std = rsqrtf(total_var / (float)D + epsilon);
 
     /* Normalize with fused residual */
     for (int i = tid; i < D_int; i += blockDim.x) {
