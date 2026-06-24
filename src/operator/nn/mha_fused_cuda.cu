@@ -455,22 +455,21 @@ __global__ void mha_flash_attn_v2_f16_kernel(
     const int64_t kv_batch_stride = (int64_t)S_int * H_kv_int * d_int;
 
     /* Shared memory layout:
-     *   Q_hsmem  : FA_TILE_BM × smem_stride (half)  — 全部 Q 行, 加载一次
-     *   K_hsmem  : FA_TILE_BN × smem_stride (half)  — 每个 KV tile 重载
-     *   V_hsmem  : FA_TILE_BN × smem_stride (half)  — 每个 KV tile 重载
-     *   S_fmem   : FA_TILE_BM × FA_TILE_BN (float)  — scores, 后复用为 P·V temp
-     *   P_hsmem  : FA_TILE_BM × FA_TILE_BN (half)   — P (Q·Kᵀ softmax 后)
-     *   acc_o_fmem: FA_TILE_BM × d (float)          — 持久化输出累积 (per-row rescale) */
+     *   Q_hsmem, K_hsmem, V_hsmem, P_hsmem : half, dynamic shared (WMMA load works)
+     *   S_fmem, acc_o_fmem : float, STATIC shared
+     *     (store_matrix_sync to dynamic half*→float* reinterpret_cast silently fails
+     *      on sm_86; static __shared__ float is required for WMMA fp32 accumulator store)
+     *
+     *   out_buf reuses S_fmem (scores consumed before P·V temp needs it). */
     extern __shared__ __half smem_h[];
     const int smem_stride = d_int + FA_SKEW;
     __half* Q_hsmem = smem_h;
     __half* K_hsmem = Q_hsmem + FA_TILE_BM * smem_stride;
     __half* V_hsmem = K_hsmem + FA_TILE_BN * smem_stride;
-    float*  S_fmem  = reinterpret_cast<float*>(V_hsmem + FA_TILE_BN * smem_stride);
-    __half* P_hsmem = reinterpret_cast<__half*>(S_fmem + FA_TILE_BM * FA_TILE_BN);
-    float*  acc_o_fmem = reinterpret_cast<float*>(P_hsmem + FA_TILE_BM * FA_TILE_BN);
-    /* out_buf: P·V temp, reuses S_fmem (scores already consumed by then) */
-    float*  out_buf = S_fmem;
+    __half* P_hsmem = V_hsmem + FA_TILE_BN * smem_stride;
+    __shared__ float S_fmem[FA_TILE_BM * FA_TILE_BN];          /* scores / P·V temp */
+    __shared__ float acc_o_fmem[FA_TILE_BM * FA_MAX_D];        /* persistent output accum */
+    float* out_buf = S_fmem;
 
     /* ---- Step 1: Compute Q for ALL BM rows, store as FP16 in smem ---- */
     for (int r = tid; r < FA_TILE_BM; r += FA_NUM_THREADS) {
@@ -629,6 +628,8 @@ __global__ void mha_flash_attn_v2_f16_kernel(
             }
         }
         __syncthreads();
+
+        __syncthreads();
     }
 
     /* ---- Step 3: Normalize acc_o_fmem and write output ---- */
@@ -639,15 +640,13 @@ __global__ void mha_flash_attn_v2_f16_kernel(
         float* o_row = acc_o_fmem + (warp_id * ROWS_PER_WARP + r) * d_int;
         float* Y_row = Y + ((int64_t)b * S_int + global_row) * D_int;
 
-        float attn_out[FA_MAX_D];
-        for (int di = lane_id; di < d_int; di += 32)
-            attn_out[di] = o_row[di] * inv_sum;
-        __syncwarp();
-
+        /* Output projection: read acc_o from smem (shared across lanes).
+         * Do NOT use a per-thread attn_out[] array — only this lane's entries
+         * would be valid. Each lane handles a subset of output columns j. */
         for (int j = lane_id; j < D_int; j += 32) {
             float contrib = 0.0f;
             for (int di = 0; di < d_int; di++)
-                contrib += attn_out[di] * WO[(ho + di) * D_int + j];
+                contrib += o_row[di] * inv_sum * WO[(ho + di) * D_int + j];
             float val = contrib;
             if (h == 0) {
                 val += (bO ? bO[j] : 0.0f);
@@ -1023,14 +1022,34 @@ int mha_fused_f32_cuda(const void* inputs[], void* outputs[],
         }
 #endif
 
-        /* Flash Attention v2 kernel — FP32 multi-row Q tiling (FA2 Section 3.3).
-         *   BM=64 query rows/block, 4 warps × 16 rows, K/V shared, warp-level
-         *   reduction, no inter-warp communication. Online softmax + exp2f.
-         *
-         * FP16 WMMA variant (mha_flash_attn_v2_f16_kernel) is implemented but
-         * experimental: output is near-zero (P·V accumulation not landing).
-         * Kept for future debugging; FP32 path is correct & fast (4× over original). */
-        {
+        /* Flash Attention v2 kernel.
+         * FP16 WMMA path (Tensor Core Q·Kᵀ + P·V) when available, else FP32.
+         * FP16 path requires d % 16 == 0 (WMMA tile alignment). */
+        if (use_f16 && d <= FA_MAX_D && (d % WMMA_N == 0)) {
+            /* dynamic shared: Q + K + V + P (all half). S_fmem/acc_o_fmem are static.
+             * Static (32KB) + dynamic (36KB) = 68KB > 48KB default, so always opt-in. */
+            size_t half_bytes = (size_t)((FA_TILE_BM + 3 * FA_TILE_BN) * smem_stride) * sizeof(__half);
+            size_t smem_bytes = half_bytes;
+
+            cudaFuncSetAttribute(mha_flash_attn_v2_f16_kernel,
+                                 cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                 (int)smem_bytes);
+            int r16 = CUDA_KERNEL_LAUNCH(mha_flash_attn_v2_f16_kernel, attn_grid, attn_block, smem_bytes, s,
+                X, WQ, bQ, K_buf, V_buf, WO, bO, Y, R,
+                B, S, D, H_q, H_kv, d, p->scale, has_residual, causal_mask);
+            if (r16 != 0) {
+                fprintf(stderr, "FP16 WMMA kernel launch failed (smem=%zu): rc=%d, falling back to FP32\n",
+                        smem_bytes, r16);
+                cudaGetLastError();
+                size_t smem_bytes_f32 = (size_t)(2 * FA_TILE_BN * smem_stride + num_warps) * sizeof(float);
+                if (smem_bytes_f32 > 48 * 1024)
+                    cudaFuncSetAttribute(mha_flash_attn_v2_kernel,
+                                         cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem_bytes_f32);
+                CUDA_KERNEL_LAUNCH(mha_flash_attn_v2_kernel, attn_grid, attn_block, smem_bytes_f32, s,
+                    X, WQ, bQ, K_buf, V_buf, WO, bO, Y, R,
+                    B, S, D, H_q, H_kv, d, p->scale, has_residual, causal_mask);
+            }
+        } else {
             size_t smem_bytes = (size_t)(2 * FA_TILE_BN * smem_stride + num_warps) * sizeof(float);
             if (smem_bytes > 48 * 1024) {
                 cudaFuncSetAttribute(mha_flash_attn_v2_kernel,

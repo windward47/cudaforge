@@ -505,6 +505,12 @@ static void test_flash_attn_long_seq(void) {
     random_fill(tWO, tD * tD,  345);
     random_fill(tbO, tD,       678);
 
+    /* Scale X by 1/D to bring Q,K ~ O(1) (random_fill gives [-1,0), so
+     * X·WQ is a sum of ~D positive terms ~D; /D makes Q~O(1) so softmax
+     * is well-conditioned and FP16 precision doesn't shift the argmax). */
+    float x_scale = 1.0f / (float)tD;
+    for (int64_t i = 0; i < t_n_elem; i++) tX[i] *= x_scale;
+
     float tscale = 1.0f / sqrtf((float)td);
 
     /* Build graph */

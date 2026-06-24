@@ -77,8 +77,8 @@ out:    每个 warp 独立计算 16×d，最后 atomicAdd 到 Y
 
 | 状态 | 内容 |
 | --- | --- |
-| 已完成 | R1 全部, R2 全部, R3-a, R4-a/b, R5 全部, Flash Attention v2 (FA2 论文对齐: 多行 Q tiling + online softmax + warp 分 Q) |
+| 已完成 | R1 全部, R2 全部, R3-a, R4 全部, R5 全部, Flash Attention v2 (FP32 + FP16 WMMA Tensor Core) |
 | 进行中 | — |
-| 实验性 | FP16 WMMA Flash Attention (mha_flash_attn_v2_f16_kernel) — 已实现, P·V 累积待调试, 暂用 FP32 路径 |
+| 实验性 | — |
 
 > **最后更新**: 2026-06-23。
