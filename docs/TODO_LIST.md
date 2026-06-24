@@ -94,8 +94,8 @@ out:    每个 warp 独立计算 16×d，最后 atomicAdd 到 Y
 | --- | --- | --- | --- | --- | --- |
 | R6-a | acc_o 用 fragment 替代 smem | `mha_fused_cuda.cu` | — | **失败** | ❌ 已验证：fragment 化导致寄存器 72→121/thread，kernel 变慢 3.4×（无 spill 但指令级并行度下降）。省 16KB smem 换寄存器压力不划算，已回退 |
 | R6-b | preloaded kernel FP16 WMMA | `mha_fused_cuda.cu` | — | ✅ **13.8×** | S≤64 路径改为走 FP16 flash WMMA kernel（precompute + flash），S=8 从 31.9ms→2.3ms。preloaded FP32 kernel 保留为 fallback |
-| R6-c | 输出投影 WMMA | `mha_fused_cuda.cu` | 低 | 1.1-1.2× | 待评估：Y=out·WO 需 WO 分块加载 + FP16 转换，smem 压力大 |
-| R6-d | cp.async 双 buffer | `mha_fused_cuda.cu` | 高 | 1.2-1.5× | 待评估：cp.async 不支持类型转换，需先改 precompute 输出 FP16（依赖链长）；double buffer 增加 9KB smem |
+| R6-c | 输出投影 WMMA | `mha_fused_cuda.cu` | — | **不可行** | ❌ 已评估：WO 是 FP32，WMMA 需 FP16 转换（48 tile × 256 转换 = 12K 转换），转换开销 + smem 压力抵消 Tensor Core 收益，回退 |
+| R6-d | cp.async 双 buffer | `mha_fused_cuda.cu` | — | 待评估 | 需先改 precompute 输出 FP16（依赖链长），double buffer 增加 9KB smem（仍 2 blocks/SM）。当前 K/V 加载非瓶颈（precompute 1ms vs flash 7ms），优先级低 |
 
 > 进度：R6-a 已验证失败回退。R6-b/c/d 需架构级改动（precompute FP16 输出 / WO 分块 / double buffer），当前 smem/寄存器预算紧张，留作后续。
 >
@@ -109,7 +109,8 @@ out:    每个 warp 独立计算 16×d，最后 atomicAdd 到 Y
 | --- | --- |
 | 已完成 | R1 全部, R2 全部, R3-a, R4 全部, R5 全部, Flash Attention v2 (FP32 + FP16 WMMA, smem 精简 2 blocks/SM) |
 | 进行中 | — |
-| 已验证失败 | R6-a (acc_o fragment 化, 寄存器压力) |
-| 待评估 | R6-b/c/d (需架构级改动) |
+| 已验证失败 | R6-a (寄存器压力), R6-c (WO FP16 转换开销) |
+| 已完成 | R6-b (S≤64 FP16 WMMA, 13.8×) |
+| 待评估 | R6-d (cp.async, 优先级低) |
 
 > **最后更新**: 2026-06-23。Profiling 工作流文档化完成，R6 优化方案基于 nsys 报告制定。
