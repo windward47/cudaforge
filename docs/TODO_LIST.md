@@ -93,7 +93,7 @@ out:    每个 warp 独立计算 16×d，最后 atomicAdd 到 Y
 | # | 任务 | 文件 | 优先级 | 预期收益 | 说明 |
 | --- | --- | --- | --- | --- | --- |
 | R6-a | acc_o 用 fragment 替代 smem | `mha_fused_cuda.cu` | — | **失败** | ❌ 已验证：fragment 化导致寄存器 72→121/thread，kernel 变慢 3.4×（无 spill 但指令级并行度下降）。省 16KB smem 换寄存器压力不划算，已回退 |
-| R6-b | preloaded kernel FP16 WMMA | `mha_fused_cuda.cu` | 中 | 短序列 2-3× | 待评估：需重构 preloaded kernel 为多行 Q tiling + WMMA，工作量与 flash kernel 相当 |
+| R6-b | preloaded kernel FP16 WMMA | `mha_fused_cuda.cu` | — | ✅ **13.8×** | S≤64 路径改为走 FP16 flash WMMA kernel（precompute + flash），S=8 从 31.9ms→2.3ms。preloaded FP32 kernel 保留为 fallback |
 | R6-c | 输出投影 WMMA | `mha_fused_cuda.cu` | 低 | 1.1-1.2× | 待评估：Y=out·WO 需 WO 分块加载 + FP16 转换，smem 压力大 |
 | R6-d | cp.async 双 buffer | `mha_fused_cuda.cu` | 高 | 1.2-1.5× | 待评估：cp.async 不支持类型转换，需先改 precompute 输出 FP16（依赖链长）；double buffer 增加 9KB smem |
 
