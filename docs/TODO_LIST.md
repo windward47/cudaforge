@@ -70,6 +70,34 @@ out:    每个 warp 独立计算 16×d，最后 atomicAdd 到 Y
 | R5-a | FP16 kernel 标记为 experimental | `mha_fused_cuda.cu` | ✅ 已标记，host dispatch 中注释说明 |
 | R5-b | 更新 ARCHITECTURE.md | `docs/ARCHITECTURE.md` | ✅ 新增 Flash Attention 架构说明 |
 | R5-c | 更新 CUDA_GUIDE.md | `docs/CUDA_GUIDE.md` | ✅ 新增 WMMA 实战注意 + FA2 优化路径 |
+| R5-d | Profiling 工作流文档 | `docs/PROFILING_GUIDE.md` | ✅ nsys/ncu/sanitizer 三层流程 + 实战案例 |
+| R5-e | Profiling 脚本 | `scripts/run_profiling.sh` | ✅ 一键 sanitizer + nsys + occupancy 估算 |
+
+---
+
+## R6: Profiling 驱动的下一轮优化 ⭐⭐
+
+**来源**：nsys 分析报告（RTX 2050, sm_86, 100KB smem/SM, 16 SMs）
+
+**当前状态**（FP16 WMMA kernel）：
+- smem 33.5KB → 2 blocks/SM（已从 1 提升到 2）
+- 72 regs/thread（寄存器非瓶颈：65536/(72×64)=14 blocks 可达）
+- kernel 时间 S=512: 22ms（nsys 纯 kernel）
+
+**分析报告瓶颈**：
+1. FP16 kernel smem 仍是 occupancy 瓶颈（33.5KB 限 2 blocks/SM，理论可 3+）
+2. acc_o_fmem 持久化在 smem 占 16KB（FA_F16_BM×FA_MAX_D×4），可用 WMMA fragment 替代
+3. preloaded kernel (S≤8 短序列) 占 benchmark 总时间 3367ms，无 FP16 WMMA 加速
+4. benchmark 内存传输开销大（D2H 68%），实际推理应避免每 iter copy
+
+| # | 任务 | 文件 | 优先级 | 预期收益 | 说明 |
+| --- | --- | --- | --- | --- | --- |
+| R6-a | acc_o 用 fragment 替代 smem | `mha_fused_cuda.cu` | 中 | 1.2-1.5× | 用 4 个 16×16 accumulator fragment 替代 acc_o_fmem (16KB)，需正确处理 per-row rescale（参考 FA2 convert_layout_acc_rowcol，smem round-trip） |
+| R6-b | preloaded kernel FP16 WMMA | `mha_fused_cuda.cu` | 中 | 短序列 2-3× | S≤64 路径也用 WMMA Q·Kᵀ + P·V，复用 flash kernel 的 WMMA 模式 |
+| R6-c | 输出投影 WMMA | `mha_fused_cuda.cu` | 低 | 1.1-1.2× | R4-e: Y = out·WO 用 WMMA 加速（当前标量循环） |
+| R6-d | cp.async 双 buffer | `mha_fused_cuda.cu` | 高 | 1.2-1.5× | SM80+ 用 cp.async 加载 K/V tile，与计算重叠，隐藏内存延迟 |
+
+> 进度：待实施。需先验证 R6-a 的 fragment rescale 正确性（FA2 用 CuTe，本项目用 smem round-trip 替代）。
 
 ---
 
@@ -77,8 +105,8 @@ out:    每个 warp 独立计算 16×d，最后 atomicAdd 到 Y
 
 | 状态 | 内容 |
 | --- | --- |
-| 已完成 | R1 全部, R2 全部, R3-a, R4 全部, R5 全部, Flash Attention v2 (FP32 + FP16 WMMA Tensor Core) |
+| 已完成 | R1 全部, R2 全部, R3-a, R4 全部, R5 全部, Flash Attention v2 (FP32 + FP16 WMMA, smem 精简 2 blocks/SM) |
 | 进行中 | — |
-| 实验性 | — |
+| 计划中 | R6 (profiling 驱动优化) |
 
-> **最后更新**: 2026-06-23。
+> **最后更新**: 2026-06-23。Profiling 工作流文档化完成，R6 优化方案基于 nsys 报告制定。
