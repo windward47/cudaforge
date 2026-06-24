@@ -92,12 +92,14 @@ out:    每个 warp 独立计算 16×d，最后 atomicAdd 到 Y
 
 | # | 任务 | 文件 | 优先级 | 预期收益 | 说明 |
 | --- | --- | --- | --- | --- | --- |
-| R6-a | acc_o 用 fragment 替代 smem | `mha_fused_cuda.cu` | 中 | 1.2-1.5× | 用 4 个 16×16 accumulator fragment 替代 acc_o_fmem (16KB)，需正确处理 per-row rescale（参考 FA2 convert_layout_acc_rowcol，smem round-trip） |
-| R6-b | preloaded kernel FP16 WMMA | `mha_fused_cuda.cu` | 中 | 短序列 2-3× | S≤64 路径也用 WMMA Q·Kᵀ + P·V，复用 flash kernel 的 WMMA 模式 |
-| R6-c | 输出投影 WMMA | `mha_fused_cuda.cu` | 低 | 1.1-1.2× | R4-e: Y = out·WO 用 WMMA 加速（当前标量循环） |
-| R6-d | cp.async 双 buffer | `mha_fused_cuda.cu` | 高 | 1.2-1.5× | SM80+ 用 cp.async 加载 K/V tile，与计算重叠，隐藏内存延迟 |
+| R6-a | acc_o 用 fragment 替代 smem | `mha_fused_cuda.cu` | — | **失败** | ❌ 已验证：fragment 化导致寄存器 72→121/thread，kernel 变慢 3.4×（无 spill 但指令级并行度下降）。省 16KB smem 换寄存器压力不划算，已回退 |
+| R6-b | preloaded kernel FP16 WMMA | `mha_fused_cuda.cu` | 中 | 短序列 2-3× | 待评估：需重构 preloaded kernel 为多行 Q tiling + WMMA，工作量与 flash kernel 相当 |
+| R6-c | 输出投影 WMMA | `mha_fused_cuda.cu` | 低 | 1.1-1.2× | 待评估：Y=out·WO 需 WO 分块加载 + FP16 转换，smem 压力大 |
+| R6-d | cp.async 双 buffer | `mha_fused_cuda.cu` | 高 | 1.2-1.5× | 待评估：cp.async 不支持类型转换，需先改 precompute 输出 FP16（依赖链长）；double buffer 增加 9KB smem |
 
-> 进度：待实施。需先验证 R6-a 的 fragment rescale 正确性（FA2 用 CuTe，本项目用 smem round-trip 替代）。
+> 进度：R6-a 已验证失败回退。R6-b/c/d 需架构级改动（precompute FP16 输出 / WO 分块 / double buffer），当前 smem/寄存器预算紧张，留作后续。
+>
+> **当前最优配置**（sm_86 RTX 2050）：FP16 WMMA kernel, BM=32, 2 warps, K/V smem 复用, 33.5KB smem, 72 regs, 2 blocks/SM。
 
 ---
 
@@ -107,6 +109,7 @@ out:    每个 warp 独立计算 16×d，最后 atomicAdd 到 Y
 | --- | --- |
 | 已完成 | R1 全部, R2 全部, R3-a, R4 全部, R5 全部, Flash Attention v2 (FP32 + FP16 WMMA, smem 精简 2 blocks/SM) |
 | 进行中 | — |
-| 计划中 | R6 (profiling 驱动优化) |
+| 已验证失败 | R6-a (acc_o fragment 化, 寄存器压力) |
+| 待评估 | R6-b/c/d (需架构级改动) |
 
 > **最后更新**: 2026-06-23。Profiling 工作流文档化完成，R6 优化方案基于 nsys 报告制定。
