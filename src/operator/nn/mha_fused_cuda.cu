@@ -1024,8 +1024,10 @@ int mha_fused_f32_cuda(const void* inputs[], void* outputs[],
 
         /* Flash Attention v2 kernel.
          * FP16 WMMA path (Tensor Core Q·Kᵀ + P·V) when available, else FP32.
-         * FP16 path requires d % 16 == 0 (WMMA tile alignment). */
-        if (use_f16 && d <= FA_MAX_D && (d % WMMA_N == 0)) {
+         * FP16 path requires d % 16 == 0 (WMMA tile alignment).
+         * MHA_FORCE_FP32=1 forces FP32 path for precision comparison. */
+        if (use_f16 && d <= FA_MAX_D && (d % WMMA_N == 0)
+            && !(getenv("MHA_FORCE_FP32"))) {
             /* dynamic shared: Q + K + V + P (all half). S_fmem/acc_o_fmem are static.
              * Static (32KB) + dynamic (36KB) = 68KB > 48KB default, so always opt-in. */
             size_t half_bytes = (size_t)((FA_TILE_BM + 3 * FA_TILE_BN) * smem_stride) * sizeof(__half);

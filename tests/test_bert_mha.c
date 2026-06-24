@@ -492,7 +492,8 @@ static void test_flash_attn_long_seq(void) {
     float *tWO = (float*)malloc(tD * tD * sizeof(float));
     float *tbO = (float*)malloc(tD * sizeof(float));
     float *tY_cpu  = (float*)calloc(t_n_elem, sizeof(float));
-    float *tY_cuda = (float*)calloc(t_n_elem, sizeof(float));
+    float *tY_cuda = (float*)calloc(t_n_elem, sizeof(float));  /* FP16 WMMA */
+    float *tY_fp32 = (float*)calloc(t_n_elem, sizeof(float));  /* FP32 FA2 */
 
     random_fill(tX,  t_n_elem, 42);
     random_fill(tR,  t_n_elem, 99);
@@ -587,14 +588,34 @@ static void test_flash_attn_long_seq(void) {
         memcpy(tY_cpu, ttY->data, t_n_elem * sizeof(float));
     }
 
-    /* CUDA */
+    /* CUDA (FP16 WMMA, default path) */
     {
         memset(ttY->data, 0, t_n_elem * sizeof(float));
         tensor_t* inputs[]  = {ttX};
         tensor_t* outputs[] = {ttY};
         int rc = graph_execute(g, inputs, outputs, true);
-        CHECK(rc == 0, "graph_execute cuda");
+        CHECK(rc == 0, "graph_execute cuda fp16");
         memcpy(tY_cuda, ttY->data, t_n_elem * sizeof(float));
+    }
+
+    /* CUDA (FP32 FA2, forced via env var) */
+    {
+#ifdef _WIN32
+        _putenv_s("MHA_FORCE_FP32", "1");
+#else
+        setenv("MHA_FORCE_FP32", "1", 1);
+#endif
+        memset(ttY->data, 0, t_n_elem * sizeof(float));
+        tensor_t* inputs[]  = {ttX};
+        tensor_t* outputs[] = {ttY};
+        int rc = graph_execute(g, inputs, outputs, true);
+        CHECK(rc == 0, "graph_execute cuda fp32");
+        memcpy(tY_fp32, ttY->data, t_n_elem * sizeof(float));
+#ifdef _WIN32
+        _putenv_s("MHA_FORCE_FP32", "");
+#else
+        unsetenv("MHA_FORCE_FP32");
+#endif
     }
 
     float max_diff = max_abs_diff(tY_cpu, tY_cuda, t_n_elem);
@@ -604,9 +625,41 @@ static void test_flash_attn_long_seq(void) {
     CHECK(max_diff < 0.5f, "max_diff long seq");
     fprintf(stderr, "Flash Attention Long Sequence: PASS\n");
 
+    /* ---- Precision analysis: FP16 vs FP32 vs CPU ---- */
+    float diff_fp16_cpu = max_abs_diff(tY_cuda, tY_cpu, t_n_elem);
+    float diff_fp32_cpu = max_abs_diff(tY_fp32, tY_cpu, t_n_elem);
+    float diff_fp16_fp32 = max_abs_diff(tY_cuda, tY_fp32, t_n_elem);
+    /* per-element relative error for FP16 vs FP32 */
+    float max_abs_fp32 = 0.0f, max_rel_fp16_fp32 = 0.0f;
+    double sum_rel = 0; int64_t rel_cnt = 0;
+    for (int64_t i = 0; i < t_n_elem; i++) {
+        float a = fabsf(tY_fp32[i]);
+        if (a > max_abs_fp32) max_abs_fp32 = a;
+        if (a > 1e-3f) {
+            float rel = fabsf(tY_cuda[i] - tY_fp32[i]) / a;
+            if (rel > max_rel_fp16_fp32) max_rel_fp16_fp32 = rel;
+            sum_rel += rel; rel_cnt++;
+        }
+    }
+    fprintf(stderr, "Precision (S=128, max|Y_fp32|=%.2f):\n", max_abs_fp32);
+    fprintf(stderr, "  FP16 WMMA vs CPU : max_abs=%.3e\n", diff_fp16_cpu);
+    fprintf(stderr, "  FP32 FA2  vs CPU : max_abs=%.3e  (online softmax vs two-pass algo diff)\n", diff_fp32_cpu);
+    fprintf(stderr, "  FP16 WMMA vs FP32: max_abs=%.3e  max_rel=%.3e  mean_rel=%.3e (pure FP16 loss)\n",
+            diff_fp16_fp32, max_rel_fp16_fp32, rel_cnt ? sum_rel/rel_cnt : 0.0);
+    /* locate the worst element */
+    {
+        int64_t worst = 0; float worst_diff = 0;
+        for (int64_t i = 0; i < t_n_elem; i++) {
+            float dd = fabsf(tY_cuda[i] - tY_fp32[i]);
+            if (dd > worst_diff) { worst_diff = dd; worst = i; }
+        }
+        fprintf(stderr, "  worst elem idx=%lld: fp16=%.4f fp32=%.4f cpu=%.4f\n",
+                (long long)worst, tY_cuda[worst], tY_fp32[worst], tY_cpu[worst]);
+    }
+
     free(tX); free(tR); free(tWQ); free(tbQ); free(tWK); free(tbK);
     free(tWV); free(tbV); free(tWO); free(tbO);
-    free(tY_cpu); free(tY_cuda);
+    free(tY_cpu); free(tY_cuda); free(tY_fp32);
     graph_destroy(g);
 #else
     (void)0;
