@@ -421,6 +421,13 @@ __global__ void mha_flash_attn_v2_kernel(
 /* Number of N-tiles to cover head_dim d (d=64 → 4 tiles) */
 #define WMMA_D_TILES (FA_MAX_D / WMMA_N)
 
+/* FP16 kernel tiling: BM=32 with 2 warps (×16 rows each) to halve smem
+ * vs FA_TILE_BM=64. Combined with K/V smem reuse, total smem drops from
+ * 68KB to ~34KB → 2 blocks/SM (was 1). */
+#define FA_F16_BM       32
+#define FA_F16_WARPS    2
+#define FA_F16_THREADS  (FA_F16_WARPS * 32)   /* 64 */
+
 __global__ void mha_flash_attn_v2_f16_kernel(
     const float* __restrict__ X,
     const float* __restrict__ WQ, const float* __restrict__ bQ,
@@ -447,33 +454,33 @@ __global__ void mha_flash_attn_v2_f16_kernel(
     const int kv_h = h / group_size;
     const int kv_ho = kv_h * d_int;
 
-    constexpr int ROWS_PER_WARP = FA_TILE_BM / FA_NUM_WARPS;  /* 16 */
-    const int warp_row_start = m_block * FA_TILE_BM + warp_id * ROWS_PER_WARP;
+    constexpr int ROWS_PER_WARP = FA_F16_BM / FA_F16_WARPS;  /* 16 */
+    const int warp_row_start = m_block * FA_F16_BM + warp_id * ROWS_PER_WARP;
 
     const float* X_b  = X + (int64_t)b * S_int * D_int;
     const float* R_b  = (has_residual && R) ? (R + (int64_t)b * S_int * D_int) : NULL;
     const int64_t kv_batch_stride = (int64_t)S_int * H_kv_int * d_int;
 
-    /* Shared memory layout:
-     *   Q_hsmem, K_hsmem, V_hsmem, P_hsmem : half, dynamic shared (WMMA load works)
-     *   S_fmem, acc_o_fmem : float, STATIC shared
-     *     (store_matrix_sync to dynamic half*→float* reinterpret_cast silently fails
-     *      on sm_86; static __shared__ float is required for WMMA fp32 accumulator store)
-     *
-     *   out_buf reuses S_fmem (scores consumed before P·V temp needs it). */
+    /* Shared memory layout (K and V REUSE the same buffer — K is consumed by
+     * Q·Kᵀ before V is loaded, so they never coexist):
+     *   Q_hsmem  : FA_F16_BM × smem_stride (half)  — 32 query rows
+     *   KV_hsmem : FA_TILE_BN × smem_stride (half) — K tile then V tile (reused)
+     *   P_hsmem  : FA_F16_BM × FA_TILE_BN (half)   — softmax P
+     *   S_fmem   : FA_F16_BM × FA_TILE_BN (float, static)  — scores / P·V temp
+     *   acc_o_fmem: FA_F16_BM × FA_MAX_D (float, static)   — persistent output
+     * Total ≈ 4.5KB + 9KB + 4KB + 8KB + 8KB = ~34KB → 2 blocks/SM on sm_86. */
     extern __shared__ __half smem_h[];
     const int smem_stride = d_int + FA_SKEW;
-    __half* Q_hsmem = smem_h;
-    __half* K_hsmem = Q_hsmem + FA_TILE_BM * smem_stride;
-    __half* V_hsmem = K_hsmem + FA_TILE_BN * smem_stride;
-    __half* P_hsmem = V_hsmem + FA_TILE_BN * smem_stride;
-    __shared__ float S_fmem[FA_TILE_BM * FA_TILE_BN];          /* scores / P·V temp */
-    __shared__ float acc_o_fmem[FA_TILE_BM * FA_MAX_D];        /* persistent output accum */
+    __half* Q_hsmem  = smem_h;
+    __half* KV_hsmem = Q_hsmem + FA_F16_BM * smem_stride;     /* K and V share */
+    __half* P_hsmem  = KV_hsmem + FA_TILE_BN * smem_stride;
+    __shared__ float S_fmem[FA_F16_BM * FA_TILE_BN];          /* scores / P·V temp */
+    __shared__ float acc_o_fmem[FA_F16_BM * FA_MAX_D];        /* persistent output accum */
     float* out_buf = S_fmem;
 
     /* ---- Step 1: Compute Q for ALL BM rows, store as FP16 in smem ---- */
-    for (int r = tid; r < FA_TILE_BM; r += FA_NUM_THREADS) {
-        int global_row = m_block * FA_TILE_BM + r;
+    for (int r = tid; r < FA_F16_BM; r += FA_F16_THREADS) {
+        int global_row = m_block * FA_F16_BM + r;
         for (int di = 0; di < d_int; di++) {
             float acc = 0.0f;
             if (global_row < S_int) {
@@ -485,7 +492,7 @@ __global__ void mha_flash_attn_v2_f16_kernel(
         }
     }
     /* Zero acc_o (persistent) */
-    for (int i = tid; i < FA_TILE_BM * d_int; i += FA_NUM_THREADS)
+    for (int i = tid; i < FA_F16_BM * d_int; i += FA_F16_THREADS)
         acc_o_fmem[i] = 0.0f;
     __syncthreads();
 
@@ -507,11 +514,11 @@ __global__ void mha_flash_attn_v2_f16_kernel(
         int kv_start = kt * FA_TILE_BN;
         int tile_n = min(FA_TILE_BN, causal_limit - kv_start);
 
-        /* Load K tile as FP16 (zero-pad beyond tile_n) */
-        for (int i = tid; i < FA_TILE_BN * d_int; i += FA_NUM_THREADS) {
+        /* Load K tile as FP16 into KV_hsmem (zero-pad beyond tile_n) */
+        for (int i = tid; i < FA_TILE_BN * d_int; i += FA_F16_THREADS) {
             int sk = i / d_int, dk = i % d_int;
             float val = (sk < tile_n) ? K_base[(int64_t)(kv_start + sk) * H_kv_int * d_int + dk] : 0.0f;
-            K_hsmem[sk * smem_stride + dk] = __float2half(val);
+            KV_hsmem[sk * smem_stride + dk] = __float2half(val);
         }
         __syncthreads();
 
@@ -530,8 +537,8 @@ __global__ void mha_flash_attn_v2_f16_kernel(
             for (int t = 0; t < num_n_tiles && t < 4; t++) {
                 wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, __half, wmma::col_major> bt;
                 /* col_major B: N-tile t = Kᵀ cols [t*16, t*16+16) = K rows [t*16, t*16+16).
-                 * Column n of Kᵀ at K_hsmem[n*smem_stride + k], so N-tile t base = t*16*smem_stride. */
-                wmma::load_matrix_sync(bt, K_hsmem + t * WMMA_N * smem_stride, smem_stride);
+                 * Column n of Kᵀ at KV_hsmem[n*smem_stride + k], so N-tile t base = t*16*smem_stride. */
+                wmma::load_matrix_sync(bt, KV_hsmem + t * WMMA_N * smem_stride, smem_stride);
                 wmma::mma_sync(acc_s[t], a_frag, bt, acc_s[t]);
             }
         }
@@ -583,22 +590,22 @@ __global__ void mha_flash_attn_v2_f16_kernel(
                 p_row[c] = __float2half(0.0f);
             row_sum[r] += warp_reduce_sum(my_sum);
         }
-        __syncwarp();
+        __syncthreads();   /* ensure all warps done with softmax before V overwrites K */
 
-        /* Load V tile as FP16 (zero-pad beyond tile_n) */
-        for (int i = tid; i < FA_TILE_BN * d_int; i += FA_NUM_THREADS) {
+        /* Load V tile as FP16 into KV_hsmem (reuses K's buffer, K now consumed) */
+        for (int i = tid; i < FA_TILE_BN * d_int; i += FA_F16_THREADS) {
             int sk = i / d_int, dk = i % d_int;
             float val = (sk < tile_n) ? V_base[(int64_t)(kv_start + sk) * H_kv_int * d_int + dk] : 0.0f;
-            V_hsmem[sk * smem_stride + dk] = __float2half(val);
+            KV_hsmem[sk * smem_stride + dk] = __float2half(val);
         }
         __syncthreads();
 
         /* ---- acc_o += P · V via WMMA → temp fragment → store out_buf → per-row add ----
          * P: (16, tile_n) row-major in P_hsmem, ld=FA_TILE_BN.
-         * V: (tile_n, d) row-major in V_hsmem, ld=smem_stride.
+         * V: (tile_n, d) row-major in KV_hsmem, ld=smem_stride.
          * out: (16, d), d=64 → 4 N-tiles. K-dim=tile_n, steps of 16. */
         /* out_buf (=S_fmem) is free now (scores consumed). Zero it for temp P·V output. */
-        for (int i = tid; i < ROWS_PER_WARP * d_int; i += FA_NUM_THREADS)
+        for (int i = tid; i < ROWS_PER_WARP * d_int; i += FA_F16_THREADS)
             out_buf[warp_id * ROWS_PER_WARP * d_int + i] = 0.0f;
         __syncwarp();
 
@@ -609,7 +616,7 @@ __global__ void mha_flash_attn_v2_f16_kernel(
             #pragma unroll
             for (int t = 0; t < WMMA_D_TILES; t++) {
                 wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, __half, wmma::row_major> v_frag;
-                wmma::load_matrix_sync(v_frag, V_hsmem + k_step * smem_stride + t * WMMA_N, smem_stride);
+                wmma::load_matrix_sync(v_frag, KV_hsmem + k_step * smem_stride + t * WMMA_N, smem_stride);
 
                 wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> pv_frag;
                 wmma::fill_fragment(pv_frag, 0.0f);
@@ -627,8 +634,6 @@ __global__ void mha_flash_attn_v2_f16_kernel(
                 __syncwarp();
             }
         }
-        __syncthreads();
-
         __syncthreads();
     }
 
@@ -1028,15 +1033,21 @@ int mha_fused_f32_cuda(const void* inputs[], void* outputs[],
          * MHA_FORCE_FP32=1 forces FP32 path for precision comparison. */
         if (use_f16 && d <= FA_MAX_D && (d % WMMA_N == 0)
             && !(getenv("MHA_FORCE_FP32"))) {
-            /* dynamic shared: Q + K + V + P (all half). S_fmem/acc_o_fmem are static.
-             * Static (32KB) + dynamic (36KB) = 68KB > 48KB default, so always opt-in. */
-            size_t half_bytes = (size_t)((FA_TILE_BM + 3 * FA_TILE_BN) * smem_stride) * sizeof(__half);
+            /* FP16 WMMA path: BM=32, 2 warps, 64 threads/block, K/V smem reuse.
+             * Grid: ceil(S/32) × B × H_q (smaller tiles → more parallelism).
+             * Smem ≈ 34KB → 2 blocks/SM (was 1 with BM=64). */
+            dim3 attn_grid_f16((unsigned int)((S + FA_F16_BM - 1) / FA_F16_BM),
+                               (unsigned int)B, (unsigned int)H_q);
+            dim3 attn_block_f16(FA_F16_THREADS, 1, 1);
+            /* dynamic shared: Q(BM×stride) + KV(BN×stride, reused) + P(BM×BN) as half */
+            size_t half_bytes = (size_t)(FA_F16_BM * smem_stride + FA_TILE_BN * smem_stride
+                                         + FA_F16_BM * FA_TILE_BN) * sizeof(__half);
             size_t smem_bytes = half_bytes;
 
             cudaFuncSetAttribute(mha_flash_attn_v2_f16_kernel,
                                  cudaFuncAttributeMaxDynamicSharedMemorySize,
                                  (int)smem_bytes);
-            int r16 = CUDA_KERNEL_LAUNCH(mha_flash_attn_v2_f16_kernel, attn_grid, attn_block, smem_bytes, s,
+            int r16 = CUDA_KERNEL_LAUNCH(mha_flash_attn_v2_f16_kernel, attn_grid_f16, attn_block_f16, smem_bytes, s,
                 X, WQ, bQ, K_buf, V_buf, WO, bO, Y, R,
                 B, S, D, H_q, H_kv, d, p->scale, has_residual, causal_mask);
             if (r16 != 0) {
