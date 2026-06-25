@@ -29,16 +29,27 @@ Platform     →  硬件抽象、内存管理（CPU + GPU）、线程调度
 - 禁止反向或跨层依赖
 - `.cu` 文件编译为 **C++17**（hipcc），`.c` 文件编译为 **C11**（GCC）
 
-## 移植状态
+## 构建状态
 
-当前处于 **CUDA → HIP 移植阶段**。详见 [PLAN.md](PLAN.md)。
+**v0.9.0** — AVX512 + ROCm/HIP 多平台集成完成。
 
-| 阶段 | 状态 | 说明 |
+| 模式 | 编译选项 | 测试结果 |
 | --- | --- | --- |
-| Phase 1: 兼容头文件 + CMake 改造 | 进行中 | `cuda2hip.h` + HIP 构建支持 |
-| Phase 2: 平台层移植 | 待开始 | 4 个 `.cu` 文件 |
-| Phase 3: 算子 Kernel 移植 | 待开始 | 37 个 `.cu` 文件 + 2 个 WMMA 处理 |
-| Phase 4: 测试验证 | 待开始 | 全量测试 + 精度校验 |
+| HIP + AVX512 + OpenMP | `ENABLE_HIP=ON ENABLE_AVX512=ON` | 35/36 通过 |
+| CPU-only + AVX512 | `ENABLE_HIP=OFF ENABLE_CUDA=OFF` | 32/32 通过 |
+
+### 编译选项
+
+| 选项 | 默认值 | 说明 |
+| --- | --- | --- |
+| `ENABLE_HIP` | ON | HIP/ROCm 后端（AMD GPU） |
+| `ENABLE_CUDA` | OFF | CUDA 后端（NVIDIA GPU） |
+| `ENABLE_AVX512` | ON | AVX-512 SIMD 优化（CPU 算子） |
+| `ENABLE_AVX2` | OFF | AVX2 SIMD 优化（CPU 算子） |
+| `ENABLE_OPENMP` | ON | OpenMP 并行 |
+| `ENABLE_TESTS` | ON | 构建测试 |
+| `HIP_ARCH` | gfx1151 | HIP 目标架构 |
+| `CUDA_ARCH` | 86 | CUDA 目标架构 |
 
 ## 目录结构
 
@@ -84,23 +95,26 @@ cudaforge/
 - 算子的 GPU kernel 先写 naive 版本 → 再优化（shared memory → wave-level → tensor core）
 - 浮点对比测试时，CPU 和 GPU 结果做相对误差比较（`allclose`），不要 `assert_equal`
 - 算子专用类型定义放在独立内部头文件（如 `conv_int.h`、`pooling_int.h`），`.c` 和 `.cu` 共用
-- WMMA Tensor Core 代码用 `#ifdef __CUDACC__` / `#elif defined(__HIPCC__)` 条件编译
+- WMMA Tensor Core 代码用 `#ifdef __CUDACC__` 条件编译，HIP 用 tiled fallback
 
 ## 常用命令
 
-```bash
-# === GPU 模式构建（HIP/ROCm）===
+# === HIP/ROCm 模式（AMD GPU，默认）===
 cmake -B build -DENABLE_HIP=ON -DENABLE_CUDA=OFF -DENABLE_TESTS=ON \
       -DENABLE_AVX512=ON -DENABLE_OPENMP=ON
 cmake --build build -j$(nproc)
 
-# === 仅 CPU 模式 ===
-cmake -B build -DENABLE_CUDA=OFF -DENABLE_HIP=OFF -DENABLE_TESTS=ON
+# === CUDA 模式（NVIDIA GPU）===
+cmake -B build -DENABLE_HIP=OFF -DENABLE_CUDA=ON -DCUDA_ARCH=86 -DENABLE_TESTS=ON
 cmake --build build -j$(nproc)
 
-# === AVX2 优化模式 ===
-cmake -B build-avx2 -G "Visual Studio 17 2022" -A x64 -DENABLE_CUDA=ON -DENABLE_TESTS=ON -DENABLE_AVX2=ON
-cmake --build build-avx2 --config Release -j$(nproc)
+# === 仅 CPU 模式（AVX-512）===
+cmake -B build -DENABLE_HIP=OFF -DENABLE_CUDA=OFF -DENABLE_AVX512=ON -DENABLE_TESTS=ON
+cmake --build build -j$(nproc)
+
+# === 仅 CPU 模式（AVX2）===
+cmake -B build -DENABLE_HIP=OFF -DENABLE_CUDA=OFF -DENABLE_AVX2=ON -DENABLE_TESTS=ON
+cmake --build build -j$(nproc)
 
 # === 运行测试 ===
 ctest --test-dir build --output-on-failure -j$(nproc)

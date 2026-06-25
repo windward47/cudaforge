@@ -1,5 +1,7 @@
 # Build output
 build/
+build_perf/
+build-*/
 out/
 *.exe
 *.bin
