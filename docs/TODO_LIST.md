@@ -109,12 +109,33 @@ out:    每个 warp 独立计算 16×d，最后 atomicAdd 到 Y
 
 | # | 任务 | 说明 |
 | --- | --- | --- |
-| R7-a | nsys 分析 BERT 端到端 | `test_bert` 全图 kernel 时间分布，定位 Top-N 瓶颈算子 |
-| R7-b | nsys 分析 GPT-2 生成 | `test_gpt2_generate` decode 循环瓶颈 |
-| R7-c | 瓶颈算子针对性优化 | 根据 R7-a/b 结果选 1-2 个算子优化 |
-| R7-d | 端到端性能回归基线 | 记录 BERT/GPT-2 端到端 ms/iter 作为基线 |
+| R7-a | nsys 分析 GPT-2 端到端 | ✅ 发现 98% 时间是 per-node eager D2H（4346 次） |
+| R7-b | nsys 验证优化效果 | ✅ D2H 降到 159 次，kernel 时间成主瓶颈 |
+| R7-c | 惰性 D2H | ✅ GPT-2 prefill 4.6ms→0.66ms（7×），36/36 通过 |
+| R7-d | 端到端基线 + 新瓶颈 | ✅ 见下表 |
 
-> 进度：待实施。
+### GPT-2 端到端性能基线（R7 后）
+
+| 指标 | 优化前 | 优化后 |
+| --- | --- | --- |
+| GPT-2 prefill | 4.635 ms/iter | **0.660 ms/iter** (7×) |
+| D2H 次数 | 4346 | 159 |
+| D2H 时间 | 5.7 ms (98%) | 0.2 ms (25%) |
+
+### 新瓶颈（kernel 时间分布，R7 后）
+
+| Kernel | calls | total_ms | 占比 |
+| --- | --- | --- | --- |
+| matmul_f32_tiled | 689 | 3.29 | 32% |
+| transpose_f32 | 424 | 1.52 | 15% |
+| add (broadcast+no-broadcast) | 1113 | 1.73 | 17% |
+| mul (broadcast+no-broadcast) | 742 | 1.14 | 11% |
+| layernorm | 265 | 0.68 | 7% |
+| reshape_copy | 424 | 0.61 | 6% |
+
+> **下一步优化方向**：matmul（32%）已是 tiled kernel，可考虑 WMMA FP16；transpose（15%）异常高，可能是 GPT-2 的 attention reshape；elementwise add/mul（28%）可融合。
+>
+> 进度：R7 全部完成。惰性 D2H 是端到端最大收益项（7×）。
 
 ---
 
