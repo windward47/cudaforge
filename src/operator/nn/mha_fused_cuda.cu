@@ -428,6 +428,7 @@ __global__ void mha_flash_attn_v2_kernel(
 #define FA_F16_WARPS    2
 #define FA_F16_THREADS  (FA_F16_WARPS * 32)   /* 64 */
 
+#ifdef __CUDACC__  /* WMMA requires nvcc */
 __global__ void mha_flash_attn_v2_f16_kernel(
     const float* __restrict__ X,
     const float* __restrict__ WQ, const float* __restrict__ bQ,
@@ -661,6 +662,7 @@ __global__ void mha_flash_attn_v2_f16_kernel(
         }
     }
 }
+#endif /* __CUDACC__ */
 
 
 /* ============================================================
@@ -974,17 +976,18 @@ int mha_fused_f32_cuda(const void* inputs[], void* outputs[],
         use_f16_short = 1;
 #else
         {
-            int dev = 0; cudaGetDevice(&dev);
-            cudaDeviceProp prop; cudaGetDeviceProperties(&prop, dev);
+            int dev = 0; (void)cudaGetDevice(&dev);
+            cudaDeviceProp prop; (void)cudaGetDeviceProperties(&prop, dev);
             if (prop.major >= 7) use_f16_short = 1;
         }
 #endif
+#ifdef __CUDACC__  /* WMMA FP16 path requires nvcc */
         if (use_f16_short && d <= FA_MAX_D && (d % WMMA_N == 0) && !(getenv("MHA_FORCE_FP32"))) {
             /* Pre-compute K/V, then run FP16 flash kernel (same as S>64 path). */
             size_t kv_size_s = (size_t)B * S * H_kv * d * sizeof(float);
             float *K_buf_s = NULL, *V_buf_s = NULL;
-            cudaMalloc(&K_buf_s, kv_size_s);
-            cudaMalloc(&V_buf_s, kv_size_s);
+            (void)cudaMalloc(&K_buf_s, kv_size_s);
+            (void)cudaMalloc(&V_buf_s, kv_size_s);
             if (K_buf_s && V_buf_s) {
                 dim3 kv_grid_s((unsigned int)(B * S), (unsigned int)H_kv, 1);
                 CUDA_KERNEL_LAUNCH(mha_precompute_kv_kernel, kv_grid_s, dim3(256), 0, s,
@@ -996,18 +999,19 @@ int mha_fused_f32_cuda(const void* inputs[], void* outputs[],
                 dim3 attn_block_s(FA_F16_THREADS, 1, 1);
                 size_t smem_bytes_s = (size_t)(FA_F16_BM * smem_stride_s + FA_TILE_BN * smem_stride_s
                                                + FA_F16_BM * FA_TILE_BN) * sizeof(__half);
-                cudaMemsetAsync(Y, 0, (size_t)B * S * D * sizeof(float), s);
-                cudaFuncSetAttribute(mha_flash_attn_v2_f16_kernel,
+                (void)cudaMemsetAsync(Y, 0, (size_t)B * S * D * sizeof(float), s);
+                (void)cudaFuncSetAttribute((const void*)mha_flash_attn_v2_f16_kernel,
                                      cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem_bytes_s);
                 CUDA_KERNEL_LAUNCH(mha_flash_attn_v2_f16_kernel, attn_grid_s, attn_block_s, smem_bytes_s, s,
                     X, WQ, bQ, K_buf_s, V_buf_s, WO, bO, Y, R,
                     B, S, D, H_q, H_kv, d, p->scale, has_residual, causal_mask);
-                cudaFree(K_buf_s); cudaFree(V_buf_s);
+                (void)cudaFree(K_buf_s); (void)cudaFree(V_buf_s);
                 return 0;
             }
-            if (K_buf_s) cudaFree(K_buf_s);
-            if (V_buf_s) cudaFree(V_buf_s);
+            if (K_buf_s) (void)cudaFree(K_buf_s);
+            if (V_buf_s) (void)cudaFree(V_buf_s);
         }
+#endif /* __CUDACC__ */
         /* FP32 preloaded fallback */
         dim3 grid((unsigned int)(B * S), 1, 1);
         dim3 block(256, 1, 1);
@@ -1029,11 +1033,11 @@ int mha_fused_f32_cuda(const void* inputs[], void* outputs[],
     size_t flat_size = (size_t)B * S * D * sizeof(float);
     float* K_buf = NULL;
     float* V_buf = NULL;
-    cudaMalloc(&K_buf, kv_size);
-    cudaMalloc(&V_buf, kv_size);
+    (void)cudaMalloc(&K_buf, kv_size);
+    (void)cudaMalloc(&V_buf, kv_size);
     if (!K_buf || !V_buf) {
-        if (K_buf) cudaFree(K_buf);
-        if (V_buf) cudaFree(V_buf);
+        if (K_buf) (void)cudaFree(K_buf);
+        if (V_buf) (void)cudaFree(V_buf);
         return -1;
     }
 
@@ -1045,7 +1049,7 @@ int mha_fused_f32_cuda(const void* inputs[], void* outputs[],
 
     if (S <= FA_SPLITKV_THRESHOLD) {
         /* Single-pass Flash Attention — R4: multi-row Q tiling */
-        cudaMemsetAsync(Y, 0, (size_t)B * S * D * sizeof(float), s);
+        (void)cudaMemsetAsync(Y, 0, (size_t)B * S * D * sizeof(float), s);
 
         dim3 attn_grid((unsigned int)((S + FA_TILE_BM - 1) / FA_TILE_BM),
                         (unsigned int)B,
@@ -1062,9 +1066,9 @@ int mha_fused_f32_cuda(const void* inputs[], void* outputs[],
         /* Check device capability at runtime */
         {
             int dev = 0;
-            cudaGetDevice(&dev);
+            (void)cudaGetDevice(&dev);
             cudaDeviceProp prop;
-            cudaGetDeviceProperties(&prop, dev);
+            (void)cudaGetDeviceProperties(&prop, dev);
             if (prop.major >= 7) use_f16 = 1;
         }
 #endif
@@ -1073,20 +1077,18 @@ int mha_fused_f32_cuda(const void* inputs[], void* outputs[],
          * FP16 WMMA path (Tensor Core Q·Kᵀ + P·V) when available, else FP32.
          * FP16 path requires d % 16 == 0 (WMMA tile alignment).
          * MHA_FORCE_FP32=1 forces FP32 path for precision comparison. */
+        int wmma_done = 0;
+#ifdef __CUDACC__  /* WMMA FP16 path requires nvcc */
         if (use_f16 && d <= FA_MAX_D && (d % WMMA_N == 0)
             && !(getenv("MHA_FORCE_FP32"))) {
-            /* FP16 WMMA path: BM=32, 2 warps, 64 threads/block, K/V smem reuse.
-             * Grid: ceil(S/32) × B × H_q (smaller tiles → more parallelism).
-             * Smem ≈ 34KB → 2 blocks/SM (was 1 with BM=64). */
             dim3 attn_grid_f16((unsigned int)((S + FA_F16_BM - 1) / FA_F16_BM),
                                (unsigned int)B, (unsigned int)H_q);
             dim3 attn_block_f16(FA_F16_THREADS, 1, 1);
-            /* dynamic shared: Q(BM×stride) + KV(BN×stride, reused) + P(BM×BN) as half */
             size_t half_bytes = (size_t)(FA_F16_BM * smem_stride + FA_TILE_BN * smem_stride
                                          + FA_F16_BM * FA_TILE_BN) * sizeof(__half);
             size_t smem_bytes = half_bytes;
 
-            cudaFuncSetAttribute(mha_flash_attn_v2_f16_kernel,
+            (void)cudaFuncSetAttribute((const void*)mha_flash_attn_v2_f16_kernel,
                                  cudaFuncAttributeMaxDynamicSharedMemorySize,
                                  (int)smem_bytes);
             int r16 = CUDA_KERNEL_LAUNCH(mha_flash_attn_v2_f16_kernel, attn_grid_f16, attn_block_f16, smem_bytes, s,
@@ -1095,23 +1097,19 @@ int mha_fused_f32_cuda(const void* inputs[], void* outputs[],
             if (r16 != 0) {
                 fprintf(stderr, "FP16 WMMA kernel launch failed (smem=%zu): rc=%d, falling back to FP32\n",
                         smem_bytes, r16);
-                cudaGetLastError();
-                size_t smem_bytes_f32 = (size_t)(2 * FA_TILE_BN * smem_stride + num_warps) * sizeof(float);
-                if (smem_bytes_f32 > 48 * 1024)
-                    cudaFuncSetAttribute(mha_flash_attn_v2_kernel,
-                                         cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem_bytes_f32);
-                CUDA_KERNEL_LAUNCH(mha_flash_attn_v2_kernel, attn_grid, attn_block, smem_bytes_f32, s,
-                    X, WQ, bQ, K_buf, V_buf, WO, bO, Y, R,
-                    B, S, D, H_q, H_kv, d, p->scale, has_residual, causal_mask);
+                (void)cudaGetLastError();
+            } else {
+                wmma_done = 1;
             }
-        } else {
-            size_t smem_bytes = (size_t)(2 * FA_TILE_BN * smem_stride + num_warps) * sizeof(float);
-            if (smem_bytes > 48 * 1024) {
-                cudaFuncSetAttribute(mha_flash_attn_v2_kernel,
-                                     cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                     (int)smem_bytes);
-            }
-            CUDA_KERNEL_LAUNCH(mha_flash_attn_v2_kernel, attn_grid, attn_block, smem_bytes, s,
+        }
+#endif /* __CUDACC__ */
+        if (!wmma_done) {
+            /* FP32 Flash Attention path (always available) */
+            size_t smem_bytes_f32 = (size_t)(2 * FA_TILE_BN * smem_stride + num_warps) * sizeof(float);
+            if (smem_bytes_f32 > 48 * 1024)
+                (void)cudaFuncSetAttribute((const void*)mha_flash_attn_v2_kernel,
+                                     cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem_bytes_f32);
+            CUDA_KERNEL_LAUNCH(mha_flash_attn_v2_kernel, attn_grid, attn_block, smem_bytes_f32, s,
                 X, WQ, bQ, K_buf, V_buf, WO, bO, Y, R,
                 B, S, D, H_q, H_kv, d, p->scale, has_residual, causal_mask);
         }
@@ -1127,14 +1125,14 @@ int mha_fused_f32_cuda(const void* inputs[], void* outputs[],
         float* Q_buf = NULL;
         float* O_accum = NULL;
         float* LSE_accum = NULL;
-        cudaMalloc(&Q_buf, q_size);
-        cudaMalloc(&O_accum, o_accum_size);
-        cudaMalloc(&LSE_accum, lse_accum_size);
+        (void)cudaMalloc(&Q_buf, q_size);
+        (void)cudaMalloc(&O_accum, o_accum_size);
+        (void)cudaMalloc(&LSE_accum, lse_accum_size);
         if (!Q_buf || !O_accum || !LSE_accum) {
-            if (Q_buf) cudaFree(Q_buf);
-            if (O_accum) cudaFree(O_accum);
-            if (LSE_accum) cudaFree(LSE_accum);
-            cudaFree(K_buf); cudaFree(V_buf);
+            if (Q_buf) (void)cudaFree(Q_buf);
+            if (O_accum) (void)cudaFree(O_accum);
+            if (LSE_accum) (void)cudaFree(LSE_accum);
+            (void)cudaFree(K_buf); (void)cudaFree(V_buf);
             return -1;
         }
 
@@ -1146,7 +1144,7 @@ int mha_fused_f32_cuda(const void* inputs[], void* outputs[],
         }
 
         /* Zero-initialize Y (heads accumulate via atomicAdd in combine) */
-        cudaMemsetAsync(Y, 0, (size_t)B * S * D * sizeof(float), s);
+        (void)cudaMemsetAsync(Y, 0, (size_t)B * S * D * sizeof(float), s);
 
         /* Split-KV kernel */
         {
@@ -1157,7 +1155,7 @@ int mha_fused_f32_cuda(const void* inputs[], void* outputs[],
             size_t smem_bytes = (size_t)(2 * FA_TILE_BN * smem_stride + num_warps) * sizeof(float);
 
             if (smem_bytes > 48 * 1024) {
-                cudaFuncSetAttribute(mha_flash_attn_splitkv_kernel,
+                (void)cudaFuncSetAttribute((const void*)mha_flash_attn_splitkv_kernel,
                                      cudaFuncAttributeMaxDynamicSharedMemorySize,
                                      (int)smem_bytes);
             }
@@ -1168,7 +1166,7 @@ int mha_fused_f32_cuda(const void* inputs[], void* outputs[],
                 B, S, D, H_q, H_kv, d, p->scale, has_residual, causal_mask, num_splits);
         }
 
-        cudaFree(Q_buf);
+        (void)cudaFree(Q_buf);
 
         /* Combine kernel */
         {
@@ -1179,12 +1177,12 @@ int mha_fused_f32_cuda(const void* inputs[], void* outputs[],
                 B, S, D, H_q, d, has_residual, num_splits);
         }
 
-        cudaFree(O_accum);
-        cudaFree(LSE_accum);
+        (void)cudaFree(O_accum);
+        (void)cudaFree(LSE_accum);
     }
 
-    cudaFree(K_buf);
-    cudaFree(V_buf);
+    (void)cudaFree(K_buf);
+    (void)cudaFree(V_buf);
     return 0;
 }
 

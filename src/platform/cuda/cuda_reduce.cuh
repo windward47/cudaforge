@@ -32,7 +32,7 @@ template<typename T>
 __device__ __forceinline__ T warp_reduce_sum(T val) {
     #pragma unroll
     for (int offset = 16; offset > 0; offset >>= 1)
-        val += __shfl_xor_sync(0xffffffff, val, offset);
+        val += __shfl_xor_sync(0xffffffffULL, val, offset);
     return val;
 }
 
@@ -45,7 +45,7 @@ template<typename T>
 __device__ __forceinline__ T warp_reduce_max(T val) {
     #pragma unroll
     for (int offset = 16; offset > 0; offset >>= 1)
-        val = max(val, __shfl_xor_sync(0xffffffff, val, offset));
+        val = max(val, __shfl_xor_sync(0xffffffffULL, val, offset));
     return val;
 }
 
@@ -138,7 +138,7 @@ template<typename T>
 __device__ __forceinline__ T quad_reduce_sum(T val) {
     #pragma unroll
     for (int offset = 2; offset > 0; offset >>= 1)
-        val += __shfl_xor_sync(0xffffffff, val, offset);
+        val += __shfl_xor_sync(0xffffffffULL, val, offset);
     return val;
 }
 
@@ -149,7 +149,7 @@ template<typename T>
 __device__ __forceinline__ T quad_reduce_max(T val) {
     #pragma unroll
     for (int offset = 2; offset > 0; offset >>= 1)
-        val = max(val, __shfl_xor_sync(0xffffffff, val, offset));
+        val = max(val, __shfl_xor_sync(0xffffffffULL, val, offset));
     return val;
 }
 

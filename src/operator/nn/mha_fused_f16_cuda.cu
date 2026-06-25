@@ -15,15 +15,18 @@
 #include "cuda_ops.h"
 #include "mha_fused_int.h"
 #include <cuda_fp16.h>
+#ifdef __CUDACC__
 #include <mma.h>
+#else
+/* WMMA not available on HIP — stub functions below */
+#endif
 
+#ifdef __CUDACC__
 using namespace nvcuda;
-
 #define WMMA_M 16
 #define WMMA_N 16
 #define WMMA_K 16
 #define MAX_SEQ_LEN 64
-
 __global__ void mha_fused_f16_kernel(
     const float* __restrict__ X,
     const float* __restrict__ WQ, const float* __restrict__ bQ,
@@ -39,15 +42,12 @@ __global__ void mha_fused_f16_kernel(
     int si = bs % (int)S;
     int tid = threadIdx.x;
     int nthreads = blockDim.x;
-
     if (b >= B) return;
-
     const float* X_b = X + b * S * D;
     float* Y_bs = Y + (b * S + si) * D;
     const float* R_bs = (has_residual && R) ? (R + (b * S + si) * D) : NULL;
     int S_int = (int)S, d_int = (int)d, D_int = (int)D;
     int S_pad = ((S_int + WMMA_M - 1) / WMMA_M) * WMMA_M;
-
     /* Shared memory:
        X_h: S_pad × D (FP16, loaded once)
        K_smem: S × d (FP16)
@@ -64,14 +64,12 @@ __global__ void mha_fused_f16_kernel(
     __half* M_smem = V_smem + S_int * d_int;
     __half* W_tile = M_smem + S_pad * d_int;
     float*  tbuf   = (float*)(W_tile + WMMA_K * WMMA_N);
-
     /* Load X (S×D) → X_h (S_pad×D) as FP16, once */
     for (int i = tid; i < S_pad * D_int; i += nthreads) {
         int r = i / D_int, c = i % D_int;
         X_h[r * D_int + c] = __float2half((r < S_int) ? X_b[r * D_int + c] : 0.0f);
     }
     __syncthreads();
-
     /* Initialize output */
     for (int j = tid; j < D_int; j += nthreads) {
         float val = (bO ? bO[j] : 0.0f);
@@ -79,7 +77,6 @@ __global__ void mha_fused_f16_kernel(
         Y_bs[j] = val;
     }
     __syncthreads();
-
     /* ---- Helper: load weight tile (WMMA_K × WMMA_N) as FP16 ----
        Loads W[ho+_k+r, _tc+c] into W_tile as col-major for WMMA matrix_b. */
     #define LOAD_W_TILE(W_SRC, ho, _k, _tc) \
@@ -90,7 +87,6 @@ __global__ void mha_fused_f16_kernel(
                 __float2half(W_SRC[(_gr) * D_int + (_gc)]) : __float2half(0.0f); \
         } \
         __syncthreads()
-
     /* ---- Helper: WMMA tile loop for projection ----
        X_h(S_pad×D, row-major) × weight(D×d, loaded per tile as col-major)
        → out(S_pad×d, FP16), with bias */
@@ -121,22 +117,18 @@ __global__ void mha_fused_f16_kernel(
                 __syncthreads(); \
             } \
         }
-
     /* Process each head */
     for (int h = 0; h < (int)H; h++) {
         int ho = h * d_int;
-
         /* ---- QKV projections via WMMA ---- */
         WMMA_PROJ(WQ, ho, M_smem, bQ, ho);  /* Q → M_smem */
         WMMA_PROJ(WK, ho, K_smem, bK, ho);  /* K → K_smem */
         WMMA_PROJ(WV, ho, V_smem, bV, ho);  /* V → V_smem */
-
         /* ---- Read Q for our query position → Q_reg (FP32) ---- */
         float Q_reg[64];
         for (int di = 0; di < d_int; di++) {
             Q_reg[di] = __half2float(M_smem[si * d_int + di]);
         }
-
         /* ---- Attention scores = Q · K^T → softmax (FP32) ---- */
         float scores[MAX_SEQ_LEN];
         for (int sj = 0; sj < S_int; sj++) {
@@ -146,7 +138,6 @@ __global__ void mha_fused_f16_kernel(
             }
             scores[sj] = dot * scale;
         }
-
         float max_val = -1e38f;
         for (int sj = 0; sj < S_int; sj++)
             if (scores[sj] > max_val) max_val = scores[sj];
@@ -157,7 +148,6 @@ __global__ void mha_fused_f16_kernel(
         }
         if (sum_val < 1e-12f) sum_val = 1e-12f;
         float inv_sum = 1.0f / sum_val;
-
         /* ---- Weighted V sum → M_smem (FP16) ---- */
         for (int i = tid; i < S_pad * d_int; i += nthreads) {
             int r = i / d_int, c = i % d_int;
@@ -172,7 +162,6 @@ __global__ void mha_fused_f16_kernel(
             }
         }
         __syncthreads();
-
         /* ---- Output projection: Y += M_smem · WO (WMMA, tiled) ----
            M_smem(S_pad×d) × WO(d×D) → accumulate into Y_bs.
            WO loaded per tile (WMMA_K × WMMA_N) into W_tile. */
@@ -180,20 +169,16 @@ __global__ void mha_fused_f16_kernel(
             for (int _tc = 0; _tc < D_int; _tc += WMMA_N) {
                 wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> c_frag;
                 wmma::fill_fragment(c_frag, 0.0f);
-
                 for (int _k = 0; _k < d_int; _k += WMMA_K) {
                     wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, __half, wmma::row_major> a_frag;
                     wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, __half, wmma::col_major> b_frag;
-
                     wmma::load_matrix_sync(a_frag, M_smem + _tr * d_int + _k, d_int);
                     LOAD_W_TILE(WO, ho, _k, _tc);
                     wmma::load_matrix_sync(b_frag, W_tile, WMMA_N);
                     wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
                 }
-
                 wmma::store_matrix_sync(tbuf, c_frag, WMMA_N, wmma::mem_row_major);
                 __syncthreads();
-
                 if (_tr <= si && si < _tr + WMMA_M) {
                     int local_row = si - _tr;
                     for (int _i = tid; _i < WMMA_N && _tc + _i < D_int; _i += nthreads) {
@@ -205,12 +190,10 @@ __global__ void mha_fused_f16_kernel(
         }
     }
 }
-
 int mha_fused_f16_cuda(const void* inputs[], void* outputs[],
                         const operator_params_t* params, stream_t* stream) {
     if (!inputs || !inputs[0] || !outputs || !outputs[0]) return -1;
     if (!params) return -1;
-
     const mha_fused_params_t* p = (const mha_fused_params_t*)params;
     const float* X  = (const float*)inputs[0];
     const float* R  = (const float*)inputs[1];
@@ -223,25 +206,29 @@ int mha_fused_f16_cuda(const void* inputs[], void* outputs[],
     const float* WO = (const float*)inputs[8];
     const float* bO = (const float*)inputs[9];
     float* Y        = (float*)outputs[0];
-
     cudaStream_t s = stream ? (cudaStream_t)stream->cuda_stream : 0;
-
     int64_t B = p->batch_size, S = p->seq_len, D = p->hidden_size;
     int64_t H = p->num_heads, d = p->head_dim;
-
     dim3 grid((unsigned int)(B * S), 1, 1);
     dim3 block(256, 1, 1);
-
     /* X_h(S_pad×D) + K(S×d) + V(S×d) + M(S_pad×d) as __half
        + W_tile(WMMA_K×WMMA_N) as __half + tbuf(16×16) as float */
     int S_pad = ((int)S + WMMA_M - 1) / WMMA_M * WMMA_M;
     size_t smem_bytes = (size_t)(S_pad * D + 2 * S * d + S_pad * d + WMMA_K * WMMA_N) * sizeof(__half)
                       + (size_t)(WMMA_M * WMMA_N) * sizeof(float);
-
     return CUDA_KERNEL_LAUNCH(mha_fused_f16_kernel, grid, block, smem_bytes, s,
         X, WQ, bQ, WK, bK, WV, bV, WO, bO, Y, R,
         B, S, D, H, d, p->scale, p->has_residual && R ? 1 : 0);
 }
+#else /* __HIPCC__ — WMMA not available, return error */
+static int mha_fused_f16_cuda(const void* inputs[] __attribute__((unused)),
+                               void* outputs[] __attribute__((unused)),
+                               const operator_params_t* params __attribute__((unused)),
+                               stream_t* stream __attribute__((unused))) {
+    fprintf(stderr, "mha_fused_f16: WMMA Tensor Cores not available on HIP\n");
+    return -1;
+}
+#endif /* __CUDACC__ */
 
 extern "C" int register_mha_fused_f16_cuda(void) {
     static operator_registry_t reg = {

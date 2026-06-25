@@ -42,7 +42,7 @@ void cuda_arena_reset(void) {
 
 void cuda_arena_destroy(void) {
     if (s_pool) {
-        cudaFree(s_pool);
+        (void)cudaFree(s_pool);
         s_pool     = NULL;
         s_capacity = 0;
         s_offset   = 0;

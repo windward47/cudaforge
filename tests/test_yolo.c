@@ -118,6 +118,7 @@ cpu_sess:
 /* --------------------------------------------------------------------------
  * CUDA inference test
  * -------------------------------------------------------------------------- */
+#ifdef USE_CUDA
 void test_yolov8n_cuda(void) {
 
     inference_session_t* sess = inference_session_load("tests/yolov8n_test.onnx");
@@ -191,6 +192,7 @@ cuda_input:
 cuda_sess:
     inference_session_destroy(sess);
 }
+#endif
 
 int main(void) {
     platform_init();

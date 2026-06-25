@@ -5,12 +5,22 @@
 #include <float.h>
 
 /* ============================================================
- * AVX2 优化路径
+ * SIMD 优化路径: AVX-512 > AVX2 > 标量
  * ============================================================ */
-#if defined(USE_AVX2)
+#if defined(USE_AVX512)
 #include <immintrin.h>
+#define SOFTMAX_HAS_AVX512 1
+#elif defined(USE_AVX2)
+#include <immintrin.h>
+#endif
 
-/* 快速 exp 近似 (复用 activations.c 中的实现) */
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+
+/* ---- AVX2 helpers (only when AVX2 without AVX512) ---- */
+#if defined(USE_AVX2) && !defined(SOFTMAX_HAS_AVX512)
+
 static inline __m256 fast_exp_avx2(__m256 x) {
     __m256 one = _mm256_set1_ps(1.0f);
     __m256 inv_ln2 = _mm256_set1_ps(1.4426950408889634f);
@@ -42,16 +52,14 @@ static inline __m256 fast_exp_avx2(__m256 x) {
     return _mm256_mul_ps(p, scale);
 }
 
-/* AVX2 softmax 单行处理 */
 static void softmax_row_avx2(const float* in, float* out, int64_t C) {
-    /* 1. 找最大值 (AVX2 水平归约) */
+    /* 1. Find max */
     __m256 vmax = _mm256_loadu_ps(in);
     int64_t c = 8;
     for (; c + 8 <= C; c += 8) {
         __m256 v = _mm256_loadu_ps(in + c);
         vmax = _mm256_max_ps(vmax, v);
     }
-    /* 水平归约 */
     __m128 hi = _mm256_extractf128_ps(vmax, 1);
     __m128 lo = _mm256_castps256_ps128(vmax);
     __m128 m128 = _mm_max_ps(lo, hi);
@@ -61,12 +69,11 @@ static void softmax_row_avx2(const float* in, float* out, int64_t C) {
     m128 = _mm_max_ps(m128, shuf);
     float max_val = _mm_cvtss_f32(m128);
 
-    /* 标量尾部 */
     for (; c < C; c++) {
         if (in[c] > max_val) max_val = in[c];
     }
 
-    /* 2. 计算 exp(x - max) 和 sum */
+    /* 2. Compute exp(x - max) and sum */
     __m256 vmax8 = _mm256_set1_ps(max_val);
     __m256 vsum = _mm256_setzero_ps();
     c = 0;
@@ -77,7 +84,6 @@ static void softmax_row_avx2(const float* in, float* out, int64_t C) {
         _mm256_storeu_ps(out + c, exp_v);
         vsum = _mm256_add_ps(vsum, exp_v);
     }
-    /* 水平求和 */
     hi = _mm256_extractf128_ps(vsum, 1);
     lo = _mm256_castps256_ps128(vsum);
     __m128 s128 = _mm_add_ps(lo, hi);
@@ -87,13 +93,12 @@ static void softmax_row_avx2(const float* in, float* out, int64_t C) {
     s128 = _mm_add_ps(s128, shuf);
     float sum = _mm_cvtss_f32(s128);
 
-    /* 标量尾部 */
     for (; c < C; c++) {
         out[c] = expf(in[c] - max_val);
         sum += out[c];
     }
 
-    /* 3. 归一化 */
+    /* 3. Normalize */
     float inv_sum = 1.0f / (sum > 0.0f ? sum : 1.0f);
     __m256 vinv = _mm256_set1_ps(inv_sum);
     c = 0;
@@ -106,7 +111,63 @@ static void softmax_row_avx2(const float* in, float* out, int64_t C) {
     }
 }
 
-#endif /* USE_AVX2 */
+#endif /* USE_AVX2 && !SOFTMAX_HAS_AVX512 */
+
+/* ---- AVX-512 helpers ---- */
+#ifdef SOFTMAX_HAS_AVX512
+
+static inline float avx512_max_reduce(const float* data, int64_t n) {
+    if (n < 16) {
+        float m = data[0];
+        for (int64_t i = 1; i < n; i++)
+            if (data[i] > m) m = data[i];
+        return m;
+    }
+    __m512 vmax = _mm512_loadu_ps(data);
+    int64_t i = 16;
+    for (; i + 15 < n; i += 16)
+        vmax = _mm512_max_ps(vmax, _mm512_loadu_ps(data + i));
+    float m = _mm512_reduce_max_ps(vmax);
+    for (; i < n; i++)
+        if (data[i] > m) m = data[i];
+    return m;
+}
+
+static inline float avx512_sum_reduce(const float* data, int64_t n) {
+    if (n < 16) {
+        float s = 0.0f;
+        for (int64_t i = 0; i < n; i++) s += data[i];
+        return s;
+    }
+    __m512 vsum = _mm512_setzero_ps();
+    int64_t i = 0;
+    for (; i + 15 < n; i += 16)
+        vsum = _mm512_add_ps(vsum, _mm512_loadu_ps(data + i));
+    float s = _mm512_reduce_add_ps(vsum);
+    for (; i < n; i++) s += data[i];
+    return s;
+}
+
+static inline void avx512_scale(float* data, int64_t n, float scale) {
+    __m512 vs = _mm512_set1_ps(scale);
+    int64_t i = 0;
+    for (; i + 15 < n; i += 16)
+        _mm512_storeu_ps(data + i, _mm512_mul_ps(_mm512_loadu_ps(data + i), vs));
+    for (; i < n; i++) data[i] *= scale;
+}
+
+static inline void avx512_sub_scalar(float* dst, const float* src,
+                                     int64_t n, float val) {
+    __m512 vv = _mm512_set1_ps(val);
+    int64_t i = 0;
+    for (; i + 15 < n; i += 16) {
+        __m512 v = _mm512_sub_ps(_mm512_loadu_ps(src + i), vv);
+        _mm512_storeu_ps(dst + i, v);
+    }
+    for (; i < n; i++) dst[i] = src[i] - val;
+}
+
+#endif /* SOFTMAX_HAS_AVX512 */
 
 /* ============================================================
  * 入口
@@ -125,31 +186,42 @@ int softmax_f32(const void* inputs[], void* outputs[],
     int64_t C = p->num_classes;
     int64_t N = p->num_blocks;
 
+#pragma omp parallel for schedule(static) if(N > 1)
     for (int64_t n = 0; n < N; n++) {
         const float* in_n = in + n * C;
         float* out_n = out + n * C;
 
-#if defined(USE_AVX2)
+#ifdef SOFTMAX_HAS_AVX512
+        /* Find max — AVX-512 reduction */
+        float max_val = avx512_max_reduce(in_n, C);
+
+        /* Subtract max and compute exp */
+        avx512_sub_scalar(out_n, in_n, C, max_val);
+        for (int64_t c = 0; c < C; c++)
+            out_n[c] = expf(out_n[c]);
+
+        /* Sum and normalize — AVX-512 */
+        float sum = avx512_sum_reduce(out_n, C);
+        float inv_sum = 1.0f / (sum > 0.0f ? sum : 1.0f);
+        avx512_scale(out_n, C, inv_sum);
+#elif defined(USE_AVX2)
         softmax_row_avx2(in_n, out_n, C);
 #else
-        /* Find max for numerical stability */
+        /* Scalar fallback */
         float max_val = in_n[0];
         for (int64_t c = 1; c < C; c++) {
             if (in_n[c] > max_val) max_val = in_n[c];
         }
 
-        /* Compute exp and sum */
         float sum = 0.0f;
         for (int64_t c = 0; c < C; c++) {
             out_n[c] = expf(in_n[c] - max_val);
             sum += out_n[c];
         }
 
-        /* Normalize */
         float inv_sum = 1.0f / (sum > 0.0f ? sum : 1.0f);
-        for (int64_t c = 0; c < C; c++) {
+        for (int64_t c = 0; c < C; c++)
             out_n[c] *= inv_sum;
-        }
 #endif
     }
     return 0;

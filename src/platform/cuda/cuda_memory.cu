@@ -70,7 +70,7 @@ void* cuda_device_alloc_pooled(size_t size) {
 
     if (size > POOL_MAX_SIZE || size == 0) {
         void* ptr = NULL;
-        cudaMalloc(&ptr, size);
+        (void)cudaMalloc(&ptr, size);
         return ptr;
     }
 
@@ -84,7 +84,7 @@ void* cuda_device_alloc_pooled(size_t size) {
 
     size_t alloc_size = (size_t)1 << idx;
     void* ptr = NULL;
-    cudaMalloc(&ptr, alloc_size);
+    (void)cudaMalloc(&ptr, alloc_size);
     return ptr;
 }
 
@@ -93,7 +93,7 @@ void cuda_device_free_sized(void* ptr, size_t size) {
     pool_init();
 
     if (size > POOL_MAX_SIZE || size == 0) {
-        cudaFree(ptr);
+        (void)cudaFree(ptr);
         return;
     }
 
@@ -104,7 +104,7 @@ void cuda_device_free_sized(void* ptr, size_t size) {
         b->ptrs[b->count] = ptr;
         b->count++;
     } else {
-        cudaFree(ptr);
+        (void)cudaFree(ptr);
     }
 }
 

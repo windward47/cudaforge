@@ -315,6 +315,7 @@ static int mha_unique_consumer(inference_graph_t* g, int tid, const int* skip) {
 }
 
 /* Count consumers of a tensor across all non-skipped nodes */
+__attribute__((unused))
 static int mha_count_consumers(inference_graph_t* g, int tid, const int* skip) {
     int count = 0;
     for (int i = 0; i < g->num_nodes; i++) {
@@ -833,7 +834,7 @@ int graph_execute(inference_graph_t* g, tensor_t* inputs[],
         if (n->type == OP_OUTPUT) continue;
 
         /* Build op name — try dtype-aware name first, fall back to f32 */
-        char name_buf[64];
+        char name_buf[80];
         const char* base = op_name(n->type);
         if (!base) { ret = -1; goto cleanup; }
 
@@ -1005,8 +1006,13 @@ int graph_execute(inference_graph_t* g, tensor_t* inputs[],
                     if (!ot->data_device) {
                         const data_type_info_t* info = data_type_get_info(ot->dtype);
                         size_t bytes = (size_t)ot->numel * info->size;
-                        if (bytes > 0)
+                        if (bytes > 0) {
+#ifdef USE_CUDA
                             ot->data_device = g_cuda.device_alloc(bytes);
+#else
+                            (void)bytes;
+#endif
+                        }
                     }
                     if (ot->data_device)
                         op_outputs[i] = ot->data_device;
@@ -1030,6 +1036,7 @@ int graph_execute(inference_graph_t* g, tensor_t* inputs[],
          * re-copies fresh host data via tensor_copy_to_device. */
         if (use_cuda) {
             int op_is_cpu = (strstr(name_buf, "_cuda") == NULL);
+#ifdef USE_CUDA
             if (op_is_cpu) {
                 for (int i = 0; i < n->num_outputs; i++) {
                     int tid = effective_output_tids[i] ? effective_output_tids[i]
@@ -1043,6 +1050,7 @@ int graph_execute(inference_graph_t* g, tensor_t* inputs[],
                     }
                 }
             }
+#endif
         }
 
         if (op_inputs != local_buf) free((void*)op_inputs);
@@ -1050,6 +1058,7 @@ int graph_execute(inference_graph_t* g, tensor_t* inputs[],
 
     /* Copy final outputs (skip self-copy when user passes graph tensors as outputs).
      * R7: with lazy D2H, GPU op outputs are on device — D2H before host memcpy. */
+#ifdef USE_CUDA
     if (use_cuda) {
         g_cuda.stream_synchronize(0);
         for (int i = 0; i < g->num_outputs; i++) {
@@ -1065,6 +1074,7 @@ int graph_execute(inference_graph_t* g, tensor_t* inputs[],
             }
         }
     }
+#endif
     for (int i = 0; i < g->num_outputs; i++) {
         int node_id = g->output_node_ids[i];
         if (node_id < 0 || node_id >= g->num_nodes) continue;

@@ -79,7 +79,7 @@ static int cuda_get_gpu_caps(gpu_caps_t* caps, int device_id) {
 
     /* 用 cudaDeviceGetAttribute 查询时钟频率（兼容 CUDA 13.2+） */
     int clock_khz = 0;
-    cudaDeviceGetAttribute(&clock_khz, cudaDevAttrClockRate, device_id);
+    (void)cudaDeviceGetAttribute(&clock_khz, cudaDevAttrClockRate, device_id);
     float clock_ghz = clock_khz * 1e-6f;  /* kHz → GHz */
 
     float fp32_gflops = (float)prop.multiProcessorCount * cores_per_sm * 2.0f * clock_ghz;

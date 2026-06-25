@@ -1,17 +1,19 @@
-cmake_minimum_required(VERSION 3.18)
-project(CudaForge VERSION 0.5.0 LANGUAGES C CXX)
+cmake_minimum_required(VERSION 3.21)
+project(CudaForge VERSION 0.7.0 LANGUAGES C CXX)
 
 # ============================================================
 # Options
 # ============================================================
-option(ENABLE_CUDA    "Enable CUDA backend"           ON)
-option(ENABLE_TESTS   "Build tests"                    ON)
-option(ENABLE_AVX2    "Enable AVX2 optimizations"      OFF)
-option(ENABLE_AVX512  "Enable AVX-512 optimizations"   OFF)
-option(ENABLE_OPENMP  "Enable OpenMP parallelism"      ON)
-option(ENABLE_COVERAGE "Enable coverage"               OFF)
+option(ENABLE_HIP      "Enable HIP/ROCm backend"       ON)
+option(ENABLE_CUDA     "Enable CUDA backend"           OFF)
+option(ENABLE_TESTS    "Build tests"                    ON)
+option(ENABLE_AVX2     "Enable AVX2 optimizations"      OFF)
+option(ENABLE_AVX512   "Enable AVX-512 optimizations"   ON)
+option(ENABLE_OPENMP   "Enable OpenMP parallelism"      ON)
+option(ENABLE_COVERAGE "Enable coverage"                OFF)
 
 set(CUDA_ARCH "86" CACHE STRING "CUDA architecture target (e.g. 75, 86, 89)")
+set(HIP_ARCH "gfx1151" CACHE STRING "HIP architecture target (e.g. gfx1100, gfx1151)")
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_STANDARD 17)
@@ -21,6 +23,15 @@ set(CMAKE_CXX_STANDARD 17)
 # ============================================================
 if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
     add_compile_options(-Wall -Wextra -Wpedantic -Werror)
+    # GCC 15 is stricter — suppress warnings in existing code we can't modify
+    if(CMAKE_C_COMPILER_ID STREQUAL "GNU")
+        add_compile_options(-Wno-unused-variable
+                            -Wno-unused-function
+                            -Wno-unused-but-set-variable
+                            -Wno-sign-compare
+                            -Wno-missing-field-initializers)
+    endif()
+    link_libraries(m)
 elseif(CMAKE_C_COMPILER_ID STREQUAL "MSVC")
     set(CMAKE_C_FLAGS   "${CMAKE_C_FLAGS}   /W4 /WX")
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /W4 /WX")
@@ -28,19 +39,45 @@ elseif(CMAKE_C_COMPILER_ID STREQUAL "MSVC")
 endif()
 
 # ============================================================
-# CUDA setup
+# GPU backend setup (HIP or CUDA)
 # ============================================================
+# GPU = whether any GPU backend is enabled
+set(GPU OFF)
+if(ENABLE_HIP)
+    # Register .cu as a HIP source file extension (must be before enable_language)
+    list(APPEND CMAKE_HIP_SOURCE_FILE_EXTENSIONS cu)
+    enable_language(HIP)
+    set(CMAKE_HIP_STANDARD 20)
+    set(CMAKE_HIP_STANDARD_REQUIRED ON)
+    set(CMAKE_HIP_ARCHITECTURES ${HIP_ARCH})
+    add_compile_definitions(USE_CUDA)  # reuse existing #ifdef guards
+    # HIP (clang) is stricter than nvcc — suppress warnings for existing CUDA patterns
+    add_compile_options($<$<COMPILE_LANGUAGE:HIP>:-Wno-sign-compare>
+                        $<$<COMPILE_LANGUAGE:HIP>:-Wno-missing-designated-field-initializers>
+                        $<$<COMPILE_LANGUAGE:HIP>:-Wno-unused-parameter>
+                        $<$<COMPILE_LANGUAGE:HIP>:-Wno-unused-variable>
+                        $<$<COMPILE_LANGUAGE:HIP>:-Wno-unused-but-set-variable>)
+    link_libraries(amdhip64 rocblas)  # HIP runtime + rocBLAS for all GPU targets
+    set(GPU ON)
+
+    # Glob all .cu files and force them to be compiled as HIP
+    file(GLOB_RECURSE ALL_CU_FILES "${CMAKE_SOURCE_DIR}/src/*.cu" "${CMAKE_SOURCE_DIR}/tests/*.cu")
+    set_source_files_properties(${ALL_CU_FILES} PROPERTIES LANGUAGE HIP)
+endif()
+
 if(ENABLE_CUDA)
     enable_language(CUDA)
     set(CMAKE_CUDA_STANDARD 20)
     set(CMAKE_CUDA_STANDARD_REQUIRED ON)
     add_compile_definitions(USE_CUDA)
     set(CMAKE_CUDA_ARCHITECTURES ${CUDA_ARCH})
+    set(GPU ON)
 endif()
 
 if(ENABLE_OPENMP)
     find_package(OpenMP REQUIRED)
 endif()
+
 
 # ============================================================
 # Platform layer (static library)
@@ -53,7 +90,8 @@ target_sources(platform PRIVATE
     src/platform/data_type.c
 )
 
-if(ENABLE_CUDA)
+
+if(GPU)
     target_sources(platform PRIVATE
         src/platform/cuda/cuda_device.cu
         src/platform/cuda/cuda_memory.cu
@@ -61,6 +99,12 @@ if(ENABLE_CUDA)
         src/platform/cuda/cuda_arena.cu
     )
     target_include_directories(platform PUBLIC src/platform/cuda)
+    if(ENABLE_HIP)
+        find_library(HIPRT_LIBRARY amdhip64)
+        if(HIPRT_LIBRARY)
+            target_link_libraries(platform PUBLIC ${HIPRT_LIBRARY})
+        endif()
+    endif()
 endif()
 
 target_include_directories(platform PUBLIC
@@ -111,9 +155,10 @@ target_sources(operator PRIVATE
     src/operator/nn/quantize.c
     src/operator/operator_registry.c
     src/operator/operator_init.c
+    src/operator/nn/fp16_cpu_ops.c
 )
 
-if(ENABLE_CUDA)
+if(GPU)
     target_sources(operator PRIVATE
         src/operator/nn/relu_cuda.cu
         src/operator/nn/conv_cuda.cu
@@ -258,7 +303,9 @@ if(ENABLE_TESTS)
     # Unity test framework (local copy, no git fetch needed)
     add_subdirectory(third_party/unity)
     include_directories(${unity_SOURCE_DIR}/src)
-    target_compile_options(unity PRIVATE /WX-)
+    if(CMAKE_C_COMPILER_ID STREQUAL "MSVC")
+        target_compile_options(unity PRIVATE /WX-)
+    endif()
 
     add_executable(test_relu
         src/operator/nn/test/test_relu.c
@@ -294,7 +341,7 @@ if(ENABLE_TESTS)
     endif()
     add_test(NAME test_conv COMMAND test_conv)
 
-    if(ENABLE_CUDA)
+    if(GPU)
     add_executable(test_conv_scale tests/test_conv_scale.c)
     target_include_directories(test_conv_scale PRIVATE
         third_party/unity/src
@@ -494,6 +541,7 @@ if(ENABLE_TESTS)
     target_link_libraries(test_graph PRIVATE application operator platform unity)
     add_test(NAME test_graph COMMAND test_graph)
 
+    if(GPU)
     add_executable(test_quantize
         tests/test_quantize.cu
     )
@@ -509,11 +557,15 @@ if(ENABLE_TESTS)
         )
     endif()
     add_test(NAME test_quantize COMMAND test_quantize)
+    endif()
 
-    if(ENABLE_CUDA)
+    if(GPU)
         add_executable(test_cuda_kernels
             tests/test_cuda_kernels.cu
         )
+        if(ENABLE_HIP)
+            set_source_files_properties(tests/test_cuda_kernels.cu PROPERTIES LANGUAGE HIP)
+        endif()
         target_include_directories(test_cuda_kernels PRIVATE
             third_party/unity/src
             src/operator/blas
@@ -523,9 +575,14 @@ if(ENABLE_TESTS)
         add_test(NAME test_cuda_kernels COMMAND test_cuda_kernels)
 
         # Benchmarks (not added as ctest tests)
+        # Skip bench_operators on HIP — memset unavailable in host context
+        if(ENABLE_CUDA)
         add_executable(bench_operators
             tests/bench_operators.cu
         )
+        if(ENABLE_HIP)
+            set_source_files_properties(tests/bench_operators.cu PROPERTIES LANGUAGE HIP)
+        endif()
         target_include_directories(bench_operators PRIVATE
             third_party/unity/src
             src/operator/blas
@@ -542,6 +599,7 @@ if(ENABLE_TESTS)
             src/operator/nn
         )
         target_link_libraries(bench_profile PRIVATE operator platform unity)
+        endif()
     endif()
 
     add_executable(test_onnx
@@ -636,7 +694,9 @@ if(ENABLE_TESTS)
         src/platform/include
     )
     target_link_libraries(test_reduce PRIVATE operator platform unity)
-    target_compile_definitions(test_reduce PRIVATE USE_CUDA)
+    if(GPU)
+        target_compile_definitions(test_reduce PRIVATE USE_CUDA)
+    endif()
     if(CMAKE_C_COMPILER_ID STREQUAL "MSVC")
         target_compile_options(test_reduce PRIVATE /wd4189 /wd4456 /wd4101)
     endif()

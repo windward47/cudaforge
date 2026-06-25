@@ -92,21 +92,21 @@ static void test_quantize_cuda(void) {
     float* d_src = NULL;
     block_q8_t* d_q = NULL;
     float* d_out = NULL;
-    cudaMalloc(&d_src, n * sizeof(float));
-    cudaMalloc(&d_q, Q8_PACKED_BYTES(n));
-    cudaMalloc(&d_out, n * sizeof(float));
-    cudaMemcpy(d_src, src, n * sizeof(float), cudaMemcpyHostToDevice);
+    (void)cudaMalloc(&d_src, n * sizeof(float));
+    (void)cudaMalloc(&d_q, Q8_PACKED_BYTES(n));
+    (void)cudaMalloc(&d_out, n * sizeof(float));
+    (void)cudaMemcpy(d_src, src, n * sizeof(float), cudaMemcpyHostToDevice);
 
     quantize_f32_q8_cuda(d_src, d_q, n, NULL);
     dequantize_q8_f32_cuda(d_q, d_out, n, NULL);
-    cudaMemcpy(gpu_out, d_out, n * sizeof(float), cudaMemcpyDeviceToHost);
+    (void)cudaMemcpy(gpu_out, d_out, n * sizeof(float), cudaMemcpyDeviceToHost);
 
     /* Compare GPU dequant vs CPU dequant */
     float maxd = max_abs_diff(ref, gpu_out, n);
     fprintf(stderr, "CUDA vs CPU dequant max_diff=%.2e\n", maxd);
     CHECK(maxd < 1e-5f, "CUDA quantize/dequantize correctness");
 
-    cudaFree(d_src); cudaFree(d_q); cudaFree(d_out);
+    (void)cudaFree(d_src); (void)cudaFree(d_q); (void)cudaFree(d_out);
     free(src); free(ref); free(gpu_out); free(q_ref);
     fprintf(stderr, "INT8 Quantize CUDA: PASS\n");
 }
@@ -142,14 +142,14 @@ static void test_matmul_q8(void) {
     block_q8_t* d_W = NULL;
     float* d_X = NULL;
     float* d_out = NULL;
-    cudaMalloc(&d_W, Q8_PACKED_BYTES(M * K));
-    cudaMalloc(&d_X, K * N * sizeof(float));
-    cudaMalloc(&d_out, M * N * sizeof(float));
-    cudaMemcpy(d_W, W_q8, Q8_PACKED_BYTES(M * K), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_X, X, K * N * sizeof(float), cudaMemcpyHostToDevice);
+    (void)cudaMalloc(&d_W, Q8_PACKED_BYTES(M * K));
+    (void)cudaMalloc(&d_X, K * N * sizeof(float));
+    (void)cudaMalloc(&d_out, M * N * sizeof(float));
+    (void)cudaMemcpy(d_W, W_q8, Q8_PACKED_BYTES(M * K), cudaMemcpyHostToDevice);
+    (void)cudaMemcpy(d_X, X, K * N * sizeof(float), cudaMemcpyHostToDevice);
 
     matmul_q8_f32_cuda(d_W, d_X, d_out, M, K, N, NULL);
-    cudaMemcpy(out_q8, d_out, M * N * sizeof(float), cudaMemcpyDeviceToHost);
+    (void)cudaMemcpy(out_q8, d_out, M * N * sizeof(float), cudaMemcpyDeviceToHost);
 
     float maxd = max_abs_diff(out_fp32, out_q8, M * N);
     /* Relative error */
@@ -160,7 +160,7 @@ static void test_matmul_q8(void) {
     fprintf(stderr, "INT8 vs FP32 MatMul: max_abs=%.2e, max_rel=%.2e\n", maxd, rel_err);
     CHECK(rel_err < 0.05f, "INT8 MatMul accuracy (5%% relative)");
 
-    cudaFree(d_W); cudaFree(d_X); cudaFree(d_out);
+    (void)cudaFree(d_W); (void)cudaFree(d_X); (void)cudaFree(d_out);
     free(W); free(X); free(out_fp32); free(out_q8); free(W_q8);
     fprintf(stderr, "INT8 MatMul: PASS\n");
 }

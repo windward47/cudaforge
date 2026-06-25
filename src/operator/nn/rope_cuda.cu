@@ -39,7 +39,7 @@ int rope_f32_cuda(const void* inputs[], void* outputs[],
     /* Copy input to output if not in-place */
     if (inputs[0] != outputs[0]) {
         size_t bytes = (size_t)p->seq_len * p->num_heads * p->head_dim * sizeof(float);
-        cudaMemcpyAsync(outputs[0], inputs[0], bytes, cudaMemcpyDeviceToDevice, s);
+        (void)cudaMemcpyAsync(outputs[0], inputs[0], bytes, cudaMemcpyDeviceToDevice, s);
     }
 
     int64_t total = p->seq_len * p->num_heads * (p->head_dim / 2);

@@ -3,12 +3,14 @@
 #include <stddef.h>
 
 /* ============================================================
- * AVX2 优化路径
+ * SIMD 优化路径: AVX-512 > AVX2 > 标量
  * ============================================================ */
-#if defined(USE_AVX2)
+#if defined(USE_AVX512)
+#include <immintrin.h>
+#define ADD_HAS_AVX512 1
+#elif defined(USE_AVX2)
 #include <immintrin.h>
 
-/* 标量 broadcast: out[i] = a[i] + b_scalar */
 static void add_avx2_scalar(const float* a, float b_scalar, float* out, int64_t n) {
     __m256 vb = _mm256_set1_ps(b_scalar);
     int64_t i = 0;
@@ -19,7 +21,6 @@ static void add_avx2_scalar(const float* a, float b_scalar, float* out, int64_t 
     for (; i < n; i++) out[i] = a[i] + b_scalar;
 }
 
-/* 逐元素: out[i] = a[i] + b[i] */
 static void add_avx2_vec(const float* a, const float* b, float* out, int64_t n) {
     int64_t i = 0;
     for (; i + 8 <= n; i += 8) {
@@ -51,18 +52,32 @@ int add_f32(const void* inputs[], void* outputs[],
     int64_t BN = p->B_numel;
 
     if (BN == 1) {
+#ifdef ADD_HAS_AVX512
+        __m512 vb = _mm512_set1_ps(b[0]);
+        int64_t i = 0;
+        for (; i + 15 < N; i += 16)
+            _mm512_storeu_ps(out + i, _mm512_add_ps(_mm512_loadu_ps(a + i), vb));
+        for (; i < N; i++) out[i] = a[i] + b[0];
+#else
         float bv = b[0];
 #if defined(USE_AVX2)
         add_avx2_scalar(a, bv, out, N);
 #else
         for (int64_t i = 0; i < N; i++) out[i] = a[i] + bv;
 #endif
+#endif
     } else {
         int64_t blocks = N / BN;
         for (int64_t blk = 0; blk < blocks; blk++) {
             const float* a_blk = a + blk * BN;
             float* out_blk = out + blk * BN;
-#if defined(USE_AVX2)
+#ifdef ADD_HAS_AVX512
+            int64_t i = 0;
+            for (; i + 15 < BN; i += 16)
+                _mm512_storeu_ps(out_blk + i, _mm512_add_ps(_mm512_loadu_ps(a_blk + i),
+                                                            _mm512_loadu_ps(b + i)));
+            for (; i < BN; i++) out_blk[i] = a_blk[i] + b[i];
+#elif defined(USE_AVX2)
             add_avx2_vec(a_blk, b, out_blk, BN);
 #else
             for (int64_t i = 0; i < BN; i++) out_blk[i] = a_blk[i] + b[i];

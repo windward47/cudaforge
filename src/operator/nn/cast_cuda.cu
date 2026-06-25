@@ -55,7 +55,7 @@ int cast_f32_cuda(const void* inputs[], void* outputs[],
                            (const __half*)inputs[0], (float*)outputs[0], cp->numel);
     } else {
         /* Unsupported casts (e.g. F32→F32): fallback to memcpy (matches CPU behavior) */
-        cudaMemcpyAsync(outputs[0], inputs[0],
+        (void)cudaMemcpyAsync(outputs[0], inputs[0],
                         (size_t)cp->numel * sizeof(float),
                         cudaMemcpyDeviceToDevice, s);
     }

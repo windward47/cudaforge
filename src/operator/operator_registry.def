@@ -5,6 +5,7 @@
  * 格式：
  *   REGISTER_CPU(fn)  — CPU 算子注册函数
  *   REGISTER_CUDA(fn) — CUDA 算子注册函数（.cu 文件中的 extern "C" 函数）
+ *   REGISTER_HIP(fn)  — HIP 专属算子注册函数（.cu 文件中由 hipcc 编译）
  * ============================================================ */
 
 /* ---- CPU 算子 ---- */
@@ -39,6 +40,7 @@ REGISTER_CPU(register_rope_f32)
 REGISTER_CPU(register_pad_f32)
 REGISTER_CPU(register_clip_f32)
 REGISTER_CPU(register_where_f32)
+REGISTER_CPU(register_fp16_cpu_ops)
 
 /* ---- CUDA 算子 (f32) ---- */
 REGISTER_CUDA(register_relu_f32_cuda)
@@ -89,3 +91,6 @@ REGISTER_CUDA(register_matmul_f16_cuda)
 REGISTER_CUDA(register_batchnorm_f16_cuda)
 REGISTER_CUDA(register_layernorm_f16_cuda)
 REGISTER_CUDA(register_softmax_f16_cuda)
+
+/* ---- HIP 专属算子（当需要 HIP 特有实现时在此添加）---- */
+/* REGISTER_HIP(register_xxx_hip) */

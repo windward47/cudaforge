@@ -36,6 +36,24 @@ int inference_session_run(inference_session_t* session,
     return graph_execute(session->model->graph, inputs, outputs, use_cuda != 0);
 }
 
+int inference_session_run_batch(inference_session_t* session,
+                                tensor_t* inputs[], tensor_t* outputs[],
+                                int batch_size, int use_cuda) {
+    if (!session || !inputs || !outputs || batch_size <= 0)
+        return -1;
+
+    /* Run each sample sequentially.
+     * The operators are already parallelized with OpenMP internally,
+     * so parallelism is within each matmul/softmax/etc call. */
+    for (int i = 0; i < batch_size; i++) {
+        tensor_t* in[]  = {inputs[i]};
+        tensor_t* out[] = {outputs[i]};
+        int rc = inference_session_run(session, in, out, use_cuda);
+        if (rc != 0) return rc;
+    }
+    return 0;
+}
+
 int inference_session_num_inputs(inference_session_t* session) {
     if (!session || !session->model) return 0;
     return session->model->num_inputs;

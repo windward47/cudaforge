@@ -23,6 +23,7 @@ void tearDown(void) {}
 /* --------------------------------------------------------------------------
  * Find op helper
  * -------------------------------------------------------------------------- */
+__attribute__((unused))
 static const operator_registry_t* find_op(const char* name) {
     const operator_registry_t* op = operator_find(name);
     if (!op) {

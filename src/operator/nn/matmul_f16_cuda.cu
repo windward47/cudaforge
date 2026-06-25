@@ -5,6 +5,9 @@
 #include "cuda_ops.h"
 #include "matmul_int.h"
 #include <cuda_fp16.h>
+#ifdef __HIPCC__
+#include <rocblas/rocblas.h>
+#endif
 
 __global__ void matmul_f16_kernel(
     const __half* __restrict__ A,  /* (M, K) */
@@ -34,6 +37,30 @@ int matmul_f16_cuda(const void* inputs[], void* outputs[],
     cudaStream_t s = stream ? (cudaStream_t)stream->cuda_stream : 0;
 
     int64_t M = p->M, K = p->K, N = p->N;
+
+#ifdef __HIPCC__
+    /* rocBLAS path for FP16 on AMD GPU */
+    if (M >= 64 && N >= 64) {
+        extern rocblas_handle get_rblas(void);
+        rocblas_handle h = get_rblas();
+        if (h) {
+            rocblas_set_stream(h, (hipStream_t)s);
+            /* __half and rocblas_half are both 16-bit IEEE 754; bit-cast alpha/beta */
+            union { __half h; rocblas_half r; } conv;
+            conv.h = __float2half(1.0f);  rocblas_half alpha_h = conv.r;
+            conv.h = __float2half(0.0f);  rocblas_half beta_h  = conv.r;
+            rocblas_status st = rocblas_hgemm(h,
+                rocblas_operation_none, rocblas_operation_none,
+                (int)N, (int)M, (int)K,
+                &alpha_h,
+                (const rocblas_half*)B, (int)N,
+                (const rocblas_half*)A, (int)K,
+                &beta_h,
+                (rocblas_half*)C, (int)N);
+            /* fall through to naive kernel on failure */
+        }
+    }
+#endif
 
     dim3 block(16, 16, 1);
     dim3 grid((unsigned int)((N + 15) / 16), (unsigned int)((M + 15) / 16), 1);

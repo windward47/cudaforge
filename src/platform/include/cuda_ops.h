@@ -6,7 +6,10 @@
 #include <stdlib.h>
 #include <stdint.h>
 
-#if defined(__CUDACC__) || defined(USE_CUDA)
+/* CUDA-to-HIP translation (no-op when not compiled by hipcc) */
+#include "cuda2hip.h"
+
+#if defined(__CUDACC__) || defined(__HIPCC__)
 #include <cuda_runtime.h>
 #endif
 
@@ -18,15 +21,15 @@ extern "C" {
 #define OPS_THREADS_PER_BLOCK 256
 
 /* --------------------------------------------------------------------------
- *  CUDA error check — meaningful when CUDA headers are available
+ *  GPU error check — meaningful when compiled by nvcc or hipcc
  * -------------------------------------------------------------------------- */
-#if defined(__CUDACC__) || defined(USE_CUDA)
-/* CUDA error check — logs error and returns error code (non-fatal) */
+#if defined(__CUDACC__) || defined(__HIPCC__)
+/* GPU error check — logs error and returns error code (non-fatal) */
 #define CUDA_CHECK(call) \
     do { \
         cudaError_t _err = call; \
         if (_err != cudaSuccess) { \
-            fprintf(stderr, "CUDA error at %s:%d: %s\n", \
+            fprintf(stderr, "GPU error at %s:%d: %s\n", \
                     __FILE__, __LINE__, cudaGetErrorString(_err)); \
             return (int)_err; \
         } \
@@ -38,13 +41,13 @@ extern "C" {
 /* --------------------------------------------------------------------------
  *  CUDA types — when compiled by the host C compiler, use forward decls
  * -------------------------------------------------------------------------- */
-#if !defined(__CUDACC__) && !defined(USE_CUDA)
+#if !defined(__CUDACC__) && !defined(__HIPCC__) && !defined(USE_CUDA)
 typedef void* cudaStream_t;
 struct cudaDeviceProp;
 #endif
 
 /* Grid/block dimension helper */
-#ifdef __CUDACC__
+#if defined(__CUDACC__) || defined(__HIPCC__)
 typedef struct {
     dim3 grid_dim;
     dim3 block_dim;
@@ -72,34 +75,24 @@ static inline kernel_config_t cuda_configure_1d(int64_t n, int threads) {
 
 /* --------------------------------------------------------------------------
  *  GPU hardware capabilities — runtime snapshot
- *  参考 CUDAForge 的 gpu_specs.py 硬件规格注入思路
  * -------------------------------------------------------------------------- */
 typedef struct {
-    /* 设备基本信息 */
     int   device_id;
-    char  name[256];                /* 设备名称 */
-    int   compute_major;            /* 计算能力主版本 */
-    int   compute_minor;            /* 计算能力次版本 */
-
-    /* SM 与线程 */
-    int   sm_count;                 /* SM 数量 */
-    int   max_threads_per_sm;       /* 每 SM 最大线程数 */
-    int   max_threads_per_block;    /* 每 block 最大线程数 */
-    int   warp_size;                /* warp 大小（通常 32） */
-
-    /* 寄存器与共享内存 */
-    int   regs_per_sm;              /* 每 SM 寄存器数 */
-    int   regs_per_block;           /* 每 block 最大寄存器数 */
-    int   shared_mem_per_sm;        /* 每 SM 共享内存（字节） */
-    int   shared_mem_per_block;     /* 每 block 最大共享内存（字节） */
-
-    /* 显存 */
-    size_t total_memory;            /* 总显存（字节） */
-
-    /* 理论峰值吞吐 (GFLOPS) */
-    float tflops_fp32;              /* FP32 理论峰值 */
-    float tflops_fp16;              /* FP16 理论峰值 */
-    float tflops_tensor;            /* Tensor Core 理论峰值 */
+    char  name[256];
+    int   compute_major;
+    int   compute_minor;
+    int   sm_count;
+    int   max_threads_per_sm;
+    int   max_threads_per_block;
+    int   warp_size;
+    int   regs_per_sm;
+    int   regs_per_block;
+    int   shared_mem_per_sm;
+    int   shared_mem_per_block;
+    size_t total_memory;
+    float tflops_fp32;
+    float tflops_fp16;
+    float tflops_tensor;
 } gpu_caps_t;
 
 /* CUDA platform ops — function pointer table */
@@ -117,7 +110,7 @@ typedef struct {
     int   (*stream_synchronize)(cudaStream_t stream);
     int   (*stream_destroy)(cudaStream_t stream);
     int   (*get_device_count)(int* count);
-    int   (*get_device_props)(struct cudaDeviceProp* props, int device_id);
+    int   (*get_device_props)(cudaDeviceProp* props, int device_id);
     int   (*get_gpu_caps)(gpu_caps_t* caps, int device_id);
 } cuda_ops_t;
 
@@ -128,12 +121,14 @@ extern cuda_ops_t g_cuda;
 #endif
 
 /* ==========================================================================
- *  CUDA kernel launch — C++ variadic template (nvcc only)
+ *  GPU kernel launch — C++ variadic template (nvcc / hipcc)
  *  Must be outside extern "C" because templates require C++ linkage.
  * ========================================================================== */
-#ifdef __CUDACC__
+#if defined(__CUDACC__) || defined(__HIPCC__)
 #ifdef __cplusplus
 
+#ifdef __CUDACC__
+/* CUDA: use cudaLaunchKernel */
 template<typename... Args>
 static inline int _cuda_kernel_call(const void* kernel, dim3 grid, dim3 block,
                                      size_t shared_mem, cudaStream_t stream,
@@ -147,6 +142,22 @@ static inline int _cuda_kernel_call(const void* kernel, dim3 grid, dim3 block,
     }
     return 0;
 }
+#else
+/* HIP: use hipLaunchKernel (direct runtime API) */
+template<typename... Args>
+static inline int _cuda_kernel_call(const void* kernel, dim3 grid, dim3 block,
+                                     size_t shared_mem, hipStream_t stream,
+                                     Args&&... args) {
+    void* params[] = { (void*)&args... };
+    hipError_t err = hipLaunchKernel(kernel, grid, block, params, shared_mem, stream);
+    if (err != hipSuccess) {
+        fprintf(stderr, "HIP error at %s:%d: %s\n",
+                __FILE__, __LINE__, hipGetErrorString(err));
+        return (int)err;
+    }
+    return 0;
+}
+#endif
 
 #define CUDA_KERNEL_LAUNCH(kernel, grid, block, shared_mem, stream, ...) \
     _cuda_kernel_call((const void*)(kernel), grid, block, shared_mem, stream, __VA_ARGS__)
@@ -155,7 +166,7 @@ static inline int _cuda_kernel_call(const void* kernel, dim3 grid, dim3 block,
 #define CUDA_KERNEL_LAUNCH(kernel, grid, block, shared_mem, stream, ...) \
     do { (void)(kernel); (void)(grid); (void)(block); (void)(shared_mem); (void)(stream); } while(0)
 #endif
-#else /* !__CUDACC__ — host-only C compilation */
+#else /* !__CUDACC__ && !__HIPCC__ — host-only C compilation */
 #define CUDA_KERNEL_LAUNCH(kernel, grid, block, shared_mem, stream, ...) \
     do { (void)(kernel); (void)(grid); (void)(block); (void)(shared_mem); (void)(stream); } while(0)
 #endif

@@ -16,4 +16,11 @@ int  inference_session_num_inputs(inference_session_t* session);
 int  inference_session_num_outputs(inference_session_t* session);
 void inference_session_destroy(inference_session_t* session);
 
+/* Batch inference: run `batch_size` independent inferences in parallel.
+ * inputs[i] and outputs[i] are the i-th sample's input/output tensors.
+ * Returns 0 on success, -1 on error. */
+int inference_session_run_batch(inference_session_t* session,
+                                tensor_t* inputs[], tensor_t* outputs[],
+                                int batch_size, int use_cuda);
+
 #endif /* INFERENCE_ENGINE_H_ */

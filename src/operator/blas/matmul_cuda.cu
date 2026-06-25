@@ -1,7 +1,12 @@
 #include "operator.h"
 #include "cuda_ops.h"
 #include "matmul_int.h"
+#ifdef __CUDACC__
 #include <mma.h>
+#endif
+#ifdef __HIPCC__
+#include <rocblas/rocblas.h>
+#endif
 
 /* ============================================================
  * Transpose kernel — used when transpose_a / transpose_b is set.
@@ -204,10 +209,10 @@ __global__ void matmul_f32_warp_bias(const float* __restrict__ A,
 }
 
 /* ============================================================
- * Tensor Core kernel (sm_70+, batched).
+ * Tensor Core kernel (sm_70+, batched). CUDA only (WMMA).
  * ============================================================ */
+#ifdef __CUDACC__
 #define TC_TILE 16
-
 __global__ void matmul_f32_tc_kernel(const float* __restrict__ A,
                                       const float* __restrict__ B,
                                       float* __restrict__ C,
@@ -215,31 +220,22 @@ __global__ void matmul_f32_tc_kernel(const float* __restrict__ A,
                                       int64_t batch_size,
                                       int64_t stride_a, int64_t stride_b, int64_t stride_c) {
     using namespace nvcuda;
-
     __shared__ half As[TC_TILE][TC_TILE];
     __shared__ half Bs[TC_TILE][TC_TILE];
-
     int tid = threadIdx.x;
     int64_t batch = blockIdx.z;
-
     const float* Ab = A + batch * stride_a;
     const float* Bb = B + batch * stride_b;
     float*       Cb = C + batch * stride_c;
-
     int tile_row = blockIdx.y * TC_TILE;
     int tile_col = blockIdx.x * TC_TILE;
-
     wmma::fragment<wmma::matrix_a, TC_TILE, TC_TILE, TC_TILE, half, wmma::row_major> a_frag;
     wmma::fragment<wmma::matrix_b, TC_TILE, TC_TILE, TC_TILE, half, wmma::col_major> b_frag;
     wmma::fragment<wmma::accumulator, TC_TILE, TC_TILE, TC_TILE, float> c_frag;
-
     wmma::fill_fragment(c_frag, 0.0f);
-
     int num_k_tiles = (int)((K + TC_TILE - 1) / TC_TILE);
-
     for (int kt = 0; kt < num_k_tiles; kt++) {
         int k0 = kt * TC_TILE;
-
         const float* A_base = Ab + tile_row * K + k0;
         #pragma unroll
         for (int i = tid; i < TC_TILE * TC_TILE; i += 32) {
@@ -250,7 +246,6 @@ __global__ void matmul_f32_tc_kernel(const float* __restrict__ A,
                 val = A_base[r * K + c];
             As[r][c] = __float2half(val);
         }
-
         const float* B_base = Bb + k0 * N + tile_col;
         #pragma unroll
         for (int i = tid; i < TC_TILE * TC_TILE; i += 32) {
@@ -261,22 +256,18 @@ __global__ void matmul_f32_tc_kernel(const float* __restrict__ A,
                 val = B_base[r * N + c];
             Bs[r][c] = __float2half(val);
         }
-
         __syncthreads();
-
         wmma::load_matrix_sync(a_frag, (const half*)As, TC_TILE);
         wmma::load_matrix_sync(b_frag, (const half*)Bs, TC_TILE);
-
         wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
-
         __syncthreads();
     }
-
     if (batch < batch_size) {
         float* C_out = Cb + tile_row * N + tile_col;
         wmma::store_matrix_sync(C_out, c_frag, (unsigned)N, wmma::mem_row_major);
     }
 }
+#endif /* __CUDACC__ */
 
 /* ============================================================
  * Bias addition kernel: C[b,i*N + j] += bias[j] for all batches/rows
@@ -290,6 +281,61 @@ __global__ void matmul_bias_add_kernel(float* C, const float* bias,
     int64_t j = idx % N;
     C[idx] += bias[j];
 }
+/* ============================================================
+ * rocBLAS helper (HIP only) — uses column-major trick for row-major data
+ * Row-major C[M,N] = A[M,K] * B[K,N]
+ *   ↔ col-major C^T[N,M] = B^T[N,K] * A^T[K,M]
+ * ============================================================ */
+#ifdef __HIPCC__
+static rocblas_handle s_rblas = NULL;
+
+rocblas_handle get_rblas(void) {
+    if (!s_rblas) {
+        if (rocblas_create_handle(&s_rblas) != rocblas_status_success)
+            return NULL;
+    }
+    return s_rblas;
+}
+
+static int rocblas_batched_sgemm_row_major(
+    const float* A, const float* B, float* C,
+    int64_t M, int64_t N, int64_t K,
+    int64_t batch_size,
+    int64_t stride_a, int64_t stride_b, int64_t stride_c,
+    bool trans_a, bool trans_b,
+    hipStream_t stream)
+{
+    rocblas_handle h = get_rblas();
+    if (!h) return -1;
+    rocblas_set_stream(h, stream);
+
+    float alpha = 1.0f, beta = 0.0f;
+    rocblas_operation opA = trans_a ? rocblas_operation_transpose : rocblas_operation_none;
+    rocblas_operation opB = trans_b ? rocblas_operation_transpose : rocblas_operation_none;
+
+    /* In row-major, C[M,N] = A * B  ↔  col-major call with swapped args */
+    rocblas_status st;
+    if (batch_size == 1) {
+        st = rocblas_sgemm(h, opB, opA,
+                           (int)N, (int)M, (int)K,
+                           &alpha,
+                           B, (int)N,   /* ldb (col-major leading dim of B^T) */
+                           A, (int)K,   /* lda */
+                           &beta,
+                           C, (int)N);  /* ldc */
+    } else {
+        st = rocblas_sgemm_strided_batched(h, opB, opA,
+                           (int)N, (int)M, (int)K,
+                           &alpha,
+                           B, (int)N, stride_b,
+                           A, (int)K, stride_a,
+                           &beta,
+                           C, (int)N, stride_c,
+                           (int)batch_size);
+    }
+    return (st == rocblas_status_success) ? 0 : -1;
+}
+#endif /* __HIPCC__ */
 
 /* ============================================================
  * Dispatch: selects the best kernel for the given dimensions.
@@ -352,8 +398,23 @@ int matmul_f32_cuda(const void* inputs[], void* outputs[],
         stride_b = K * N;
     }
 
+#ifdef __HIPCC__
+    /* rocBLAS path — optimized for medium/large matrices on AMD GPU */
+    if (config == 0 && M >= 64 && N >= 64) {
+        ret = rocblas_batched_sgemm_row_major(
+            A, B, C, M, N, K, batch_size,
+            stride_a, stride_b, stride_c,
+            false, false, s);
+        if (ret != 0) goto matmul_cleanup;
+        if (bias) {
+            int64_t total = batch_size * M * N;
+            ret = CUDA_KERNEL_LAUNCH(matmul_bias_add_kernel, (int)((total + 255) / 256), 256, 0, s,
+                                      C, bias, M, N, batch_size, stride_c);
+        }
+    } else
+#endif
     if (config == 1 || (config == 0 && M <= 32 && N <= 32)) {
-        /* Naive: small matrices or explicit config (no fused bias variant) */
+        /* Naive: small matrices or explicit config */
         dim3 block(16, 16, 1);
         dim3 grid((unsigned int)((N + 15) / 16),
                   (unsigned int)((M + 15) / 16),
@@ -367,9 +428,10 @@ int matmul_f32_cuda(const void* inputs[], void* outputs[],
             ret = CUDA_KERNEL_LAUNCH(matmul_bias_add_kernel, (int)((total + 255) / 256), 256, 0, s,
                                       C, bias, M, N, batch_size, stride_c);
         }
+#ifdef __CUDACC__
     } else if (config == 4 || (config == 0 && M >= 512 && N >= 512 && K >= 512
                && M % TC_TILE == 0 && N % TC_TILE == 0 && batch_size == 1)) {
-        /* Tensor Core: large aligned matrices (no fused bias variant) */
+        /* Tensor Core: large aligned matrices (CUDA only, WMMA) */
         dim3 block(32, 1, 1);
         dim3 grid((unsigned int)((N + TC_TILE - 1) / TC_TILE),
                   (unsigned int)((M + TC_TILE - 1) / TC_TILE), 1);
@@ -382,6 +444,7 @@ int matmul_f32_cuda(const void* inputs[], void* outputs[],
             ret = CUDA_KERNEL_LAUNCH(matmul_bias_add_kernel, (int)((total + 255) / 256), 256, 0, s,
                                       C, bias, M, N, batch_size, stride_c);
         }
+#endif
     } else if (config == 3 || (config == 0 && M >= 64 && N >= 64)) {
         /* Warp-tiled: fused bias when available */
         dim3 block(WARP_TILE, WARP_TILE, 1);

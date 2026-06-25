@@ -1,3 +1,4 @@
+#include <string.h>
 #include "unity.h"
 #include "operator.h"
 #include "conv_int.h"
@@ -11,7 +12,7 @@ void tearDown(void) {}
 void test_conv2d_f32_basic(void) {
     /* Simple 1x3x3 input, 2x2 kernel identity-like, golden values computed by hand */
     int64_t N=1,C=1,H=3,W=3,K=1,KH=2,KW=2;
-    int64_t OH=(H-KH)/1+1, OW=(W-KW)/1+1;
+    int64_t OH __attribute__((unused)) = (H-KH)/1+1, OW __attribute__((unused)) = (W-KW)/1+1;
     float input[9] = {1,2,3, 4,5,6, 7,8,9};
     float weight[4] = {1,0, 0,1};
     float output[4] = {0};
