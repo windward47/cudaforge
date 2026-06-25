@@ -139,6 +139,30 @@ out:    每个 warp 独立计算 16×d，最后 atomicAdd 到 Y
 
 ---
 
+## R8: 分体式 Flash Attention (分离输出投影) ⭐
+
+**来源**：GLM5.1 代码审阅指出 atomicAdd 是性能杀手，建议分离输出投影。
+
+**评估结果**：已实施并 benchmark，**回退**。
+
+| 路径 | 一体式 (R7) | 分体式 (R8) | 结论 |
+| --- | --- | --- | --- |
+| S≤64 短序列 | preloaded FP32 2.4ms | flash+proj 3 kernel | ❌ 分体开销大 |
+| S=512 长序列 | 33ms | 45ms | ❌ output_proj 标量循环慢 |
+| GPT-2 端到端 | 0.66ms | 2.34ms | ❌ 额外 malloc+launch |
+
+**根因**：
+- atomicAdd 在输出投影段（不在 KV 循环内），实际影响有限
+- 分体式引入 O_attn buffer 的 cudaMalloc/free + 额外 kernel launch
+- output_proj kernel 标量循环 (H_q×d×D) 比 WMMA 慢
+- 短序列的 3 阶段 (precompute+flash+proj) 开销 > 一体式
+
+**结论**：GLM5.1 的 atomicAdd 指出在理论上有价值，但实际 benchmark 显示一体式更快。分体式需配合 output_proj 的 WMMA 实现 + buffer 复用才有收益，当前不划算。
+
+> 进度：R8 已验证回退。一体式 (R7) 是当前最优。
+
+---
+
 ## 进度
 
 | 状态 | 内容 |
