@@ -968,14 +968,26 @@ int graph_execute(inference_graph_t* g, tensor_t* inputs[],
             }
         }
 
-        /* Copy to device if CUDA and swap pointers */
+        /* Copy to device if CUDA and swap pointers.
+         * R7 lazy D2H: if this op runs on CPU (no CUDA variant, name lacks
+         * "_cuda"), D2H its inputs so CPU func reads fresh host data. GPU ops
+         * keep data on device — eliminates per-node eager D2H (was 98% of
+         * GPT-2 end-to-end time). */
         if (use_cuda) {
+            int op_is_cpu = (strstr(name_buf, "_cuda") == NULL);
             for (int i = 0; i < n->num_inputs; i++) {
                 int tid = n->input_tensors[i];
                 if (tid >= 0) {
-                    tensor_copy_to_device(g->tensors[tid].tensor);
-                    if (g->tensors[tid].tensor->data_device)
-                        op_inputs[i] = g->tensors[tid].tensor->data_device;
+                    tensor_t* t = g->tensors[tid].tensor;
+                    if (op_is_cpu) {
+                        /* CPU op: ensure host has fresh data from device */
+                        if (t->data_device) tensor_copy_to_host(t);
+                        op_inputs[i] = t->data;
+                    } else {
+                        tensor_copy_to_device(t);
+                        if (t->data_device)
+                            op_inputs[i] = t->data_device;
+                    }
                 }
             }
             for (int w = 0; w < n->num_weights; w++) {
@@ -1012,26 +1024,47 @@ int graph_execute(inference_graph_t* g, tensor_t* inputs[],
             goto cleanup;
         }
 
-        /* Copy back to host if CUDA — must happen BEFORE any host-side verify */
-        /* Skip D2H for KV-cache tensors (they persist on device between calls) */
+        /* R7 lazy D2H: no per-node eager D2H. GPU op outputs stay on device.
+         * For CPU ops (name lacks "_cuda"): outputs written to host `data`.
+         * Their device copy is now stale — invalidate so downstream GPU op
+         * re-copies fresh host data via tensor_copy_to_device. */
         if (use_cuda) {
-            for (int i = 0; i < n->num_outputs; i++) {
-                int tid = effective_output_tids[i] ? effective_output_tids[i]
-                                                   : n->output_tensors[i];
-                if (tid >= 0 && tid != g->kv_cache_K_tid && tid != g->kv_cache_V_tid) {
-                    tensor_t* ot = g->tensors[tid].tensor;
-                    if (ot && ot->numel > 0) {
-                        tensor_copy_to_host(ot);
+            int op_is_cpu = (strstr(name_buf, "_cuda") == NULL);
+            if (op_is_cpu) {
+                for (int i = 0; i < n->num_outputs; i++) {
+                    int tid = effective_output_tids[i] ? effective_output_tids[i]
+                                                       : n->output_tensors[i];
+                    if (tid >= 0 && tid != g->kv_cache_K_tid && tid != g->kv_cache_V_tid) {
+                        tensor_t* ot = g->tensors[tid].tensor;
+                        if (ot && ot->data_device) {
+                            g_cuda.device_free(ot->data_device);
+                            ot->data_device = NULL;
+                        }
                     }
                 }
             }
-            g_cuda.stream_synchronize(0);
         }
 
         if (op_inputs != local_buf) free((void*)op_inputs);
     }
 
-    /* Copy final outputs (skip self-copy when user passes graph tensors as outputs) */
+    /* Copy final outputs (skip self-copy when user passes graph tensors as outputs).
+     * R7: with lazy D2H, GPU op outputs are on device — D2H before host memcpy. */
+    if (use_cuda) {
+        g_cuda.stream_synchronize(0);
+        for (int i = 0; i < g->num_outputs; i++) {
+            int node_id = g->output_node_ids[i];
+            if (node_id < 0 || node_id >= g->num_nodes) continue;
+            graph_node_t* n = &g->nodes[node_id];
+            if (n->type == OP_OUTPUT && n->num_inputs > 0) {
+                int tid = n->input_tensors[0];
+                if (tid >= 0 && tid < g->num_tensors) {
+                    tensor_t* src = g->tensors[tid].tensor;
+                    if (src && src->data_device) tensor_copy_to_host(src);
+                }
+            }
+        }
+    }
     for (int i = 0; i < g->num_outputs; i++) {
         int node_id = g->output_node_ids[i];
         if (node_id < 0 || node_id >= g->num_nodes) continue;

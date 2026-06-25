@@ -103,6 +103,21 @@ out:    每个 warp 独立计算 16×d，最后 atomicAdd 到 Y
 
 ---
 
+## R7: 端到端推理性能分析 ⭐⭐⭐
+
+**动机**：R1-R6 的优化集中在 MHA 单算子（11-14× 加速），但端到端推理中 MHA 只占一部分。需用 nsys 分析完整推理图，定位**新的瓶颈算子**（LayerNorm/MatMul/Softmax/Conv 等），让后续优化投入产出比最高。
+
+| # | 任务 | 说明 |
+| --- | --- | --- |
+| R7-a | nsys 分析 BERT 端到端 | `test_bert` 全图 kernel 时间分布，定位 Top-N 瓶颈算子 |
+| R7-b | nsys 分析 GPT-2 生成 | `test_gpt2_generate` decode 循环瓶颈 |
+| R7-c | 瓶颈算子针对性优化 | 根据 R7-a/b 结果选 1-2 个算子优化 |
+| R7-d | 端到端性能回归基线 | 记录 BERT/GPT-2 端到端 ms/iter 作为基线 |
+
+> 进度：待实施。
+
+---
+
 ## 进度
 
 | 状态 | 内容 |

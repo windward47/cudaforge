@@ -799,6 +799,23 @@ if(ENABLE_TESTS)
         target_compile_options(bench_bert_mha PRIVATE /wd4189 /wd4456 /wd4101)
     endif()
 
+    add_executable(bench_e2e
+        tests/bench_e2e.c
+    )
+    target_include_directories(bench_e2e PRIVATE
+        src/application/model
+        src/application/engine
+        src/application/include
+        src/operator/include
+        src/operator/blas
+        src/operator/nn
+        src/platform/include
+    )
+    target_link_libraries(bench_e2e PRIVATE onnx_model application operator platform)
+    if(CMAKE_C_COMPILER_ID STREQUAL "MSVC")
+        target_compile_options(bench_e2e PRIVATE /wd4189 /wd4456 /wd4101)
+    endif()
+
     add_executable(bench_mha_decode
         tests/bench_mha_decode.c
     )
