@@ -163,14 +163,42 @@ out:    每个 warp 独立计算 16×d，最后 atomicAdd 到 Y
 
 ---
 
+## R9: RoPE 位置编码扩展 ⭐⭐⭐
+
+**来源**：位置编码方案调研（对比 ggml / flash-attention 参考实现）。
+
+**背景**：RoPE 当前是「已实现但未接入推理链路的孤立算子」--GPT-2 测试模型不用位置编码，`onnx_loader.c` 不识别 RotaryEmbedding，`generate.c` 不调用 RoPE。当前实现仅 interleaved 布局、B=1、无 pos_offset、无缩放、CUDA 每线程重算 sin/cos。要支持 LLaMA/Mistral，需补齐 NeoX 布局、batch、pos_offset、FP16、频率缓存、上下文扩展。
+
+**调研结论**（关键架构决策）：
+- **inv_freq 表驱动**：所有上下文扩展变体（Linear/NTK/Dynamic NTK/YaRN/LongRoPE）最终都是改变 `angle = pos · θ_i` 中的频率 `θ_i` 或位置 `pos`。因此 RoPE kernel 应直接接收 `inv_freq[d/2]` device 表（而非 `base` 标量），一次改动覆盖全部变体，且查表比重算 `powf/cosf/sinf` 快得多。参考 flash-attention 解耦哲学。
+- **NeoX half-split 布局**：LLaMA/Mistral 训练即此布局（前半段 `i` 与后半段 `i+d/2` 配对），推理必须匹配。当前 interleaved（相邻对 `2i`/`2i+1`）保留给 GPT-J 系。用布局枚举字段统一两种，kernel 内一个分支。参考 ggml `rope.cu:177-181`。
+- **learned PE 不动**：GPT-2/BERT 的 learned absolute PE 已烘焙在 ONNX 图（Gather+Add），走通用路径无需新增算子。
+
+**两阶段**：阶段一（R9-a~e，算子增强）→ 阶段二（R9-f~h，端到端接入）。
+
+| # | 任务 | 文件 | 优先级 | 说明 |
+| --- | --- | --- | --- | --- |
+| R9-a | 参数结构重构 + inv_freq 表化 + NeoX 布局 | `rope_int.h`/`rope.c`/`rope_cuda.cu`/`test_rope.c` | ⭐⭐⭐ | `rope_params_t` 加 `layout`(interleaved/half-split)+`inv_freq`表指针；kernel 改查表 + 布局分支；向后兼容 base 标量路径 |
+| R9-b | batch(B>1) + pos_offset | `rope.c`/`rope_cuda.cu`/`test_rope.c` | ⭐⭐⭐ | kernel 加 B 维；pos_offset 适配 KV-cache 续写(pos=offset+idx)；新增 batch/offset 测试 |
+| R9-c | FP16 RoPE | 新建 `rope_f16_cuda.cu`/`fp16_cpu_ops.c`/`test_rope.c` | ⭐⭐ | 模板 `softmax_f16_cuda.cu`；CPU 委托模式；注册 `rope_f16_cuda`/`rope_f16`；FP16 kernel 数 15→16 |
+| R9-d | CUDA sin/cos 预计算表优化 | `rope_cuda.cu`/`rope_f16_cuda.cu` | ⭐⭐ | shared memory 预计算 cos/sin，消除每线程 powf/cosf/sinf；nsys 对比 |
+| R9-e | theta 缩放（Linear + NTK-aware） | `rope_int.h`/host 端/`test_rope.c` | ⭐ | inv_freq 表驱动：Linear 改 pos/scale，NTK 改 base'；host 端按方案生成表 |
+| R9-f | ONNX RotaryEmbedding 映射 | `onnx_loader.c` | ⭐⭐ | `map_onnx_op` 加 RotaryEmbedding→OP_ROPE；读 base/layout/scale |
+| R9-g | GPT-2 测试模型加 RoPE + 端到端验证 | `gen_gpt2_test.py`/`test_gpt2_generate.c` | ⭐⭐⭐ | q/k_proj 后加 RoPE；导出 ONNX；端到端与 PyTorch 参考对齐 |
+| R9-h | 生成循环 + mha_decode/KV-cache 协同 | `graph.c`/`mha_decode`/`generate.c` | ⭐ | pos_offset=cache_len；graph_update_cache_len 同步 RoPE 节点；进阶待评估 |
+
+**执行约定**：逐个任务实现+编译+test_rope+全量 ctest 回归+commit（遵循"一个 commit 一件事"）。commit message 用 `(R9-x)` 后缀。
+
+---
+
 ## 进度
 
 | 状态 | 内容 |
 | --- | --- |
 | 已完成 | R1 全部, R2 全部, R3-a, R4 全部, R5 全部, Flash Attention v2 (FP32 + FP16 WMMA, smem 精简 2 blocks/SM) |
-| 进行中 | — |
-| 已验证失败 | R6-a (寄存器压力), R6-c (WO FP16 转换开销) |
+| 进行中 | R9 (RoPE 位置编码扩展) |
+| 已验证失败 | R6-a (寄存器压力), R6-c (WO FP16 转换开销), R8 (分体式开销大, 回退) |
 | 已完成 | R6-b (S≤64 FP16 WMMA, 13.8×) |
-| 待评估 | R6-d (cp.async, 优先级低) |
+| 待评估 | R6-d (cp.async, 优先级低), R9-h (生成循环+KV-cache 协同, 进阶) |
 
-> **最后更新**: 2026-06-23。Profiling 工作流文档化完成，R6 优化方案基于 nsys 报告制定。
+> **最后更新**: 2026-07-11。R9 RoPE 位置编码扩展规划启动（基于 ggml/flash-attention 调研，inv_freq 表驱动架构）。
