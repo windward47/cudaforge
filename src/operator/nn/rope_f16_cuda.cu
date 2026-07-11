@@ -8,12 +8,26 @@
 #include <cuda_fp16.h>
 #include <math.h>
 
+/* Max head_dim for shared-memory inv_freq cache (must match rope_cuda.cu). */
+#define ROPE_MAX_HALF_D 256
+
 __global__ void rope_f16_kernel(__half* data, int64_t B, int64_t S, int64_t H, int64_t d,
                                  float base, const float* inv_freq, int is_halfsplit,
                                  int64_t pos_offset) {
-    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
     int64_t half_d = d / 2;
     int64_t total = B * S * H * half_d;
+
+    /* Cooperatively precompute inv_freq into shared memory (eliminates per-thread powf). */
+    __shared__ float s_inv_freq[ROPE_MAX_HALF_D];
+    if (half_d <= ROPE_MAX_HALF_D) {
+        for (int64_t i = threadIdx.x; i < half_d; i += blockDim.x) {
+            s_inv_freq[i] = inv_freq ? inv_freq[i]
+                                     : (1.0f / powf(base, (float)(2 * i) / (float)d));
+        }
+        __syncthreads();
+    }
+
+    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= total) return;
 
     /* Decode (i, h, pos, b) from linear idx */
@@ -24,8 +38,9 @@ __global__ void rope_f16_kernel(__half* data, int64_t B, int64_t S, int64_t H, i
     int64_t pos = tmp % S;
     int64_t b = tmp / S;
 
-    float freq = inv_freq ? inv_freq[i]
-                          : (1.0f / powf(base, (float)(2 * i) / (float)d));
+    float freq = (half_d <= ROPE_MAX_HALF_D) ? s_inv_freq[i]
+                : (inv_freq ? inv_freq[i]
+                            : (1.0f / powf(base, (float)(2 * i) / (float)d)));
     float angle = (float)(pos + pos_offset) * freq;
     float c = cosf(angle);
     float s = sinf(angle);
