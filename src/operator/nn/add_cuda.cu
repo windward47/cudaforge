@@ -8,6 +8,14 @@ __global__ void add_f32_no_broadcast_kernel(const float* a, const float* b,
     if (i < N) out[i] = a[i] + b[i];
 }
 
+/* Scalar broadcast: b is a single float on device, broadcast to all N elements.
+   Reads b[0] directly on device - no host D2H sync needed. */
+__global__ void add_f32_scalar_broadcast_kernel(const float* a, const float* b,
+                                                  float* out, int64_t N) {
+    int64_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < N) out[i] = a[i] + b[0];
+}
+
 __global__ void add_f32_broadcast_c_kernel(const float* a, const float* b,
                                              float* out, int64_t N, int64_t C) {
     int64_t i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -34,10 +42,10 @@ int add_f32_cuda(const void* inputs[], void* outputs[],
     dim3 grid((unsigned int)((N + OPS_THREADS_PER_BLOCK - 1) / OPS_THREADS_PER_BLOCK), 1, 1);
 
     if (p->B_numel == 1) {
-        float bv;
-        g_cuda.memcpy_d2h(&bv, (void*)b, sizeof(float), 0);
-        g_cuda.stream_synchronize(0);
-        return CUDA_KERNEL_LAUNCH(add_f32_no_broadcast_kernel, grid, block, 0, s,
+        /* Scalar broadcast: read b[0] on device, no host D2H sync.
+           (R11-a: previous code did memcpy_d2h + stream_synchronize here,
+            which forced a host sync on every scalar-broadcast add call.) */
+        return CUDA_KERNEL_LAUNCH(add_f32_scalar_broadcast_kernel, grid, block, 0, s,
                                   a, b, out, N);
     } else if (p->B_numel == N) {
         return CUDA_KERNEL_LAUNCH(add_f32_no_broadcast_kernel, grid, block, 0, s,
@@ -50,7 +58,7 @@ int add_f32_cuda(const void* inputs[], void* outputs[],
 extern "C" int register_add_f32_cuda(void) {
     static operator_registry_t reg = {
         .name = "add_f32_cuda", .data_type = "f32",
-        .func = add_f32_cuda, .version = 1, .flags = OP_FLAG_NONE,
+        .func = add_f32_cuda, .version = 2, .flags = OP_FLAG_NONE,
     };
     return operator_register(&reg);
 }
