@@ -244,12 +244,14 @@ out:    每个 warp 独立计算 16×d，最后 atomicAdd 到 Y
 - **layernorm_residual kernel 是死代码**：layernorm_cuda.cu:60 已实现但 dispatch 未接线。
 - **MatMul->Activation fusion 检测了但没实现**：graph.c:802 的 OP_MATMUL 分支缺失。
 
-| # | 任务 | 文件 | 优先级 | 说明 |
-| --- | --- | --- | --- | --- |
-| R11-a | 修复 add 标量 D2H sync | `add_cuda.cu` | ⭐⭐⭐ P0 | 消除 B_numel==1 时的 memcpy_d2h+stream_synchronize 隐式同步 |
-| R11-b | 重跑 bench_e2e nsys | `scripts/run_profiling.sh` | ⭐⭐⭐ P0 | 校准 R7 后的真实瓶颈（R9/R10 叠加后可能已变） |
-| R11-c | 接线 layernorm_residual | `layernorm_cuda.cu`/`graph.c` | ⭐⭐ P1 | 死代码接线，省 4 次/iter residual 读写 |
-| R11-d | MatMul->Activation fusion | `matmul_cuda.cu`/`graph.c`/`matmul_int.h` | ⭐⭐ P1 | 补 graph.c:802 OP_MATMUL 分支，融合 ff1->GELU |
+| # | 任务 | 文件 | 优先级 | 状态 | 说明 |
+| --- | --- | --- | --- | --- | --- |
+| R11-a | 修复 add 标量 D2H sync | `add_cuda.cu` | ⭐⭐⭐ P0 | ✅ | 消除 B_numel==1 时的 memcpy_d2h+stream_synchronize 隐式同步；新增 scalar_broadcast kernel |
+| R11-b | 重跑 bench_e2e nsys | `scripts/run_profiling.sh` | ⭐⭐⭐ P0 | ✅ | 确认瓶颈分布：matmul 34%, transpose 16%, add/mul 25%, layernorm 7%, reshape 6% |
+| R11-c | 消除 Gemm transB 物理 transpose | `matmul_cuda.cu` | ⭐⭐⭐ P0 | ✅ | tiled kernel 加 transpose_b 参数直接读转置布局；消除物理 transpose kernel launch+alloc。naive 也统一 API(仍用物理转置,cache 友好) |
+| R11-d | layernorm_residual / matmul+act fusion | - | ⭐⭐ P1 | ⬜ 待后续 | 死代码接线 + GELU 融合；需更多架构改动 |
+
+**完成情况**：R11-a~c 完成（38/38 测试通过）。add D2H sync bug 修复 + tiled transB in-place 读取消除物理 transpose。nsys 确认瓶颈分布与 R7 一致。bench_e2e 基线 0.66ms(R7) -> ~0.7ms(R11, 含 R9/R10 叠加)，benchmark 噪声较大(GPU 频率波动 0.58-1.1ms)。R11-d(layernorm+residual/matmul+act fusion)留作后续。
 
 **执行约定**：逐个任务实现+编译+全量 ctest 回归+commit。commit message 用 `(R11-x)` 后缀。
 
@@ -259,10 +261,10 @@ out:    每个 warp 独立计算 16×d，最后 atomicAdd 到 Y
 
 | 状态 | 内容 |
 | --- | --- |
-| 已完成 | R1 全部, R2 全部, R3-a, R4 全部, R5 全部, Flash Attention v2 (FP32 + FP16 WMMA, smem 精简 2 blocks/SM), R9 全部 (RoPE 扩展: NeoX布局/inv_freq表驱动/batch/pos_offset/FP16/shared-mem优化/Linear+NTK缩放/推理图接入/decode融合+cache_len>0 bug修复), R10 全部 (native 生成循环: mha_decode+KV-cache prefill->decode 验证) |
-| 进行中 | R11 (端到端性能优化: add D2H sync bug / nsys 确认瓶颈 / layernorm+residual fusion / matmul+activation fusion) |
+| 已完成 | R1 全部, R2 全部, R3-a, R4 全部, R5 全部, Flash Attention v2 (FP32 + FP16 WMMA, smem 精简 2 blocks/SM), R9 全部 (RoPE 扩展), R10 全部 (native 生成循环), R11-a~c (add D2H bug修复 + transB in-place消除 + nsys确认瓶颈) |
+| 进行中 | - |
 | 已验证失败 | R6-a (寄存器压力), R6-c (WO FP16 转换开销), R8 (分体式开销大, 回退), R9-g (ONNX RoPE 导出不可行, native 图已覆盖) |
 | 已完成 | R6-b (S≤64 FP16 WMMA, 13.8×) |
-| 待评估 | R6-d (cp.async, 优先级低) |
+| 待评估 | R6-d (cp.async, 优先级低), R11-d (layernorm+residual/matmul+act fusion) |
 
-> **最后更新**: 2026-07-11。R9 RoPE 扩展 + R10 生成循环全部完成（38/38 测试通过）。RoPE 全链路就绪（NeoX布局/inv_freq表驱动/FP16/decode融合），native 单层 transformer 图经 graph_execute 跑通 prefill->decode 生成循环，验证 mha_decode RoPE 融合 + KV-cache 持久化 + cache_len 递增在端到端生成中正确工作。
+> **最后更新**: 2026-07-12。R9 RoPE + R10 生成循环 + R11 端到端性能优化（R11-a~c）完成（38/38 测试通过）。R11 修复 add D2H sync bug + 消除 tiled transB 物理 transpose，nsys 确认瓶颈分布（matmul 34%/transpose 16%/add+mul 25%）。R11-d（layernorm+residual fusion / matmul+act fusion）留作后续。
