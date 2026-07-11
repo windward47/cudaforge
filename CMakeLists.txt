@@ -826,6 +826,25 @@ if(ENABLE_TESTS)
     set_tests_properties(test_mha_decode PROPERTIES
         WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
 
+    add_executable(test_native_generate
+        tests/test_native_generate.c
+    )
+    target_include_directories(test_native_generate PRIVATE
+        src/application/engine
+        src/application/include
+        src/operator/include
+        src/operator/blas
+        src/operator/nn
+        src/platform/include
+    )
+    target_link_libraries(test_native_generate PRIVATE application operator platform)
+    if(CMAKE_C_COMPILER_ID STREQUAL "MSVC")
+        target_compile_options(test_native_generate PRIVATE /wd4189 /wd4456 /wd4101)
+    endif()
+    add_test(NAME test_native_generate COMMAND test_native_generate)
+    set_tests_properties(test_native_generate PROPERTIES
+        WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+
     add_executable(test_rope
         tests/test_rope.c
     )

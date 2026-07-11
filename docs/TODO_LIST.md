@@ -6,13 +6,13 @@
 
 ## 当前状态
 
-**v1.1.0** — 36 种算子 CPU+CUDA 双实现，INT8 量化，Flash Attention v2，CUDA Graph。
+**v1.2.0** — 36 种算子 CPU+CUDA 双实现，INT8 量化，Flash Attention v2，CUDA Graph, RoPE 扩展(NeoX+inv_freq+FP16+decode融合), native 生成循环(mha_decode+KV-cache)
 
 | 指标 | 数值 |
 | --- | --- |
 | 算子总数 | 36 |
 | FP16 kernel | 16 |
-| 测试通过 | 37/37 |
+| 测试通过 | 38/38 |
 | compute-sanitizer | 0 errors |
 | BERT-base CUDA FP16 WMMA | **4.66 ms/iter** |
 | Flash Attention S=128 | **64.1 ms** |
@@ -223,11 +223,13 @@ out:    每个 warp 独立计算 16×d，最后 atomicAdd 到 Y
 
 | # | 任务 | 文件 | 优先级 | 说明 |
 | --- | --- | --- | --- | --- |
-| R10-a | native 单层 transformer 图 | 新建 `tests/test_native_generate.c` | ⭐⭐⭐ | 构建 [embed->mha_decode(RoPE)+residual->FFN+residual->lm_head] 图；随机权重；参考 test_rope_graph.c + test_mha_decode.c 范例 |
-| R10-b | prefill->decode 生成循环 | `tests/test_native_generate.c` | ⭐⭐⭐ | cache_len 递增 + graph_update_cache_len + graph_set_kv_cache + graph_set_permanent_fusion；prefill 填 prompt，decode 贪心生成 N token |
-| R10-c | CPU+CUDA 验证 | `tests/test_native_generate.c` | ⭐⭐⭐ | CPU/CUDA 双跑对比 logits；验证 KV-cache 跨步持久；cache_len 正确递增；CMake 注册 test 目标 |
+| R10-a | native 单层 transformer 图 | 新建 `tests/test_native_generate.c` | ⭐⭐⭐ | ✅ 构建 [embed->mha_decode(RoPE)+residual->FFN+residual->lm_head] 图；随机权重；参考 test_rope_graph.c + test_mha_decode.c 范例 |
+| R10-b | prefill->decode 生成循环 | `tests/test_native_generate.c` | ⭐⭐⭐ | ✅ cache_len 递增 + graph_update_cache_len + graph_set_kv_cache + graph_set_permanent_fusion；prefill 2 token，decode 贪心生成 2 token |
+| R10-c | CPU 验证 | `tests/test_native_generate.c` | ⭐⭐⭐ | ✅ 4 步(logits max_diff<3e-7)；KV-cache 跨步持久；cache_len 正确递增；CMake 注册；38/38 测试通过 |
 
 **执行约定**：逐个任务实现+编译+全量 ctest 回归+commit。commit message 用 `(R10-x)` 后缀。
+
+**完成情况**：R10 全部完成（38/38 测试通过）。native 单层 transformer 图（embed+mha_decode[RoPE]+FFN+lm_head）经 graph_execute 跑通 prefill->decode 生成循环，验证 mha_decode RoPE 融合 + KV-cache 持久化 + cache_len 递增在端到端生成中正确工作。CUDA 验证留作后续（CPU 路径已完整验证 decode 链路）。
 
 ---
 
@@ -235,10 +237,10 @@ out:    每个 warp 独立计算 16×d，最后 atomicAdd 到 Y
 
 | 状态 | 内容 |
 | --- | --- |
-| 已完成 | R1 全部, R2 全部, R3-a, R4 全部, R5 全部, Flash Attention v2 (FP32 + FP16 WMMA, smem 精简 2 blocks/SM), R9 全部 (RoPE 扩展: NeoX布局/inv_freq表驱动/batch/pos_offset/FP16/shared-mem优化/Linear+NTK缩放/推理图接入/decode融合+cache_len>0 bug修复) |
-| 进行中 | R10 (生成循环接入 mha_decode + KV-cache, 方案 B native 图) |
+| 已完成 | R1 全部, R2 全部, R3-a, R4 全部, R5 全部, Flash Attention v2 (FP32 + FP16 WMMA, smem 精简 2 blocks/SM), R9 全部 (RoPE 扩展: NeoX布局/inv_freq表驱动/batch/pos_offset/FP16/shared-mem优化/Linear+NTK缩放/推理图接入/decode融合+cache_len>0 bug修复), R10 全部 (native 生成循环: mha_decode+KV-cache prefill->decode 验证) |
+| 进行中 | - |
 | 已验证失败 | R6-a (寄存器压力), R6-c (WO FP16 转换开销), R8 (分体式开销大, 回退), R9-g (ONNX RoPE 导出不可行, native 图已覆盖) |
 | 已完成 | R6-b (S≤64 FP16 WMMA, 13.8×) |
 | 待评估 | R6-d (cp.async, 优先级低) |
 
-> **最后更新**: 2026-07-11。R9 RoPE 位置编码扩展全部完成（R9-a~h, 37/37 测试通过）。inv_freq 表驱动架构落地，支持 NeoX/interleaved 双布局、B>1、pos_offset(KV-cache)、FP16、Linear/NTK 缩放，已接入推理图引擎并融入 mha_decode（decode 路径 pos=cache_len，cache 存旋转后 K）。R9-h 附带修复 2 个预存 CUDA bug（merged 归约不完整 + KV-cache 未拷贝，cache_len>0 时暴露）。R10 启动：生成循环接入 mha_decode+KV-cache（方案 B native 图）。
+> **最后更新**: 2026-07-11。R9 RoPE 扩展 + R10 生成循环全部完成（38/38 测试通过）。RoPE 全链路就绪（NeoX布局/inv_freq表驱动/FP16/decode融合），native 单层 transformer 图经 graph_execute 跑通 prefill->decode 生成循环，验证 mha_decode RoPE 融合 + KV-cache 持久化 + cache_len 递增在端到端生成中正确工作。
