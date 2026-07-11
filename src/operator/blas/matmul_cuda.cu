@@ -47,10 +47,16 @@ __global__ void matmul_f32_naive(const float* A, const float* B, float* C,
 /* ============================================================
  * Tiled: shared memory, MATMUL_TILE_SIZE (16) × MATMUL_TILE_SIZE (batched)
  * ============================================================ */
+/* ============================================================
+ * Tiled: shared memory, MATMUL_TILE_SIZE (16) × MATMUL_TILE_SIZE (batched)
+ * transpose_b flag: when set, B is stored as [N,K] row-major (need B^T).
+ *   Instead of physical transpose, read B in transposed order directly.
+ * ============================================================ */
 __global__ void matmul_f32_tiled(const float* A, const float* B, float* C,
                                   int64_t M, int64_t N, int64_t K,
                                   int64_t batch_size,
-                                  int64_t stride_a, int64_t stride_b, int64_t stride_c) {
+                                  int64_t stride_a, int64_t stride_b, int64_t stride_c,
+                                  int transpose_b) {
     __shared__ float As[MATMUL_TILE_SIZE][MATMUL_TILE_SIZE];
     __shared__ float Bs[MATMUL_TILE_SIZE][MATMUL_TILE_SIZE];
 
@@ -72,9 +78,14 @@ __global__ void matmul_f32_tiled(const float* A, const float* B, float* C,
         else
             As[ty][tx] = 0.0f;
 
-        if (tiled_k + ty < K && col < N)
-            Bs[ty][tx] = Bb[(tiled_k + ty) * N + col];
-        else
+        if (tiled_k + ty < K && col < N) {
+            /* transpose_b: B is [N,K] row-major, B[n][k]=B[n*K+k].
+               We need B[k][n] = B[col*K + (tiled_k+ty)]. */
+            if (transpose_b)
+                Bs[ty][tx] = Bb[col * K + (tiled_k + ty)];
+            else
+                Bs[ty][tx] = Bb[(tiled_k + ty) * N + col];
+        } else
             Bs[ty][tx] = 0.0f;
 
         __syncthreads();
@@ -98,7 +109,8 @@ __global__ void matmul_f32_tiled_bias(const float* A, const float* B, float* C,
                                        const float* bias,
                                        int64_t M, int64_t N, int64_t K,
                                        int64_t batch_size,
-                                       int64_t stride_a, int64_t stride_b, int64_t stride_c) {
+                                       int64_t stride_a, int64_t stride_b, int64_t stride_c,
+                                       int transpose_b) {
     __shared__ float As[MATMUL_TILE_SIZE][MATMUL_TILE_SIZE];
     __shared__ float Bs[MATMUL_TILE_SIZE][MATMUL_TILE_SIZE];
     int tx = threadIdx.x, ty = threadIdx.y;
@@ -112,7 +124,10 @@ __global__ void matmul_f32_tiled_bias(const float* A, const float* B, float* C,
     for (int t = 0; t < (K + MATMUL_TILE_SIZE - 1) / MATMUL_TILE_SIZE; t++) {
         int tiled_k = t * MATMUL_TILE_SIZE;
         if (row < M && tiled_k + tx < K) As[ty][tx] = Ab[row * K + tiled_k + tx]; else As[ty][tx] = 0.0f;
-        if (tiled_k + ty < K && col < N) Bs[ty][tx] = Bb[(tiled_k + ty) * N + col]; else Bs[ty][tx] = 0.0f;
+        if (tiled_k + ty < K && col < N) {
+            if (transpose_b) Bs[ty][tx] = Bb[col * K + (tiled_k + ty)];
+            else              Bs[ty][tx] = Bb[(tiled_k + ty) * N + col];
+        } else Bs[ty][tx] = 0.0f;
         __syncthreads();
         for (int k = 0; k < MATMUL_TILE_SIZE; k++) sum += As[ty][k] * Bs[k][tx];
         __syncthreads();
@@ -363,6 +378,12 @@ int matmul_f32_cuda(const void* inputs[], void* outputs[],
     float* B_trans = NULL;
     int ret = 0;
     int config = p ? p->tuning_config : 0;  /* 0=heuristic, 1=naive, 2=tiled, 3=warp, 4=tc */
+    int tb_flag = p->transpose_b ? 1 : 0;
+    /* R11-c: tiled kernel supports in-place transpose_b, so we only do the
+       physical transpose for non-tiled paths (naive/warp/TC). */
+    int use_tiled_path = (config == 2) ||
+        (config == 0 && !(M <= 32 && N <= 32) && !(M >= 64 && N >= 64) &&
+         !(M >= 512 && N >= 512 && K >= 512));
 
     /* Transpose A if needed (A is K×M, need M×K for standard kernel) */
     if (p->transpose_a) {
@@ -381,8 +402,11 @@ int matmul_f32_cuda(const void* inputs[], void* outputs[],
         stride_a = M * K;
     }
 
-    /* Transpose B if needed (B is N×K, need K×N for standard kernel) */
-    if (p->transpose_b) {
+    /* Transpose B if needed (B is N×K, need K×N for standard kernel).
+       R11-c: the tiled kernel supports in-place transpose_b (reads B in
+       transposed order), so we skip the physical transpose for that path.
+       Other kernels (naive/warp/TC) still need the physical transpose. */
+    if (p->transpose_b && !use_tiled_path) {
         size_t bytes = (size_t)batch_size * K * N * sizeof(float);
         B_trans = (float*)g_cuda.device_alloc(bytes);
         if (!B_trans) { ret = -1; goto matmul_cleanup; }
@@ -396,6 +420,7 @@ int matmul_f32_cuda(const void* inputs[], void* outputs[],
         }
         B = B_trans;
         stride_b = K * N;
+        tb_flag = 0;  /* already transposed, kernel reads normally */
     }
 
 #ifdef __HIPCC__
@@ -469,11 +494,11 @@ int matmul_f32_cuda(const void* inputs[], void* outputs[],
         if (bias) {
             ret = CUDA_KERNEL_LAUNCH(matmul_f32_tiled_bias, grid, block, 0, s,
                                       A, B, C, bias, M, N, K,
-                                      batch_size, stride_a, stride_b, stride_c);
+                                      batch_size, stride_a, stride_b, stride_c, tb_flag);
         } else {
             ret = CUDA_KERNEL_LAUNCH(matmul_f32_tiled, grid, block, 0, s,
                                       A, B, C, M, N, K,
-                                      batch_size, stride_a, stride_b, stride_c);
+                                      batch_size, stride_a, stride_b, stride_c, tb_flag);
         }
     }
 
