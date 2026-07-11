@@ -206,14 +206,39 @@ out:    每个 warp 独立计算 16×d，最后 atomicAdd 到 Y
 
 ---
 
+## R10: 生成循环接入 mha_decode + KV-cache ⭐⭐⭐
+
+**来源**：R9-h 完成后，mha_decode 已支持 RoPE 融合，但 `generate.c` 仍对每个 token 重跑整图（行 9-11 注释承认是 future work）。需把 mha_decode+KV-cache 接入生成循环，实现真正的逐 token 自回归生成。
+
+**调研结论**（方案选择）：
+- **方案 A（改 generate.c + ONNX KV-cache 路径）不推荐**：现有 gpt2_full.onnx 无 KV-cache 端口、用绝对位置 embedding（非 RoPE），需改导出脚本+loader+融合检测器，工作量大且脆弱。
+- **方案 C（generate.c 加 KV-cache 分支但图不变）不可行**：现有图是 OP_MHA_FUSED（无 cache 端口）。
+- **方案 B（native 生成测试）推荐**：C 代码直接构建 `[embed -> mha_decode(RoPE) -> FFN -> lm_head]` native 图，跑 prefill->decode 生成循环。所有底层能力已就绪（mha_decode RoPE 融合、graph KV-cache API、native 图构建范例 test_rope_graph.c/test_mha_decode.c）。
+
+**关键设计**：
+- prefill 和 decode 统一用 mha_decode 逐 token 填 cache（cache_len 从 0 递增），避免 prefill/decode 切换复杂性。
+- RoPE 已融合进 mha_decode（R9-h），图里**不另加** OP_ROPE 节点（避免双重旋转），`rope_base=10000` 启用。
+- 每步调用 `graph_update_cache_len(g, cache_len)` 递增所有 MHA_DECODE 节点位置。
+- `graph_set_kv_cache` 标记 K/V cache tensor 持久化，`graph_set_permanent_fusion` 避免重复融合。
+
+| # | 任务 | 文件 | 优先级 | 说明 |
+| --- | --- | --- | --- | --- |
+| R10-a | native 单层 transformer 图 | 新建 `tests/test_native_generate.c` | ⭐⭐⭐ | 构建 [embed->mha_decode(RoPE)+residual->FFN+residual->lm_head] 图；随机权重；参考 test_rope_graph.c + test_mha_decode.c 范例 |
+| R10-b | prefill->decode 生成循环 | `tests/test_native_generate.c` | ⭐⭐⭐ | cache_len 递增 + graph_update_cache_len + graph_set_kv_cache + graph_set_permanent_fusion；prefill 填 prompt，decode 贪心生成 N token |
+| R10-c | CPU+CUDA 验证 | `tests/test_native_generate.c` | ⭐⭐⭐ | CPU/CUDA 双跑对比 logits；验证 KV-cache 跨步持久；cache_len 正确递增；CMake 注册 test 目标 |
+
+**执行约定**：逐个任务实现+编译+全量 ctest 回归+commit。commit message 用 `(R10-x)` 后缀。
+
+---
+
 ## 进度
 
 | 状态 | 内容 |
 | --- | --- |
 | 已完成 | R1 全部, R2 全部, R3-a, R4 全部, R5 全部, Flash Attention v2 (FP32 + FP16 WMMA, smem 精简 2 blocks/SM), R9 全部 (RoPE 扩展: NeoX布局/inv_freq表驱动/batch/pos_offset/FP16/shared-mem优化/Linear+NTK缩放/推理图接入/decode融合+cache_len>0 bug修复) |
-| 进行中 | - |
+| 进行中 | R10 (生成循环接入 mha_decode + KV-cache, 方案 B native 图) |
 | 已验证失败 | R6-a (寄存器压力), R6-c (WO FP16 转换开销), R8 (分体式开销大, 回退), R9-g (ONNX RoPE 导出不可行, native 图已覆盖) |
 | 已完成 | R6-b (S≤64 FP16 WMMA, 13.8×) |
 | 待评估 | R6-d (cp.async, 优先级低) |
 
-> **最后更新**: 2026-07-11。R9 RoPE 位置编码扩展全部完成（R9-a~h, 37/37 测试通过）。inv_freq 表驱动架构落地，支持 NeoX/interleaved 双布局、B>1、pos_offset(KV-cache)、FP16、Linear/NTK 缩放，已接入推理图引擎并融入 mha_decode（decode 路径 pos=cache_len，cache 存旋转后 K）。R9-h 附带修复 2 个预存 CUDA bug（merged 归约不完整 + KV-cache 未拷贝，cache_len>0 时暴露）。
+> **最后更新**: 2026-07-11。R9 RoPE 位置编码扩展全部完成（R9-a~h, 37/37 测试通过）。inv_freq 表驱动架构落地，支持 NeoX/interleaved 双布局、B>1、pos_offset(KV-cache)、FP16、Linear/NTK 缩放，已接入推理图引擎并融入 mha_decode（decode 路径 pos=cache_len，cache 存旋转后 K）。R9-h 附带修复 2 个预存 CUDA bug（merged 归约不完整 + KV-cache 未拷贝，cache_len>0 时暴露）。R10 启动：生成循环接入 mha_decode+KV-cache（方案 B native 图）。
