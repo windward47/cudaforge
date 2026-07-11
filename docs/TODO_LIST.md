@@ -229,7 +229,29 @@ out:    每个 warp 独立计算 16×d，最后 atomicAdd 到 Y
 
 **执行约定**：逐个任务实现+编译+全量 ctest 回归+commit。commit message 用 `(R10-x)` 后缀。
 
-**完成情况**：R10 全部完成（38/38 测试通过）。native 单层 transformer 图（embed+mha_decode[RoPE]+FFN+lm_head）经 graph_execute 跑通 prefill->decode 生成循环，验证 mha_decode RoPE 融合 + KV-cache 持久化 + cache_len 递增在端到端生成中正确工作。CUDA 验证留作后续（CPU 路径已完整验证 decode 链路）。
+**完成情况**：R10 全部完成（38/38 测试通过）。native 单层 transformer 图（embed+mha_decode[RoPE]+FFN+lm_head）经 graph_execute 跑通 prefill->decode 生成循环，验证 mha_decode RoPE 融合 + KV-cache 持久化 + cache_len 递增在端到端生成中正确工作。CUDA 验证完成（generate_tokens CPU/CUDA 生成 token 序列完全一致）。
+
+---
+
+## R11: 端到端性能优化 ⭐⭐⭐
+
+**来源**：R7 瓶颈分析（matmul 32%, transpose 15%, add/mul 28%, layernorm 7%）。调研发现根因与 R7 推测不同：transpose 主因是 Gemm transB 权重转置（非 attention reshape，已被 MHA fusion 消除）；add/mul 主因是 GELU tanh 展开 + causal mask Where + residual，且有 add_cuda.cu 标量 D2H sync bug 放大延迟。
+
+**调研结论**（关键发现）：
+- **add_cuda.cu:38-40 标量 D2H sync bug**：`B_numel==1` 时 `memcpy_d2h` + `stream_synchronize` 强制 host 同步，1113 次 add 调用里引入显著延迟。R7 的惰性 D2H 未覆盖此路径。P0 修复。
+- **transpose 主因是 Gemm transB**：matmul_cuda.cu:385 对 transB 做物理转置再 GEMM，~250 次/50iter。非 attention reshape（已被 MHA fusion 消除）。
+- **独立 matmul WMMA 对 GPT-2 无收益**：小矩阵（8×64）远低于 TC 门槛，FP16 转换不划算（R6-c 已验证回退）。
+- **layernorm_residual kernel 是死代码**：layernorm_cuda.cu:60 已实现但 dispatch 未接线。
+- **MatMul->Activation fusion 检测了但没实现**：graph.c:802 的 OP_MATMUL 分支缺失。
+
+| # | 任务 | 文件 | 优先级 | 说明 |
+| --- | --- | --- | --- | --- |
+| R11-a | 修复 add 标量 D2H sync | `add_cuda.cu` | ⭐⭐⭐ P0 | 消除 B_numel==1 时的 memcpy_d2h+stream_synchronize 隐式同步 |
+| R11-b | 重跑 bench_e2e nsys | `scripts/run_profiling.sh` | ⭐⭐⭐ P0 | 校准 R7 后的真实瓶颈（R9/R10 叠加后可能已变） |
+| R11-c | 接线 layernorm_residual | `layernorm_cuda.cu`/`graph.c` | ⭐⭐ P1 | 死代码接线，省 4 次/iter residual 读写 |
+| R11-d | MatMul->Activation fusion | `matmul_cuda.cu`/`graph.c`/`matmul_int.h` | ⭐⭐ P1 | 补 graph.c:802 OP_MATMUL 分支，融合 ff1->GELU |
+
+**执行约定**：逐个任务实现+编译+全量 ctest 回归+commit。commit message 用 `(R11-x)` 后缀。
 
 ---
 
@@ -238,7 +260,7 @@ out:    每个 warp 独立计算 16×d，最后 atomicAdd 到 Y
 | 状态 | 内容 |
 | --- | --- |
 | 已完成 | R1 全部, R2 全部, R3-a, R4 全部, R5 全部, Flash Attention v2 (FP32 + FP16 WMMA, smem 精简 2 blocks/SM), R9 全部 (RoPE 扩展: NeoX布局/inv_freq表驱动/batch/pos_offset/FP16/shared-mem优化/Linear+NTK缩放/推理图接入/decode融合+cache_len>0 bug修复), R10 全部 (native 生成循环: mha_decode+KV-cache prefill->decode 验证) |
-| 进行中 | - |
+| 进行中 | R11 (端到端性能优化: add D2H sync bug / nsys 确认瓶颈 / layernorm+residual fusion / matmul+activation fusion) |
 | 已验证失败 | R6-a (寄存器压力), R6-c (WO FP16 转换开销), R8 (分体式开销大, 回退), R9-g (ONNX RoPE 导出不可行, native 图已覆盖) |
 | 已完成 | R6-b (S≤64 FP16 WMMA, 13.8×) |
 | 待评估 | R6-d (cp.async, 优先级低) |
