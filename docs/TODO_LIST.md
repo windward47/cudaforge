@@ -185,11 +185,24 @@ out:    每个 warp 独立计算 16×d，最后 atomicAdd 到 Y
 | R9-e | theta 缩放（Linear + NTK-aware） | `test_rope.c` | ⭐ | ✅ | inv_freq 表驱动验证：Linear(inv_freq/scale) + NTK(base'=base·scale^(d/(d-2)))；高频保留低频拉伸 |
 | R9-f | RoPE 接入推理图引擎 | 新建 `test_rope_graph.c` | ⭐⭐ | ✅ | native 图 [INPUT->OP_ROPE->OUTPUT] 经 graph_execute 验证 dispatch 链路；CPU+CUDA 双跑。ONNX 映射降级(标准 ONNX 无此算子) |
 | R9-g | GPT-2 测试模型加 RoPE | - | ⭐⭐⭐ | ❌ 已评估 | ONNX 路径不可行：PyTorch 无内置 RoPE，自定义 op 导出后 ORT 无法生成参考输出。R9-f native 图已覆盖"推理链路接入"验证 |
-| R9-h | 生成循环 + mha_decode/KV-cache 协同 | `mha_decode`/`graph.c` | ⭐ | ⬜ 待后续 | 评估：mha_decode 内部算 Q/K 投影，需重构为接收已旋转 Q/K 或内部融合 RoPE；pos_offset=cache_len 前提已就绪(R9-b)。留作后续架构任务 |
+| R9-h | mha_decode 内部融合 RoPE | `mha_decode_int.h`/`mha_decode.c`/`mha_decode_cuda.cu`/`test_mha_decode.c` | ⭐ | ⬜ 规划中 | 方案 A：参数加 rope_base/layout/inv_freq(base=0 禁用,向后兼容)；CPU/CUDA kernel 在 Q/K 投影后、K 写 cache 前旋转(pos=cache_len)；详见下表 |
+
+### R9-h 子任务（方案 A：mha_decode 内部融合 RoPE）
+
+**调研结论**：推荐方案 A（内部融合）而非方案 B（改接口接收已旋转 Q/K）或方案 C（图层面拆分）。理由：(1) `pos_offset` 直接用 `mha_decode_params_t.cache_len`（已被 `graph_update_cache_len` 每步更新），无需改图引擎；(2) decode 单 token 对 launch 延迟敏感，保持单 kernel 最优；(3) 向后兼容（base=0 走原路径）；(4) cache 存旋转后 K，prefill/decode 语义统一。
+
+| # | 任务 | 文件 | 说明 |
+| --- | --- | --- | --- |
+| R9-h1 | 参数结构扩展 | `mha_decode_int.h` | 加 `float rope_base`(0=禁用)、`int32_t rope_layout`、`const float* rope_inv_freq`(NULL 用 base 现算) |
+| R9-h2 | CPU 融合 RoPE | `mha_decode.c` | K_new 算完后写 cache 前旋转(pos=cache_len)；Q 算完后 attention 前旋转；复用 rope.c 成对旋转逻辑 |
+| R9-h3 | CUDA 融合 RoPE | `mha_decode_cuda.cu` | Q 旋转(Q_reg 单线程,简单)；K 旋转需重构线程循环(每线程处理整 kv_h 的 d 维,d≤64 放寄存器)或两阶段(shared mem 暂存再旋转) |
+| R9-h4 | 测试 | `test_mha_decode.c` | 新增 RoPE 测试 case(rope_base=10000, layout=HALFSPLIT)；decode_ref 加旋转；验证 cache 存旋转后 K |
+
+**执行约定**：逐个任务实现+编译+test_mha_decode+全量 ctest 回归+commit（遵循"一个 commit 一件事"）。commit message 用 `(R9-hN)` 后缀。
 
 **执行约定**：逐个任务实现+编译+test_rope+全量 ctest 回归+commit（遵循"一个 commit 一件事"）。commit message 用 `(R9-x)` 后缀。
 
-**完成情况**：R9-a~f 全部完成（37/37 测试通过），R9-g 已评估不可行（native 图已覆盖），R9-h 待后续。RoPE 算子层具备完整能力：NeoX/interleaved 双布局、inv_freq 表驱动、B>1、pos_offset(KV-cache)、FP16、shared memory 优化、Linear/NTK 缩放、推理图引擎接入。
+**完成情况**：R9-a~f 全部完成（37/37 测试通过），R9-g 已评估不可行（native 图已覆盖），R9-h 已调研并拆为子任务（方案 A：mha_decode 内部融合 RoPE，待实现）。RoPE 算子层具备完整能力：NeoX/interleaved 双布局、inv_freq 表驱动、B>1、pos_offset(KV-cache)、FP16、shared memory 优化、Linear/NTK 缩放、推理图引擎接入。
 
 ---
 
@@ -201,6 +214,7 @@ out:    每个 warp 独立计算 16×d，最后 atomicAdd 到 Y
 | 进行中 | - |
 | 已验证失败 | R6-a (寄存器压力), R6-c (WO FP16 转换开销), R8 (分体式开销大, 回退), R9-g (ONNX RoPE 导出不可行, native 图已覆盖) |
 | 已完成 | R6-b (S≤64 FP16 WMMA, 13.8×) |
-| 待评估 | R6-d (cp.async, 优先级低), R9-h (mha_decode+RoPE 融合, 需重构 decode 接收已旋转 Q/K) |
+| 待评估 | R6-d (cp.async, 优先级低) |
+| 进行中 | R9-h (mha_decode 内部融合 RoPE, 方案 A 已调研拆子任务) |
 
-> **最后更新**: 2026-07-11。R9 RoPE 位置编码扩展完成（R9-a~f, 37/37 测试通过）。inv_freq 表驱动架构落地，支持 NeoX/interleaved 双布局、B>1、pos_offset(KV-cache)、FP16、Linear/NTK 缩放，已接入推理图引擎。R9-g ONNX 路径不可行已评估，R9-h decode 融合留作后续。
+> **最后更新**: 2026-07-11。R9 RoPE 位置编码扩展完成（R9-a~f, 37/37 测试通过）。inv_freq 表驱动架构落地，支持 NeoX/interleaved 双布局、B>1、pos_offset(KV-cache)、FP16、Linear/NTK 缩放，已接入推理图引擎。R9-g ONNX 路径不可行已评估，R9-h decode 融合已调研（方案 A）拆为 h1~h4 子任务待实现。
