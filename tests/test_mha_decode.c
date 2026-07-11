@@ -9,6 +9,7 @@
 #include "graph.h"
 #include "mha_decode_int.h"
 #include "causal_mask_int.h"
+#include "rope_int.h"
 #include "platform.h"
 #include "operator.h"
 #include <stdio.h>
@@ -54,6 +55,28 @@ static void random_fill(float* data, int64_t n, int seed) {
     }
 }
 
+/* Apply RoPE in-place to a (d,) vector at position pos (mirrors mha_decode.c). */
+static void rope_apply_vec_test(float* q, int64_t d, int64_t pos,
+                                float rope_base, int rope_layout, const float* inv_freq) {
+    int64_t half_d = d / 2;
+    int is_halfsplit = (rope_layout == ROPE_LAYOUT_HALFSPLIT);
+    for (int64_t i = 0; i < half_d; i++) {
+        float freq = inv_freq ? inv_freq[i]
+                              : (1.0f / powf(rope_base, (float)(2 * i) / (float)d));
+        float angle = (float)pos * freq;
+        float c = cosf(angle), s = sinf(angle);
+        if (!is_halfsplit) {
+            float x0 = q[2 * i], x1 = q[2 * i + 1];
+            q[2 * i]     = x0 * c - x1 * s;
+            q[2 * i + 1] = x0 * s + x1 * c;
+        } else {
+            float x0 = q[i], x1 = q[i + half_d];
+            q[i]          = x0 * c - x1 * s;
+            q[i + half_d] = x0 * s + x1 * c;
+        }
+    }
+}
+
 /* ============================================================
  * CPU reference: manual mha_decode computation
  * ============================================================ */
@@ -67,8 +90,10 @@ static void decode_ref(
     const float* WO, const float* bO,
     float* Y,              /* (B, 1, D) */
     float* K_out, float* V_out,
-    int64_t cache_len, float scale)
+    int64_t cache_len, float scale,
+    float rope_base, int rope_layout, const float* rope_inv_freq)
 {
+    int use_rope = (rope_base > 0.0f);
     /* Copy caches */
     memcpy(K_out, K_cache, TB * TMAX_SEQ * TH * Td * sizeof(float));
     memcpy(V_out, V_cache, TB * TMAX_SEQ * TH * Td * sizeof(float));
@@ -91,7 +116,7 @@ static void decode_ref(
                 Q[di] = acc + (bQ ? bQ[ho + di] : 0.0f);
             }
 
-            /* K_new, V_new → cache */
+            /* K_new, V_new -> cache */
             for (int64_t di = 0; di < Td; di++) {
                 float k_acc = 0.0f, v_acc = 0.0f;
                 for (int64_t j = 0; j < TD; j++) {
@@ -101,6 +126,14 @@ static void decode_ref(
                 int64_t idx = (b * TMAX_SEQ + cache_len) * TH * Td + ho + di;
                 K_out[idx] = k_acc + (bK ? bK[ho + di] : 0.0f);
                 V_out[idx] = v_acc + (bV ? bV[ho + di] : 0.0f);
+            }
+
+            /* R9-h: rotate Q and K_new (pos = cache_len) before attention.
+               K_new is now in K_out at the cache_len slot; rotate in place. */
+            if (use_rope) {
+                rope_apply_vec_test(Q, Td, cache_len, rope_base, rope_layout, rope_inv_freq);
+                int64_t k_idx = (b * TMAX_SEQ + cache_len) * TH * Td + ho;
+                rope_apply_vec_test(K_out + k_idx, Td, cache_len, rope_base, rope_layout, rope_inv_freq);
             }
 
             /* Attention scores */
@@ -131,7 +164,7 @@ static void decode_ref(
                 for (int64_t di = 0; di < Td; di++) merged[di] += w * V_out[v_off + di];
             }
 
-            /* Output projection — accumulate per-head to match GPU atomicAdd order */
+            /* Output projection - accumulate per-head to match GPU atomicAdd order */
             for (int64_t j = 0; j < TD; j++) {
                 float contrib = 0.0f;
                 for (int64_t di = 0; di < Td; di++) contrib += merged[di] * WO[(ho + di) * TD + j];
@@ -198,7 +231,7 @@ static int test_mha_decode_cpu(void) {
 
     /* Reference */
     decode_ref(X_new, K_cache, V_cache, WQ, bQ, WK, bK, WV, bV, WO, bO,
-               Y_ref, K_ref, V_ref, 0, scale);
+               Y_ref, K_ref, V_ref, 0, scale, 0.0f, 0, NULL);
 
     float diff = max_abs_diff(Y_cpu, Y_ref, TB * TD);
     fprintf(stderr, "Step 1 (cache_len=0): Y max_diff=%.2e\n", diff);
@@ -240,7 +273,7 @@ static int test_mha_decode_cpu(void) {
     CHECK(ret == 0, "mha_decode_f32 step 2 returned error");
 
     decode_ref(X_new2, K_cpu, V_cpu, WQ, bQ, WK, bK, WV, bV, WO, bO,
-               Y_ref2, K_ref2, V_ref2, 1, scale);
+               Y_ref2, K_ref2, V_ref2, 1, scale, 0.0f, 0, NULL);
 
     diff = max_abs_diff(Y_cpu2, Y_ref2, TB * TD);
     fprintf(stderr, "Step 2 (cache_len=1): Y max_diff=%.2e\n", diff);
@@ -414,6 +447,182 @@ cleanup_cuda:
 }
 
 /* ============================================================
+ * Test: mha_decode with RoPE fusion (R9-h) - CPU + CUDA
+ * Verifies Q/K rotation at pos=cache_len, cache stores rotated K.
+ * ============================================================ */
+static int test_mha_decode_rope(void) {
+    fprintf(stderr, "\n=== MHA Decode + RoPE Test ===\n");
+
+    float* X_new   = (float*)malloc(TB * TD * sizeof(float));
+    float* K_cache = (float*)calloc(1, TB * TMAX_SEQ * TH * Td * sizeof(float));
+    float* V_cache = (float*)calloc(1, TB * TMAX_SEQ * TH * Td * sizeof(float));
+    float* WQ = (float*)malloc(TD * TD * sizeof(float));
+    float* bQ = (float*)malloc(TD * sizeof(float));
+    float* WK = (float*)malloc(TD * TD * sizeof(float));
+    float* bK = (float*)malloc(TD * sizeof(float));
+    float* WV = (float*)malloc(TD * TD * sizeof(float));
+    float* bV = (float*)malloc(TD * sizeof(float));
+    float* WO = (float*)malloc(TD * TD * sizeof(float));
+    float* bO = (float*)malloc(TD * sizeof(float));
+
+    float* Y_cpu = (float*)calloc(1, TB * TD * sizeof(float));
+    float* Y_ref = (float*)calloc(1, TB * TD * sizeof(float));
+    float* K_cpu = (float*)calloc(1, TB * TMAX_SEQ * TH * Td * sizeof(float));
+    float* V_cpu = (float*)calloc(1, TB * TMAX_SEQ * TH * Td * sizeof(float));
+    float* K_ref = (float*)calloc(1, TB * TMAX_SEQ * TH * Td * sizeof(float));
+    float* V_ref = (float*)calloc(1, TB * TMAX_SEQ * TH * Td * sizeof(float));
+
+    random_fill(X_new, TB * TD, 77);
+    random_fill(WQ, TD * TD, 100); random_fill(bQ, TD, 101);
+    random_fill(WK, TD * TD, 102); random_fill(bK, TD, 103);
+    random_fill(WV, TD * TD, 104); random_fill(bV, TD, 105);
+    random_fill(WO, TD * TD, 106); random_fill(bO, TD, 107);
+
+    float scale = 1.0f / sqrtf((float)Td);
+
+    /* Decode at cache_len=2 (simulating 3rd token), with RoPE enabled (HALFSPLIT) */
+    mha_decode_params_t p;
+    memset(&p, 0, sizeof(p));
+    p.batch_size = TB; p.hidden_size = TD;
+    p.num_heads = TH; p.num_kv_heads = TH; p.head_dim = Td;
+    p.scale = scale; p.cache_len = 2; p.max_seq = TMAX_SEQ;
+    p.rope_base = 10000.0f;
+    p.rope_layout = ROPE_LAYOUT_HALFSPLIT;
+    p.rope_inv_freq = NULL;
+
+    /* CPU */
+    const void* cpu_in[] = { X_new, K_cache, V_cache, WQ, bQ, WK, bK, WV, bV, WO, bO };
+    void* cpu_out[] = { Y_cpu, K_cpu, V_cpu };
+    int ret = mha_decode_f32(cpu_in, cpu_out, (const operator_params_t*)&p, NULL);
+    CHECK(ret == 0, "mha_decode_f32 (rope) returned error");
+
+    /* Reference with RoPE */
+    decode_ref(X_new, K_cache, V_cache, WQ, bQ, WK, bK, WV, bV, WO, bO,
+               Y_ref, K_ref, V_ref, 2, scale, 10000.0f, ROPE_LAYOUT_HALFSPLIT, NULL);
+
+    float diff = max_abs_diff(Y_cpu, Y_ref, TB * TD);
+    fprintf(stderr, "RoPE CPU: Y max_diff=%.2e\n", diff);
+    CHECK(diff < 1e-4f, "RoPE CPU Y mismatch");
+
+    diff = max_abs_diff(K_cpu, K_ref, TB * TMAX_SEQ * TH * Td);
+    fprintf(stderr, "RoPE CPU: K_cache max_diff=%.2e\n", diff);
+    CHECK(diff < 1e-4f, "RoPE CPU K_cache mismatch (rotation not applied to cache?)");
+
+    /* Sanity: rotated K_cache must differ from non-rotated (rope_base=0) */
+    float* K_norope = (float*)calloc(1, TB * TMAX_SEQ * TH * Td * sizeof(float));
+    float* V_norope = (float*)calloc(1, TB * TMAX_SEQ * TH * Td * sizeof(float));
+    float* Y_norope = (float*)calloc(1, TB * TD * sizeof(float));
+    mha_decode_params_t p0 = p;
+    p0.rope_base = 0.0f;
+    const void* in0[] = { X_new, K_cache, V_cache, WQ, bQ, WK, bK, WV, bV, WO, bO };
+    void* out0[] = { Y_norope, K_norope, V_norope };
+    mha_decode_f32(in0, out0, (const operator_params_t*)&p0, NULL);
+    float rope_effect = max_abs_diff(K_cpu, K_norope, TB * TMAX_SEQ * TH * Td);
+    fprintf(stderr, "RoPE vs no-RoPE K_cache: max_diff=%.2e (must be >0)\n", rope_effect);
+    CHECK(rope_effect > 1e-6f, "RoPE had no effect on K_cache");
+    /* Note: Y-effect is not checked here because with a single cached token at
+       the same position as Q (pos=cache_len), RoPE's relative-position rotation
+       cancels in Q·K (R^T·R = I). The K_cache rotation (proven above) plus the
+       CPU-vs-ref Y match (proven earlier) together confirm correct fusion. */
+
+#ifdef USE_CUDA
+    /* CUDA with RoPE */
+    float* Y_gpu = (float*)calloc(1, TB * TD * sizeof(float));
+    float* K_gpu = (float*)calloc(1, TB * TMAX_SEQ * TH * Td * sizeof(float));
+    float* V_gpu = (float*)calloc(1, TB * TMAX_SEQ * TH * Td * sizeof(float));
+
+    int64_t x_shape[] = {TB, 1, TD};
+    int64_t cache_shape[] = {TB, TMAX_SEQ, TH, Td};
+    int64_t w_shape[] = {TD, TD};
+    int64_t b_shape[] = {TD};
+
+    tensor_t* tX = tensor_create(DATA_TYPE_F32, 3, x_shape);
+    tensor_t* tKc = tensor_create(DATA_TYPE_F32, 4, cache_shape);
+    tensor_t* tVc = tensor_create(DATA_TYPE_F32, 4, cache_shape);
+    tensor_t* tWQ = tensor_create(DATA_TYPE_F32, 2, w_shape);
+    tensor_t* tbQ = tensor_create(DATA_TYPE_F32, 1, b_shape);
+    tensor_t* tWK = tensor_create(DATA_TYPE_F32, 2, w_shape);
+    tensor_t* tbK = tensor_create(DATA_TYPE_F32, 1, b_shape);
+    tensor_t* tWV = tensor_create(DATA_TYPE_F32, 2, w_shape);
+    tensor_t* tbV = tensor_create(DATA_TYPE_F32, 1, b_shape);
+    tensor_t* tWO = tensor_create(DATA_TYPE_F32, 2, w_shape);
+    tensor_t* tbO = tensor_create(DATA_TYPE_F32, 1, b_shape);
+    tensor_t* tY = tensor_create(DATA_TYPE_F32, 3, x_shape);
+    tensor_t* tKo = tensor_create(DATA_TYPE_F32, 4, cache_shape);
+    tensor_t* tVo = tensor_create(DATA_TYPE_F32, 4, cache_shape);
+
+    memcpy(tX->data, X_new, TB * TD * sizeof(float));
+    memcpy(tKc->data, K_cache, TB * TMAX_SEQ * TH * Td * sizeof(float));
+    memcpy(tVc->data, V_cache, TB * TMAX_SEQ * TH * Td * sizeof(float));
+    memcpy(tWQ->data, WQ, TD * TD * sizeof(float));
+    memcpy(tbQ->data, bQ, TD * sizeof(float));
+    memcpy(tWK->data, WK, TD * TD * sizeof(float));
+    memcpy(tbK->data, bK, TD * sizeof(float));
+    memcpy(tWV->data, WV, TD * TD * sizeof(float));
+    memcpy(tbV->data, bV, TD * sizeof(float));
+    memcpy(tWO->data, WO, TD * TD * sizeof(float));
+    memcpy(tbO->data, bO, TD * sizeof(float));
+
+    tensor_copy_to_device(tX); tensor_copy_to_device(tKc); tensor_copy_to_device(tVc);
+    tensor_copy_to_device(tWQ); tensor_copy_to_device(tbQ);
+    tensor_copy_to_device(tWK); tensor_copy_to_device(tbK);
+    tensor_copy_to_device(tWV); tensor_copy_to_device(tbV);
+    tensor_copy_to_device(tWO); tensor_copy_to_device(tbO);
+    tensor_copy_to_device(tY); tensor_copy_to_device(tKo); tensor_copy_to_device(tVo);
+
+    const operator_registry_t* op = operator_find("mha_decode_f32_cuda");
+    if (op && op->func) {
+        const void* gpu_in[] = {
+            tX->data_device, tKc->data_device, tVc->data_device,
+            tWQ->data_device, tbQ->data_device,
+            tWK->data_device, tbK->data_device,
+            tWV->data_device, tbV->data_device,
+            tWO->data_device, tbO->data_device
+        };
+        void* gpu_out[] = { tY->data_device, tKo->data_device, tVo->data_device };
+        ret = op->func(gpu_in, gpu_out, (const operator_params_t*)&p, NULL);
+        CHECK(ret == 0, "mha_decode_f32_cuda (rope) returned error");
+        tensor_copy_to_host(tY); tensor_copy_to_host(tKo); tensor_copy_to_host(tVo);
+        g_cuda.stream_synchronize(0);
+
+        memcpy(Y_gpu, tY->data, TB * TD * sizeof(float));
+        memcpy(K_gpu, tKo->data, TB * TMAX_SEQ * TH * Td * sizeof(float));
+        memcpy(V_gpu, tVo->data, TB * TMAX_SEQ * TH * Td * sizeof(float));
+
+        diff = max_abs_diff(V_gpu, V_cpu, TB * TMAX_SEQ * TH * Td);
+        fprintf(stderr, "RoPE CUDA vs CPU: V_cache max_diff=%.2e\n", diff);
+        CHECK(diff < 1e-3f, "RoPE CUDA V_cache mismatch");
+
+        diff = max_abs_diff(K_gpu, K_cpu, TB * TMAX_SEQ * TH * Td);
+        fprintf(stderr, "RoPE CUDA vs CPU: K_cache max_diff=%.2e\n", diff);
+        CHECK(diff < 1e-3f, "RoPE CUDA K_cache mismatch");
+
+        diff = max_abs_diff(Y_gpu, Y_cpu, TB * TD);
+        fprintf(stderr, "RoPE CUDA vs CPU: Y max_diff=%.2e\n", diff);
+        CHECK(diff < 1e-3f, "RoPE CUDA Y mismatch");
+    } else {
+        fprintf(stderr, "SKIP: mha_decode_f32_cuda not registered\n");
+    }
+
+    tensor_destroy(tX); tensor_destroy(tKc); tensor_destroy(tVc);
+    tensor_destroy(tWQ); tensor_destroy(tbQ);
+    tensor_destroy(tWK); tensor_destroy(tbK);
+    tensor_destroy(tWV); tensor_destroy(tbV);
+    tensor_destroy(tWO); tensor_destroy(tbO);
+    tensor_destroy(tY); tensor_destroy(tKo); tensor_destroy(tVo);
+    free(Y_gpu); free(K_gpu); free(V_gpu);
+#endif
+
+    fprintf(stderr, "MHA Decode + RoPE: PASS\n");
+    free(X_new); free(K_cache); free(V_cache);
+    free(WQ); free(bQ); free(WK); free(bK);
+    free(WV); free(bV); free(WO); free(bO);
+    free(Y_cpu); free(Y_ref); free(K_cpu); free(V_cpu); free(K_ref); free(V_ref);
+    free(K_norope); free(V_norope); free(Y_norope);
+    return 0;
+}
+
+/* ============================================================
  * Test: CausalMask operator
  * ============================================================ */
 static int test_causal_mask(void) {
@@ -462,6 +671,7 @@ int main(void) {
     test_causal_mask();
     test_mha_decode_cpu();
     test_mha_decode_cuda();
+    test_mha_decode_rope();
 
 #ifdef USE_CUDA
     cuda_platform_finalize();

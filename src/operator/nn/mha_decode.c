@@ -1,12 +1,40 @@
-/* CPU reference for MHA decode — single-token attention with KV-cache.
+/* CPU reference for MHA decode - single-token attention with KV-cache.
    Supports GQA (Grouped-Query Attention): H_kv <= H_q.
    inputs:  [X_new(B,1,D), K_cache(B,max_seq,H_kv,d), V_cache(B,max_seq,H_kv,d),
              WQ(D,D), bQ(D), WK(D,H_kv*d), bK(H_kv*d), WV(D,H_kv*d), bV(H_kv*d), WO(D,D), bO(D)]
-   outputs: [Y(B,1,D), K_cache_out, V_cache_out] */
+   outputs: [Y(B,1,D), K_cache_out, V_cache_out]
+
+   RoPE fusion (R9-h): when rope_base > 0, Q and K_new are rotated in-place
+   after projection, using pos = cache_len (the new token's position). The
+   KV-cache thus stores rotated K, keeping prefill/decode cache consistent. */
 #include "operator.h"
 #include "mha_decode_int.h"
 #include <math.h>
 #include <string.h>
+
+/* Apply RoPE in-place to a single (d,) vector at position `pos`.
+   Mirrors rope.c's pair-rotation logic; layout selects interleaved/halfsplit.
+   rope_base>0 enables; inv_freq NULL => derive from rope_base. */
+static void rope_apply_vec(float* q, int64_t d, int64_t pos,
+                           float rope_base, int rope_layout, const float* inv_freq) {
+    int64_t half_d = d / 2;
+    int is_halfsplit = (rope_layout == ROPE_LAYOUT_HALFSPLIT);
+    for (int64_t i = 0; i < half_d; i++) {
+        float freq = inv_freq ? inv_freq[i]
+                              : (1.0f / powf(rope_base, (float)(2 * i) / (float)d));
+        float angle = (float)pos * freq;
+        float c = cosf(angle), s = sinf(angle);
+        if (!is_halfsplit) {
+            float x0 = q[2 * i], x1 = q[2 * i + 1];
+            q[2 * i]     = x0 * c - x1 * s;
+            q[2 * i + 1] = x0 * s + x1 * c;
+        } else {
+            float x0 = q[i], x1 = q[i + half_d];
+            q[i]          = x0 * c - x1 * s;
+            q[i + half_d] = x0 * s + x1 * c;
+        }
+    }
+}
 
 int mha_decode_f32(const void* inputs[], void* outputs[],
                    const operator_params_t* params, stream_t* stream) {
@@ -22,6 +50,9 @@ int mha_decode_f32(const void* inputs[], void* outputs[],
     int64_t cache_len = p->cache_len, max_seq = p->max_seq;
     int64_t kv_dim = H_kv * d;  /* WK/WV output dimension */
     int64_t group_size = H / H_kv;  /* query heads per KV head */
+
+    /* RoPE config: enabled when rope_base > 0 */
+    int use_rope = (p->rope_base > 0.0f);
 
     const float* X_new   = (const float*)inputs[0];   /* (B, 1, D) */
     const float* K_cache = (const float*)inputs[1];    /* (B, max_seq, H_kv, d) */
@@ -63,6 +94,10 @@ int mha_decode_f32(const void* inputs[], void* outputs[],
                 K_new[di] = k_acc + (bK ? bK[kv_ho + di] : 0.0f);
                 V_new[di] = v_acc + (bV ? bV[kv_ho + di] : 0.0f);
             }
+            /* R9-h: rotate K_new before writing to cache (pos = cache_len) */
+            if (use_rope) {
+                rope_apply_vec(K_new, d, cache_len, p->rope_base, p->rope_layout, p->rope_inv_freq);
+            }
             /* Write to cache */
             int64_t cache_idx = (b * max_seq + cache_len) * H_kv * d + kv_ho;
             for (int64_t di = 0; di < d; di++) {
@@ -74,15 +109,19 @@ int mha_decode_f32(const void* inputs[], void* outputs[],
         /* Process each query head */
         for (int64_t h = 0; h < H; h++) {
             int64_t ho = h * d;
-            int64_t kv_h = h / group_size;  /* GQA: map query head → KV head */
+            int64_t kv_h = h / group_size;  /* GQA: map query head -> KV head */
             int64_t kv_ho = kv_h * d;
 
-            /* Q = x · WQ + bQ  →  (d,) */
+            /* Q = x · WQ + bQ  ->  (d,) */
             float Q[64];
             for (int64_t di = 0; di < d; di++) {
                 float acc = 0.0f;
                 for (int64_t j = 0; j < D; j++) acc += x[j] * WQ[j * D + ho + di];
                 Q[di] = acc + (bQ ? bQ[ho + di] : 0.0f);
+            }
+            /* R9-h: rotate Q before attention (pos = cache_len) */
+            if (use_rope) {
+                rope_apply_vec(Q, d, cache_len, p->rope_base, p->rope_layout, p->rope_inv_freq);
             }
 
             /* Attention scores: Q · K_cache^T · scale, positions 0..cache_len */
@@ -127,7 +166,7 @@ int mha_decode_f32(const void* inputs[], void* outputs[],
 int register_mha_decode_f32(void) {
     static operator_registry_t reg = {
         .name = "mha_decode_f32", .data_type = "f32",
-        .func = mha_decode_f32, .version = 1, .flags = OP_FLAG_NONE,
+        .func = mha_decode_f32, .version = 2, .flags = OP_FLAG_NONE,
     };
     return operator_register(&reg);
 }
