@@ -21,6 +21,9 @@ typedef struct {
                                NULL = 从 base 现算（向后兼容）。
                                频率表驱动架构：host 端按方案生成此表，
                                可支持 Linear/NTK/Dynamic NTK/YaRN 等上下文扩展变体。 */
+    int64_t batch_size;     /* B, 默认 1; >1 时对 (B,S,H,d) 张量按 batch 独立旋转 */
+    int64_t pos_offset;     /* 起始位置偏移, 默认 0; 适配 KV-cache 续写时
+                               pos = pos_offset + 局部索引 (decode 单 token 时 = cache_len) */
 } rope_params_t;
 
 #endif /* ROPE_INT_H_ */
