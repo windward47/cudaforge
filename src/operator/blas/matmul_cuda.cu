@@ -28,7 +28,8 @@ __global__ void transpose_f32_kernel(const float* src, float* dst,
 __global__ void matmul_f32_naive(const float* A, const float* B, float* C,
                                   int64_t M, int64_t N, int64_t K,
                                   int64_t batch_size,
-                                  int64_t stride_a, int64_t stride_b, int64_t stride_c) {
+                                  int64_t stride_a, int64_t stride_b, int64_t stride_c,
+                                  int transpose_b) {
     int64_t row = blockIdx.y * blockDim.y + threadIdx.y;
     int64_t col = blockIdx.x * blockDim.x + threadIdx.x;
     int64_t batch = blockIdx.z;
@@ -38,7 +39,10 @@ __global__ void matmul_f32_naive(const float* A, const float* B, float* C,
         float*       Cb = C + batch * stride_c;
         float sum = 0.0f;
         for (int64_t k = 0; k < K; k++) {
-            sum += Ab[row * K + k] * Bb[k * N + col];
+            /* transpose_b: B is [N,K] row-major, B[n][k]=B[n*K+k].
+               We need B[k][n] = B[col*K + k]. */
+            float bk = transpose_b ? Bb[col * K + k] : Bb[k * N + col];
+            sum += Ab[row * K + k] * bk;
         }
         Cb[row * N + col] = sum;
     }
@@ -446,7 +450,7 @@ int matmul_f32_cuda(const void* inputs[], void* outputs[],
                   (unsigned int)batch_size);
         ret = CUDA_KERNEL_LAUNCH(matmul_f32_naive, grid, block, 0, s,
                                   A, B, C, M, N, K,
-                                  batch_size, stride_a, stride_b, stride_c);
+                                  batch_size, stride_a, stride_b, stride_c, tb_flag);
         if (ret != 0) goto matmul_cleanup;
         if (bias) {
             int64_t total = batch_size * M * N;
