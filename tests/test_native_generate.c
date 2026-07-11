@@ -282,10 +282,35 @@ static int test_generate_api(void) {
     cfg.verbose = 0;
 
     int gen = generate_tokens(g, prompt, 2, out, &cfg);
-    fprintf(stderr, "generate_tokens: gen=%d, tokens:", gen);
+    fprintf(stderr, "generate_tokens CPU: gen=%d, tokens:", gen);
     for (int i = 0; i < gen; i++) fprintf(stderr, " %lld", (long long)out[i]);
     fprintf(stderr, "\n");
     CHECK(gen == 3, "generate_tokens wrong count");
+
+#ifdef USE_CUDA
+    /* CUDA run: reset cache, run with use_cuda=1, compare tokens */
+    memset(tKc->data, 0, MAX_SEQ*N_HEADS*D_HEAD*sizeof(float));
+    memset(tVc->data, 0, MAX_SEQ*N_HEADS*D_HEAD*sizeof(float));
+    memset(tKo->data, 0, MAX_SEQ*N_HEADS*D_HEAD*sizeof(float));
+    memset(tVo->data, 0, MAX_SEQ*N_HEADS*D_HEAD*sizeof(float));
+    if (tKc->data_device) { memset(tKc->data_device, 0, MAX_SEQ*N_HEADS*D_HEAD*sizeof(float)); }
+    if (tVc->data_device) { memset(tVc->data_device, 0, MAX_SEQ*N_HEADS*D_HEAD*sizeof(float)); }
+
+    int64_t out_cuda[8] = {0};
+    generate_config_t cfg_c = cfg;
+    cfg_c.use_cuda = 1;
+    int gen_c = generate_tokens(g, prompt, 2, out_cuda, &cfg_c);
+    fprintf(stderr, "generate_tokens CUDA: gen=%d, tokens:", gen_c);
+    for (int i = 0; i < gen_c; i++) fprintf(stderr, " %lld", (long long)out_cuda[i]);
+    fprintf(stderr, "\n");
+    CHECK(gen_c == gen, "CUDA generate_tokens count mismatch");
+    int cuda_match = 1;
+    for (int i = 0; i < gen; i++) {
+        if (out_cuda[i] != out[i]) { cuda_match = 0; break; }
+    }
+    CHECK(cuda_match, "CUDA generate_tokens tokens differ from CPU");
+    fprintf(stderr, "generate_tokens CUDA vs CPU: MATCH\n");
+#endif
 
     fprintf(stderr, "generate_tokens API (KV-cache): PASS\n");
     graph_destroy(g);

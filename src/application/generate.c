@@ -19,6 +19,10 @@
 #include <string.h>
 #include <math.h>
 
+#ifdef USE_CUDA
+#include "cuda_ops.h"
+#endif
+
 /* Find argmax of float array, return index */
 static int64_t argmax_f32(const float* data, int64_t n) {
     int64_t best_idx = 0;
@@ -84,6 +88,20 @@ static int generate_kv_cache(inference_graph_t* g,
     int64_t* id_data = (int64_t*)input_tensor->data;
     float* logits = (float*)output_tensor->data;
 
+    /* Find the mha_decode node to locate K/V cache input/output tensor pairs.
+       The op writes K_out/V_out; we must feed them back as K_in/V_in next step. */
+    int k_in_tid = -1, k_out_tid = -1, v_in_tid = -1, v_out_tid = -1;
+    for (int i = 0; i < g->num_nodes; i++) {
+        if (g->nodes[i].type == OP_MHA_DECODE && g->nodes[i].num_inputs >= 3 &&
+            g->nodes[i].num_outputs >= 3) {
+            k_in_tid = g->nodes[i].input_tensors[1];
+            v_in_tid = g->nodes[i].input_tensors[2];
+            k_out_tid = g->nodes[i].output_tensors[1];
+            v_out_tid = g->nodes[i].output_tensors[2];
+            break;
+        }
+    }
+
     int64_t generated = 0;
     int64_t next_token = -1;
 
@@ -91,6 +109,14 @@ static int generate_kv_cache(inference_graph_t* g,
        The last prompt token's logits produce the first generated token. */
     for (int64_t step = 0; step < prompt_len; step++) {
         id_data[0] = prompt[step];
+#ifdef USE_CUDA
+        /* Force re-copy of input token id to device (tensor_copy_to_device
+           skips if data_device already exists, but the id changes each step). */
+        if (cfg->use_cuda && input_tensor->data_device) {
+            g_cuda.memcpy_h2d(input_tensor->data_device, input_tensor->data,
+                              (size_t)input_tensor->numel * sizeof(int64_t), 0);
+        }
+#endif
         graph_update_cache_len(g, step);
 
         tensor_t* inputs[] = {input_tensor};
@@ -100,6 +126,25 @@ static int generate_kv_cache(inference_graph_t* g,
             fprintf(stderr, "generate_kv: prefill step %lld failed (ret=%d)\n",
                     (long long)step, ret);
             return -1;
+        }
+        /* Feed K_out/V_out back to K_in/V_in for next step */
+        if (k_in_tid >= 0 && k_out_tid >= 0 && k_in_tid != k_out_tid) {
+            tensor_t* kin = g->tensors[k_in_tid].tensor;
+            tensor_t* kout = g->tensors[k_out_tid].tensor;
+            tensor_t* vin = g->tensors[v_in_tid].tensor;
+            tensor_t* vout = g->tensors[v_out_tid].tensor;
+            size_t bytes = (size_t)kin->numel * data_type_get_info(kin->dtype)->size;
+#ifdef USE_CUDA
+            if (cfg->use_cuda && kin->data_device && kout->data_device) {
+                g_cuda.memcpy_d2d(kin->data_device, kout->data_device, bytes, 0);
+                g_cuda.memcpy_d2d(vin->data_device, vout->data_device, bytes, 0);
+                g_cuda.stream_synchronize(0);
+            } else
+#endif
+            {
+                memcpy(kin->data, kout->data, bytes);
+                memcpy(vin->data, vout->data, bytes);
+            }
         }
     }
 
@@ -126,6 +171,12 @@ static int generate_kv_cache(inference_graph_t* g,
 
         /* Feed the just-generated token, advance cache_len */
         id_data[0] = next_token;
+#ifdef USE_CUDA
+        if (cfg->use_cuda && input_tensor->data_device) {
+            g_cuda.memcpy_h2d(input_tensor->data_device, input_tensor->data,
+                              (size_t)input_tensor->numel * sizeof(int64_t), 0);
+        }
+#endif
         graph_update_cache_len(g, cache_len);
         cache_len++;
 
@@ -136,6 +187,25 @@ static int generate_kv_cache(inference_graph_t* g,
             fprintf(stderr, "generate_kv: decode step %lld failed (ret=%d)\n",
                     (long long)step, ret);
             break;
+        }
+        /* Feed K_out/V_out back to K_in/V_in for next step */
+        if (k_in_tid >= 0 && k_out_tid >= 0 && k_in_tid != k_out_tid) {
+            tensor_t* kin = g->tensors[k_in_tid].tensor;
+            tensor_t* kout = g->tensors[k_out_tid].tensor;
+            tensor_t* vin = g->tensors[v_in_tid].tensor;
+            tensor_t* vout = g->tensors[v_out_tid].tensor;
+            size_t bytes = (size_t)kin->numel * data_type_get_info(kin->dtype)->size;
+#ifdef USE_CUDA
+            if (cfg->use_cuda && kin->data_device && kout->data_device) {
+                g_cuda.memcpy_d2d(kin->data_device, kout->data_device, bytes, 0);
+                g_cuda.memcpy_d2d(vin->data_device, vout->data_device, bytes, 0);
+                g_cuda.stream_synchronize(0);
+            } else
+#endif
+            {
+                memcpy(kin->data, kout->data, bytes);
+                memcpy(vin->data, vout->data, bytes);
+            }
         }
 
         next_token = sample_token(logits, vocab, cfg->temperature);
