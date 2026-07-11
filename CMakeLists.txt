@@ -837,7 +837,7 @@ if(ENABLE_TESTS)
         src/operator/nn
         src/platform/include
     )
-    target_link_libraries(test_native_generate PRIVATE application operator platform)
+    target_link_libraries(test_native_generate PRIVATE onnx_model application operator platform)
     if(CMAKE_C_COMPILER_ID STREQUAL "MSVC")
         target_compile_options(test_native_generate PRIVATE /wd4189 /wd4456 /wd4101)
     endif()

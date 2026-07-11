@@ -19,6 +19,7 @@
 #include "graph.h"
 #include "platform.h"
 #include "operator.h"
+#include "generate.h"
 #include "mha_decode_int.h"
 #include "matmul_int.h"
 #include "layernorm_int.h"
@@ -182,7 +183,117 @@ static void decode_ref(
     }
 }
 
-int main(void) {
+/* Minimal generate_tokens API test: builds a decode-only graph
+   (token_embed -> mha_decode[RoPE] -> lm_head) and calls generate_tokens. */
+static int test_generate_api(void) {
+    fprintf(stderr, "\n--- generate_tokens API test ---\n");
+
+    const int64_t D = D_MODEL, H = N_HEADS, d = D_HEAD;
+    float* tok_emb = (float*)malloc(VOCAB * D * sizeof(float));
+    float* WQ = (float*)malloc(D*D*sizeof(float)), *bQ = (float*)malloc(D*sizeof(float));
+    float* WK = (float*)malloc(D*D*sizeof(float)), *bK = (float*)malloc(D*sizeof(float));
+    float* WV = (float*)malloc(D*D*sizeof(float)), *bV = (float*)malloc(D*sizeof(float));
+    float* WO = (float*)malloc(D*D*sizeof(float)), *bO = (float*)malloc(D*sizeof(float));
+    float* lm_w = (float*)malloc(D*VOCAB*sizeof(float));
+    random_fill(tok_emb, VOCAB*D, 31);
+    random_fill(WQ, D*D, 32); random_fill(bQ, D, 33);
+    random_fill(WK, D*D, 34); random_fill(bK, D, 35);
+    random_fill(WV, D*D, 36); random_fill(bV, D, 37);
+    random_fill(WO, D*D, 38); random_fill(bO, D, 39);
+    random_fill(lm_w, D*VOCAB, 40);
+
+    inference_graph_t* g = graph_create();
+    int64_t id_shape[] = {1};
+    int64_t x_shape[] = {1, D};
+    int64_t cache_shape[] = {1, MAX_SEQ, H, d};
+    int64_t wdd[] = {D, D};
+    int64_t wdv[] = {D, VOCAB};
+    int64_t bd[] = {D};
+    int64_t logit_shape[] = {1, VOCAB};
+
+    tensor_t* tId = tensor_create(DATA_TYPE_I64, 1, id_shape);
+    tensor_t* tEmb = tensor_create(DATA_TYPE_F32, 2, (int64_t[]){VOCAB, D});
+    tensor_t* tX = tensor_create(DATA_TYPE_F32, 2, x_shape);
+    tensor_t* tKc = tensor_create(DATA_TYPE_F32, 4, cache_shape);
+    tensor_t* tVc = tensor_create(DATA_TYPE_F32, 4, cache_shape);
+    tensor_t* tY = tensor_create(DATA_TYPE_F32, 2, x_shape);
+    tensor_t* tKo = tensor_create(DATA_TYPE_F32, 4, cache_shape);
+    tensor_t* tVo = tensor_create(DATA_TYPE_F32, 4, cache_shape);
+    tensor_t* tLogits = tensor_create(DATA_TYPE_F32, 2, logit_shape);
+    memcpy(tEmb->data, tok_emb, VOCAB*D*sizeof(float));
+    tensor_t* tWQ=tensor_create(DATA_TYPE_F32,2,wdd); memcpy(tWQ->data,WQ,D*D*sizeof(float));
+    tensor_t* tbQ=tensor_create(DATA_TYPE_F32,1,bd); memcpy(tbQ->data,bQ,D*sizeof(float));
+    tensor_t* tWK=tensor_create(DATA_TYPE_F32,2,wdd); memcpy(tWK->data,WK,D*D*sizeof(float));
+    tensor_t* tbK=tensor_create(DATA_TYPE_F32,1,bd); memcpy(tbK->data,bK,D*sizeof(float));
+    tensor_t* tWV=tensor_create(DATA_TYPE_F32,2,wdd); memcpy(tWV->data,WV,D*D*sizeof(float));
+    tensor_t* tbV=tensor_create(DATA_TYPE_F32,1,bd); memcpy(tbV->data,bV,D*sizeof(float));
+    tensor_t* tWO=tensor_create(DATA_TYPE_F32,2,wdd); memcpy(tWO->data,WO,D*D*sizeof(float));
+    tensor_t* tbO=tensor_create(DATA_TYPE_F32,1,bd); memcpy(tbO->data,bO,D*sizeof(float));
+    tensor_t* tLM=tensor_create(DATA_TYPE_F32,2,wdv); memcpy(tLM->data,lm_w,D*VOCAB*sizeof(float));
+
+    int tidId=graph_add_tensor(g,tId), tidEmb=graph_add_tensor(g,tEmb);
+    int tidX=graph_add_tensor(g,tX), tidKc=graph_add_tensor(g,tKc), tidVc=graph_add_tensor(g,tVc);
+    int tidY=graph_add_tensor(g,tY), tidKo=graph_add_tensor(g,tKo), tidVo=graph_add_tensor(g,tVo);
+    int tidLogits=graph_add_tensor(g,tLogits);
+    int tidWQ=graph_add_tensor(g,tWQ),tidbQ=graph_add_tensor(g,tbQ);
+    int tidWK=graph_add_tensor(g,tWK),tidbK=graph_add_tensor(g,tbK);
+    int tidWV=graph_add_tensor(g,tWV),tidbV=graph_add_tensor(g,tbV);
+    int tidWO=graph_add_tensor(g,tWO),tidbO=graph_add_tensor(g,tbO);
+    int tidLM=graph_add_tensor(g,tLM);
+
+    /* Gather(embed, id) -> X */
+    gather_params_t gp; memset(&gp,0,sizeof(gp));
+    gp.axis=0; gp.num_indices=1; gp.block_size=D; gp.outer_size=1;
+    gp.inner_size=VOCAB*D; gp.out_axis_dim=1;
+    { int in[]={tidEmb,tidId},out[]={tidX};
+      graph_add_node(g,OP_GATHER,2,in,1,out,0,NULL,&gp,sizeof(gp)); }
+
+    /* mha_decode(X, K_cache, V_cache, weights) -> Y, K_out, V_out */
+    mha_decode_params_t mp; memset(&mp,0,sizeof(mp));
+    mp.batch_size=1; mp.hidden_size=D; mp.num_heads=H; mp.num_kv_heads=H; mp.head_dim=d;
+    mp.scale=1.0f/sqrtf((float)d); mp.cache_len=0; mp.max_seq=MAX_SEQ;
+    mp.rope_base=10000.0f; mp.rope_layout=ROPE_LAYOUT_HALFSPLIT; mp.rope_inv_freq=NULL;
+    { int in[]={tidX,tidKc,tidVc}, out[]={tidY,tidKo,tidVo};
+      tensor_t* wts[]={tWQ,tbQ,tWK,tbK,tWV,tbV,tWO,tbO};
+      graph_add_node(g,OP_MHA_DECODE,3,in,3,out,8,wts,&mp,sizeof(mp)); }
+    graph_set_kv_cache(g, tidKo, tidVo);
+
+    /* lm_head: MatMul(Y, lm_w) -> logits */
+    matmul_params_t mmp; memset(&mmp,0,sizeof(mmp));
+    mmp.M=1; mmp.N=VOCAB; mmp.K=D;
+    { int in[]={tidY}, out[]={tidLogits};
+      tensor_t* wts[]={tLM};
+      graph_add_node(g,OP_MATMUL,1,in,1,out,1,wts,&mmp,sizeof(mmp)); }
+
+    int in_nid=graph_add_node(g,OP_INPUT,0,NULL,1,(int[]){tidId},0,NULL,NULL,0);
+    graph_set_input(g,in_nid);
+    int out_nid=graph_add_node(g,OP_OUTPUT,1,(int[]){tidLogits},0,NULL,0,NULL,NULL,0);
+    graph_set_output(g,out_nid);
+    graph_set_permanent_fusion(g,1);
+    CHECK(graph_build(g)==0, "graph_build (api)");
+
+    /* Call generate_tokens */
+    int64_t prompt[] = {5, 2};
+    int64_t out[8] = {0};
+    generate_config_t cfg = generate_default_config();
+    cfg.max_new_tokens = 3;
+    cfg.temperature = 0;
+    cfg.use_cuda = 0;
+    cfg.verbose = 0;
+
+    int gen = generate_tokens(g, prompt, 2, out, &cfg);
+    fprintf(stderr, "generate_tokens: gen=%d, tokens:", gen);
+    for (int i = 0; i < gen; i++) fprintf(stderr, " %lld", (long long)out[i]);
+    fprintf(stderr, "\n");
+    CHECK(gen == 3, "generate_tokens wrong count");
+
+    fprintf(stderr, "generate_tokens API (KV-cache): PASS\n");
+    graph_destroy(g);
+    free(tok_emb);free(WQ);free(bQ);free(WK);free(bK);free(WV);free(bV);free(WO);free(bO);free(lm_w);
+    return 0;
+}
+
+static int run_tests(void) {
     platform_init();
     operator_init_all();
 #ifdef USE_CUDA
@@ -455,7 +566,7 @@ int main(void) {
     for (int i = 0; i < n_generated; i++) fprintf(stderr, " %lld", (long long)generated[i]);
     fprintf(stderr, "\n");
 
-    fprintf(stderr, "R10 Native Generate (CPU): PASS\n");
+    fprintf(stderr, "R10 Native Generate (manual loop): PASS\n");
 
     graph_destroy(g);
     free(ref_K); free(ref_V);
@@ -463,10 +574,17 @@ int main(void) {
     free(ln1_g); free(ln1_b); free(ff1_w); free(ff1_b); free(ff2_w); free(ff2_b);
     free(ln2_g); free(ln2_b); free(lm_head_w);
 
+    /* Test generate_tokens API with a minimal decode-only graph */
+    test_generate_api();
+
 #ifdef USE_CUDA
     cuda_platform_finalize();
 #endif
     platform_finalize();
     fprintf(stderr, "\n=== R10 Native Generate Tests Done ===\n");
     return 0;
+}
+
+int main(void) {
+    return run_tests();
 }

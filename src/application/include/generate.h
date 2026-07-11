@@ -14,6 +14,7 @@ typedef struct {
     int64_t  max_new_tokens;   /* maximum tokens to generate */
     int64_t  eos_token_id;    /* stop generation when this token is produced (-1 = no stop) */
     int      temperature;     /* 0 = greedy argmax, >0 = sample with temperature */
+    int      use_cuda;        /* 1 = run on GPU, 0 = CPU only */
     int      verbose;         /* print each generated token */
 } generate_config_t;
 
@@ -23,6 +24,7 @@ static inline generate_config_t generate_default_config(void) {
     cfg.max_new_tokens = 64;
     cfg.eos_token_id = -1;
     cfg.temperature = 0;
+    cfg.use_cuda = 1;
     cfg.verbose = 1;
     return cfg;
 }
