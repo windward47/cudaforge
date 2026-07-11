@@ -414,6 +414,119 @@ static int test_rope_cuda(void) {
 }
 
 /* ============================================================
+ * Test: RoPE theta scaling (Linear + NTK-aware via inv_freq table)
+ * Validates the inv_freq-table-driven architecture: host precomputes a
+ * scaled frequency table and passes it via p.inv_freq, exercising the
+ * same kernel path that Linear/NTK/Dynamic-NTK/YaRN would use.
+ * ============================================================ */
+static int test_rope_scaling(void) {
+    fprintf(stderr, "\n=== RoPE Theta Scaling Test ===\n");
+
+    const int64_t TS = 8, TH = 2, Td = 8;  /* larger d for meaningful NTK effect */
+    int64_t total = TS * TH * Td;
+    int64_t shape[] = {TS, TH, Td};
+    tensor_t* tIn = tensor_create(DATA_TYPE_F32, 3, shape);
+    float scale = 2.0f;
+    int64_t half_d = Td / 2;
+
+    srand(41);
+    for (int64_t i = 0; i < total; i++) {
+        ((float*)tIn->data)[i] = ((float)rand() / RAND_MAX - 0.5f) * 2.0f;
+    }
+
+    /* --- Linear scaling: inv_freq[i] = (1/base^(2i/d)) / scale --- */
+    float* inv_freq_linear = (float*)malloc(half_d * sizeof(float));
+    for (int64_t i = 0; i < half_d; i++) {
+        float base_freq = 1.0f / powf(10000.0f, (float)(2 * i) / (float)Td);
+        inv_freq_linear[i] = base_freq / scale;
+    }
+
+    /* Reference: same as applying RoPE with pos = pos/scale (Linear equivalence) */
+    float* ref_linear = (float*)malloc(total * sizeof(float));
+    memcpy(ref_linear, tIn->data, total * sizeof(float));
+    for (int64_t pos = 0; pos < TS; pos++) {
+        for (int64_t h = 0; h < TH; h++) {
+            float* q = ref_linear + (pos * TH + h) * Td;
+            for (int64_t i = 0; i < half_d; i++) {
+                float angle = (float)pos * inv_freq_linear[i];
+                float c = cosf(angle), s = sinf(angle);
+                float x0 = q[2 * i], x1 = q[2 * i + 1];
+                q[2 * i]     = x0 * c - x1 * s;
+                q[2 * i + 1] = x0 * s + x1 * c;
+            }
+        }
+    }
+
+    /* Run RoPE with Linear-scaled inv_freq table */
+    tensor_t* tOut = tensor_create(DATA_TYPE_F32, 3, shape);
+    memcpy(tOut->data, tIn->data, total * sizeof(float));
+    rope_params_t p;
+    p.seq_len = TS; p.head_dim = Td; p.num_heads = TH;
+    p.base = 10000.0f;
+    p.layout = ROPE_LAYOUT_INTERLEAVED;
+    p.inv_freq = inv_freq_linear;
+    p.batch_size = 1; p.pos_offset = 0;
+    const void* in_ptr = tOut->data;
+    void* out_ptr = tOut->data;
+    int ret = rope_f32(&in_ptr, &out_ptr, (const operator_params_t*)&p, NULL);
+    CHECK(ret == 0, "rope_f32 (linear scaling) returned error");
+    float diff_linear = max_abs_diff((const float*)tOut->data, ref_linear, total);
+    fprintf(stderr, "Linear scaling (inv_freq table) vs ref: max_diff=%.2e\n", diff_linear);
+    CHECK(diff_linear < 1e-5f, "Linear scaling mismatch");
+
+    /* --- NTK-aware: base' = base * scale^(d/(d-2)), inv_freq from base' --- */
+    float ntk_base = 10000.0f * powf(scale, (float)Td / (float)(Td - 2));
+    float* inv_freq_ntk = (float*)malloc(half_d * sizeof(float));
+    for (int64_t i = 0; i < half_d; i++) {
+        inv_freq_ntk[i] = 1.0f / powf(ntk_base, (float)(2 * i) / (float)Td);
+    }
+    /* Sanity: NTK inv_freq differs from plain (high-freq ~unchanged, low-freq stretched) */
+    float freq0_plain = 1.0f / powf(10000.0f, 0.0f);            /* i=0, highest freq = 1 */
+    float freq0_ntk   = inv_freq_ntk[0];
+    float freqL_plain = 1.0f / powf(10000.0f, (float)(2*(half_d-1))/(float)Td);
+    float freqL_ntk   = inv_freq_ntk[half_d - 1];
+    fprintf(stderr, "NTK: high-freq plain=%.4f ntk=%.4f (close); low-freq plain=%.4f ntk=%.4f (stretched)\n",
+            freq0_plain, freq0_ntk, freqL_plain, freqL_ntk);
+    CHECK(fabsf(freq0_plain - freq0_ntk) < 0.01f, "NTK should preserve high frequency");
+    CHECK(freqL_ntk < freqL_plain, "NTK should stretch low frequency");
+
+    /* Run RoPE with NTK inv_freq table, compare to reference using same table */
+    float* ref_ntk = (float*)malloc(total * sizeof(float));
+    memcpy(ref_ntk, tIn->data, total * sizeof(float));
+    for (int64_t pos = 0; pos < TS; pos++) {
+        for (int64_t h = 0; h < TH; h++) {
+            float* q = ref_ntk + (pos * TH + h) * Td;
+            for (int64_t i = 0; i < half_d; i++) {
+                float angle = (float)pos * inv_freq_ntk[i];
+                float c = cosf(angle), s = sinf(angle);
+                float x0 = q[2 * i], x1 = q[2 * i + 1];
+                q[2 * i]     = x0 * c - x1 * s;
+                q[2 * i + 1] = x0 * s + x1 * c;
+            }
+        }
+    }
+    memcpy(tOut->data, tIn->data, total * sizeof(float));
+    p.inv_freq = inv_freq_ntk;
+    in_ptr = tOut->data; out_ptr = tOut->data;
+    ret = rope_f32(&in_ptr, &out_ptr, (const operator_params_t*)&p, NULL);
+    CHECK(ret == 0, "rope_f32 (ntk scaling) returned error");
+    float diff_ntk = max_abs_diff((const float*)tOut->data, ref_ntk, total);
+    fprintf(stderr, "NTK scaling (inv_freq table) vs ref: max_diff=%.2e\n", diff_ntk);
+    CHECK(diff_ntk < 1e-5f, "NTK scaling mismatch");
+
+    /* NTK result must differ from Linear (different scaling strategy) */
+    float diff_strategies = max_abs_diff(ref_linear, ref_ntk, total);
+    fprintf(stderr, "Linear vs NTK: max_diff=%.2e (must be >0)\n", diff_strategies);
+    CHECK(diff_strategies > 1e-6f, "Linear and NTK produced identical output");
+
+    fprintf(stderr, "RoPE Theta Scaling: PASS\n");
+    tensor_destroy(tIn); tensor_destroy(tOut);
+    free(inv_freq_linear); free(inv_freq_ntk);
+    free(ref_linear); free(ref_ntk);
+    return 0;
+}
+
+/* ============================================================
  * Test: RoPE FP16 (CPU delegate + CUDA native __half)
  * ============================================================ */
 static int test_rope_f16(void) {
@@ -519,6 +632,7 @@ int main(void) {
     test_rope_batch();
     test_rope_pos_offset();
     test_rope_cuda();
+    test_rope_scaling();
     test_rope_f16();
 
 #ifdef USE_CUDA
