@@ -185,7 +185,7 @@ out:    每个 warp 独立计算 16×d，最后 atomicAdd 到 Y
 | R9-e | theta 缩放（Linear + NTK-aware） | `test_rope.c` | ⭐ | ✅ | inv_freq 表驱动验证：Linear(inv_freq/scale) + NTK(base'=base·scale^(d/(d-2)))；高频保留低频拉伸 |
 | R9-f | RoPE 接入推理图引擎 | 新建 `test_rope_graph.c` | ⭐⭐ | ✅ | native 图 [INPUT->OP_ROPE->OUTPUT] 经 graph_execute 验证 dispatch 链路；CPU+CUDA 双跑。ONNX 映射降级(标准 ONNX 无此算子) |
 | R9-g | GPT-2 测试模型加 RoPE | - | ⭐⭐⭐ | ❌ 已评估 | ONNX 路径不可行：PyTorch 无内置 RoPE，自定义 op 导出后 ORT 无法生成参考输出。R9-f native 图已覆盖"推理链路接入"验证 |
-| R9-h | mha_decode 内部融合 RoPE | `mha_decode_int.h`/`mha_decode.c`/`mha_decode_cuda.cu`/`test_mha_decode.c` | ⭐ | ⬜ 规划中 | 方案 A：参数加 rope_base/layout/inv_freq(base=0 禁用,向后兼容)；CPU/CUDA kernel 在 Q/K 投影后、K 写 cache 前旋转(pos=cache_len)；详见下表 |
+| R9-h | mha_decode 内部融合 RoPE | `mha_decode_int.h`/`mha_decode.c`/`mha_decode_cuda.cu`/`test_mha_decode.c` | ⭐ | ✅ | 方案 A：参数加 rope_base/layout/inv_freq(base=0 禁用)；CPU/CUDA kernel 在 Q/K 投影后、K 写 cache 前旋转(pos=cache_len)；附带修复 2 个预存 CUDA bug(merged 归约+cache copy) |
 
 ### R9-h 子任务（方案 A：mha_decode 内部融合 RoPE）
 
@@ -202,7 +202,7 @@ out:    每个 warp 独立计算 16×d，最后 atomicAdd 到 Y
 
 **执行约定**：逐个任务实现+编译+test_rope+全量 ctest 回归+commit（遵循"一个 commit 一件事"）。commit message 用 `(R9-x)` 后缀。
 
-**完成情况**：R9-a~f 全部完成（37/37 测试通过），R9-g 已评估不可行（native 图已覆盖），R9-h 已调研并拆为子任务（方案 A：mha_decode 内部融合 RoPE，待实现）。RoPE 算子层具备完整能力：NeoX/interleaved 双布局、inv_freq 表驱动、B>1、pos_offset(KV-cache)、FP16、shared memory 优化、Linear/NTK 缩放、推理图引擎接入。
+**完成情况**：R9-a~f 全部完成（37/37 测试通过），R9-g 已评估不可行（native 图已覆盖），R9-h 完成（mha_decode 内部融合 RoPE + 修复 2 个预存 CUDA bug）。RoPE 全链路就绪：算子层（NeoX/interleaved 双布局、inv_freq 表驱动、B>1、pos_offset、FP16、Linear/NTK 缩放、shared memory 优化）+ 推理图接入 + decode 融合（KV-cache 存旋转后 K，pos=cache_len）。
 
 ---
 
@@ -210,11 +210,10 @@ out:    每个 warp 独立计算 16×d，最后 atomicAdd 到 Y
 
 | 状态 | 内容 |
 | --- | --- |
-| 已完成 | R1 全部, R2 全部, R3-a, R4 全部, R5 全部, Flash Attention v2 (FP32 + FP16 WMMA, smem 精简 2 blocks/SM), R9-a~f (RoPE 扩展: NeoX布局/inv_freq表驱动/batch/pos_offset/FP16/shared-mem优化/Linear+NTK缩放/推理图接入) |
+| 已完成 | R1 全部, R2 全部, R3-a, R4 全部, R5 全部, Flash Attention v2 (FP32 + FP16 WMMA, smem 精简 2 blocks/SM), R9 全部 (RoPE 扩展: NeoX布局/inv_freq表驱动/batch/pos_offset/FP16/shared-mem优化/Linear+NTK缩放/推理图接入/decode融合+cache_len>0 bug修复) |
 | 进行中 | - |
 | 已验证失败 | R6-a (寄存器压力), R6-c (WO FP16 转换开销), R8 (分体式开销大, 回退), R9-g (ONNX RoPE 导出不可行, native 图已覆盖) |
 | 已完成 | R6-b (S≤64 FP16 WMMA, 13.8×) |
 | 待评估 | R6-d (cp.async, 优先级低) |
-| 进行中 | R9-h (mha_decode 内部融合 RoPE, 方案 A 已调研拆子任务) |
 
-> **最后更新**: 2026-07-11。R9 RoPE 位置编码扩展完成（R9-a~f, 37/37 测试通过）。inv_freq 表驱动架构落地，支持 NeoX/interleaved 双布局、B>1、pos_offset(KV-cache)、FP16、Linear/NTK 缩放，已接入推理图引擎。R9-g ONNX 路径不可行已评估，R9-h decode 融合已调研（方案 A）拆为 h1~h4 子任务待实现。
+> **最后更新**: 2026-07-11。R9 RoPE 位置编码扩展全部完成（R9-a~h, 37/37 测试通过）。inv_freq 表驱动架构落地，支持 NeoX/interleaved 双布局、B>1、pos_offset(KV-cache)、FP16、Linear/NTK 缩放，已接入推理图引擎并融入 mha_decode（decode 路径 pos=cache_len，cache 存旋转后 K）。R9-h 附带修复 2 个预存 CUDA bug（merged 归约不完整 + KV-cache 未拷贝，cache_len>0 时暴露）。
