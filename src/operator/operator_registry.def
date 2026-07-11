@@ -91,6 +91,7 @@ REGISTER_CUDA(register_matmul_f16_cuda)
 REGISTER_CUDA(register_batchnorm_f16_cuda)
 REGISTER_CUDA(register_layernorm_f16_cuda)
 REGISTER_CUDA(register_softmax_f16_cuda)
+REGISTER_CUDA(register_rope_f16_cuda)
 
 /* ---- HIP 专属算子（当需要 HIP 特有实现时在此添加）---- */
 /* REGISTER_HIP(register_xxx_hip) */

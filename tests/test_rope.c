@@ -10,6 +10,7 @@
 #include "rope_int.h"
 #include "platform.h"
 #include "operator.h"
+#include "fp16.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -412,6 +413,99 @@ static int test_rope_cuda(void) {
     return 0;
 }
 
+/* ============================================================
+ * Test: RoPE FP16 (CPU delegate + CUDA native __half)
+ * ============================================================ */
+static int test_rope_f16(void) {
+#ifdef USE_CUDA
+    fprintf(stderr, "\n=== RoPE FP16 Test ===\n");
+
+    int64_t total = T_S * T_H * T_d;
+    int64_t shape[] = {T_S, T_H, T_d};
+
+    /* FP32 reference input */
+    float* f32_in = (float*)malloc(total * sizeof(float));
+    srand(31);
+    for (int64_t i = 0; i < total; i++) {
+        f32_in[i] = ((float)rand() / RAND_MAX - 0.5f) * 2.0f;
+    }
+
+    /* FP32 RoPE reference (CPU) for comparison baseline */
+    float* f32_ref = (float*)malloc(total * sizeof(float));
+    memcpy(f32_ref, f32_in, total * sizeof(float));
+    rope_params_t p;
+    p.seq_len = T_S;
+    p.head_dim = T_d;
+    p.num_heads = T_H;
+    p.base = 10000.0f;
+    p.layout = ROPE_LAYOUT_INTERLEAVED;
+    p.inv_freq = NULL;
+    p.batch_size = 1;
+    p.pos_offset = 0;
+    const void* ref_in = f32_ref;
+    void* ref_out = f32_ref;
+    rope_f32(&ref_in, &ref_out, (const operator_params_t*)&p, NULL);
+
+    /* FP16 CPU delegate: rope_f16 */
+    fp16_t* h16_cpu = (fp16_t*)malloc(total * sizeof(fp16_t));
+    fp32_to_fp16_buf(h16_cpu, f32_in, total);
+    const void* f16_in = h16_cpu;
+    void* f16_out = h16_cpu;
+    const operator_registry_t* op_cpu = operator_find("rope_f16");
+    if (!op_cpu || !op_cpu->func) {
+        fprintf(stderr, "SKIP: rope_f16 not registered\n");
+        free(f32_in); free(f32_ref); free(h16_cpu);
+        return 0;
+    }
+    op_cpu->func(&f16_in, &f16_out, (const operator_params_t*)&p, NULL);
+
+    /* Compare FP16 CPU vs FP32 ref (FP16 precision, looser tolerance) */
+    float* f32_from_cpu = (float*)malloc(total * sizeof(float));
+    fp16_to_fp32_buf(f32_from_cpu, h16_cpu, total);
+    float diff_cpu = max_abs_diff(f32_from_cpu, f32_ref, total);
+    fprintf(stderr, "FP16 CPU vs FP32 ref: max_diff=%.2e\n", diff_cpu);
+    CHECK(diff_cpu < 1e-2f, "FP16 CPU RoPE mismatch");
+
+    /* FP16 CUDA: rope_f16_cuda */
+    const operator_registry_t* op_cuda = operator_find("rope_f16_cuda");
+    if (!op_cuda || !op_cuda->func) {
+        fprintf(stderr, "SKIP: rope_f16_cuda not registered\n");
+        free(f32_in); free(f32_ref); free(h16_cpu); free(f32_from_cpu);
+        return 0;
+    }
+
+    tensor_t* tGpu = tensor_create(DATA_TYPE_F16, 3, shape);
+    memcpy(tGpu->data, h16_cpu, total * sizeof(fp16_t));  /* reuse CPU input (pre-RoPE) */
+    /* Re-fill with original input (h16_cpu was rotated in-place above) */
+    fp32_to_fp16_buf((fp16_t*)tGpu->data, f32_in, total);
+    tensor_copy_to_device(tGpu);
+    const void* gpu_in = tGpu->data_device;
+    void* gpu_out = tGpu->data_device;
+    op_cuda->func(&gpu_in, &gpu_out, (const operator_params_t*)&p, NULL);
+    tensor_copy_to_host(tGpu);
+    g_cuda.stream_synchronize(0);
+
+    float* f32_from_gpu = (float*)malloc(total * sizeof(float));
+    fp16_to_fp32_buf(f32_from_gpu, (const fp16_t*)tGpu->data, total);
+    float diff_cuda = max_abs_diff(f32_from_gpu, f32_ref, total);
+    fprintf(stderr, "FP16 CUDA vs FP32 ref: max_diff=%.2e\n", diff_cuda);
+    CHECK(diff_cuda < 1e-2f, "FP16 CUDA RoPE mismatch");
+
+    /* FP16 CUDA vs FP16 CPU (should be very close, both FP16) */
+    float diff_f16 = max_abs_diff(f32_from_gpu, f32_from_cpu, total);
+    fprintf(stderr, "FP16 CUDA vs FP16 CPU: max_diff=%.2e\n", diff_f16);
+    CHECK(diff_f16 < 1e-3f, "FP16 CUDA vs CPU mismatch");
+
+    fprintf(stderr, "RoPE FP16: PASS\n");
+    tensor_destroy(tGpu);
+    free(f32_in); free(f32_ref); free(h16_cpu);
+    free(f32_from_cpu); free(f32_from_gpu);
+#else
+    (void)0;
+#endif
+    return 0;
+}
+
 int main(void) {
     platform_init();
     operator_init_all();
@@ -425,6 +519,7 @@ int main(void) {
     test_rope_batch();
     test_rope_pos_offset();
     test_rope_cuda();
+    test_rope_f16();
 
 #ifdef USE_CUDA
     cuda_platform_finalize();

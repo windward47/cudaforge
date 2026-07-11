@@ -6,8 +6,13 @@
 #include "fp16.h"
 #include "matmul_int.h"
 #include "add_int.h"
+#include "rope_int.h"
 #include <stdlib.h>
 #include <string.h>
+
+/* rope_f32 (CPU) - delegated to by rope_f16_cpu below */
+extern int rope_f32(const void* inputs[], void* outputs[],
+                    const operator_params_t* params, stream_t* stream);
 
 /* --------------------------------------------------------------------------
  * matmul_f16: FP16 A,B → FP32 matmul → FP16 C
@@ -148,16 +153,58 @@ static const operator_registry_t s_relu_f16_reg = {
 };
 
 /* --------------------------------------------------------------------------
+ * rope_f16: FP16 RoPE - convert to FP32, delegate to rope_f32, convert back.
+ * Reuses the full-precision rotation (sin/cos/inv_freq logic); FP16 only
+ * halves memory bandwidth, compute stays FP32 for numerical stability.
+ * -------------------------------------------------------------------------- */
+static int rope_f16_cpu(const void* inputs[], void* outputs[],
+                        const operator_params_t* params, stream_t* stream) {
+    if (!inputs || !inputs[0] || !outputs || !outputs[0] || !params) return -1;
+
+    const rope_params_t* p = (const rope_params_t*)params;
+    int64_t S = p->seq_len, d = p->head_dim, H = p->num_heads;
+    int64_t B = (p->batch_size > 0) ? p->batch_size : 1;
+    int64_t total = B * S * H * d;
+
+    const fp16_t* in16 = (const fp16_t*)inputs[0];
+    fp16_t* out16      = (fp16_t*)outputs[0];
+
+    float* buf32 = (float*)malloc((size_t)total * sizeof(float));
+    if (!buf32) return -1;
+    fp16_to_fp32_buf(buf32, in16, total);
+
+    /* In-place on the FP32 buffer */
+    const void* f32_in[] = { buf32 };
+    void* f32_out[] = { buf32 };
+    int ret = rope_f32(f32_in, f32_out, params, stream);
+    if (ret == 0) {
+        fp32_to_fp16_buf(out16, buf32, total);
+    }
+    free(buf32);
+    return ret;
+}
+
+static const operator_registry_t s_rope_f16_reg = {
+    .name      = "rope_f16",
+    .data_type = "f16",
+    .func      = rope_f16_cpu,
+    .version   = 1,
+    .flags     = OP_FLAG_IN_PLACE,
+};
+
+/* --------------------------------------------------------------------------
  * Registration
  * -------------------------------------------------------------------------- */
 int register_matmul_f16_cpu(void) { return operator_register(&s_matmul_f16_reg); }
 int register_add_f16_cpu(void)    { return operator_register(&s_add_f16_reg); }
 int register_relu_f16_cpu(void)   { return operator_register(&s_relu_f16_reg); }
+int register_rope_f16_cpu(void)   { return operator_register(&s_rope_f16_reg); }
 
 int register_fp16_cpu_ops(void) {
     int ret = 0;
     ret += register_matmul_f16_cpu();
     ret += register_add_f16_cpu();
     ret += register_relu_f16_cpu();
+    ret += register_rope_f16_cpu();
     return ret;
 }
