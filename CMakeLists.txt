@@ -788,6 +788,24 @@ if(ENABLE_TESTS)
     set_tests_properties(test_bert_mha PROPERTIES
         WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
 
+    add_executable(test_rope_graph
+        tests/test_rope_graph.c
+    )
+    target_include_directories(test_rope_graph PRIVATE
+        src/application/engine
+        src/application/include
+        src/operator/include
+        src/operator/nn
+        src/platform/include
+    )
+    target_link_libraries(test_rope_graph PRIVATE application operator platform)
+    if(CMAKE_C_COMPILER_ID STREQUAL "MSVC")
+        target_compile_options(test_rope_graph PRIVATE /wd4189 /wd4456 /wd4101)
+    endif()
+    add_test(NAME test_rope_graph COMMAND test_rope_graph)
+    set_tests_properties(test_rope_graph PROPERTIES
+        WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+
     add_executable(test_mha_decode
         tests/test_mha_decode.c
     )
