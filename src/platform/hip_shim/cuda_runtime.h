@@ -1,7 +1,12 @@
-/* cuda_runtime.h — Shim for HIP compilation
+/* cuda_runtime.h - Shim for HIP compilation
  * When compiled with hipcc, redirects to HIP runtime header.
  * When compiled with nvcc or host compiler, this file is not used
- * (the real cuda_runtime.h from CUDA Toolkit is found instead).
+ * (the real cuda_runtime.h from CUDA Toolkit is found instead, because
+ *  src/platform/cuda is only on the include path under ENABLE_HIP).
+ *
+ * NOTE: src/platform/cuda must NOT be on the include path for nvcc builds,
+ * otherwise this shim shadows the real cuda_runtime.h. See CMakeLists.txt
+ * (the include dir is gated behind ENABLE_HIP).
  */
 #ifndef CUDA_RUNTIME_H_SHIM_
 #define CUDA_RUNTIME_H_SHIM_

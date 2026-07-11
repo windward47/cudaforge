@@ -9,7 +9,12 @@
 /* CUDA-to-HIP translation (no-op when not compiled by hipcc) */
 #include "cuda2hip.h"
 
-#if defined(__CUDACC__) || defined(__HIPCC__)
+/* Pull in the CUDA runtime.
+   - nvcc/hipcc device compilation: __CUDACC__/__HIPCC__ defined.
+   - Pure-CUDA host (.c, MSVC/GCC, USE_CUDA && !USE_HIP): include the real
+     toolkit cuda_runtime.h for host-side CUDA API symbols.
+   - HIP host (.c under HIP backend): types come from cuda2hip.h Mode 2. */
+#if defined(__CUDACC__) || defined(__HIPCC__) || (defined(USE_CUDA) && !defined(USE_HIP))
 #include <cuda_runtime.h>
 #endif
 
@@ -110,7 +115,7 @@ typedef struct {
     int   (*stream_synchronize)(cudaStream_t stream);
     int   (*stream_destroy)(cudaStream_t stream);
     int   (*get_device_count)(int* count);
-    int   (*get_device_props)(cudaDeviceProp* props, int device_id);
+    int   (*get_device_props)(struct cudaDeviceProp* props, int device_id);
     int   (*get_gpu_caps)(gpu_caps_t* caps, int device_id);
 } cuda_ops_t;
 

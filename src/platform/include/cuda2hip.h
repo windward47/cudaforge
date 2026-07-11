@@ -84,11 +84,14 @@
 #define cudaLaunchKernel         hipModuleLaunchKernel
 #define cudaLaunchCooperativeKernel hipLaunchCooperativeKernel
 
-#elif defined(USE_CUDA) && !defined(__CUDACC__)
+#elif defined(USE_HIP) && !defined(__CUDACC__)
 /* ================================================================
- * Mode 2: Host GCC compiling .c files that link against HIP.
+ * Mode 2: Host compiler building .c files under a HIP toolchain.
+ * (USE_HIP is defined by CMake only for the HIP backend; this prevents
+ *  the branch from triggering in a pure-nvcc CUDA build where USE_CUDA
+ *  is also defined but hip/ headers are unavailable.)
  * Provides type/function remapping for symbols used in host code.
- * .cu files are compiled by hipcc (Mode 1), .c files by GCC.
+ * .cu files are compiled by hipcc (Mode 1), .c files by the host compiler.
  * ================================================================ */
 #ifndef __HIP_PLATFORM_AMD__
 #define __HIP_PLATFORM_AMD__

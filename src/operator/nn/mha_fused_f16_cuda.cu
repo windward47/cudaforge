@@ -221,10 +221,10 @@ int mha_fused_f16_cuda(const void* inputs[], void* outputs[],
         B, S, D, H, d, p->scale, p->has_residual && R ? 1 : 0);
 }
 #else /* __HIPCC__ — WMMA not available, return error */
-static int mha_fused_f16_cuda(const void* inputs[] __attribute__((unused)),
-                               void* outputs[] __attribute__((unused)),
-                               const operator_params_t* params __attribute__((unused)),
-                               stream_t* stream __attribute__((unused))) {
+static int mha_fused_f16_cuda(const void* inputs[] CF_UNUSED,
+                               void* outputs[] CF_UNUSED,
+                               const operator_params_t* params CF_UNUSED,
+                               stream_t* stream CF_UNUSED) {
     fprintf(stderr, "mha_fused_f16: WMMA Tensor Cores not available on HIP\n");
     return -1;
 }

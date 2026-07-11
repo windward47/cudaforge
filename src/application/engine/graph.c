@@ -315,7 +315,7 @@ static int mha_unique_consumer(inference_graph_t* g, int tid, const int* skip) {
 }
 
 /* Count consumers of a tensor across all non-skipped nodes */
-__attribute__((unused))
+CF_UNUSED
 static int mha_count_consumers(inference_graph_t* g, int tid, const int* skip) {
     int count = 0;
     for (int i = 0; i < g->num_nodes; i++) {

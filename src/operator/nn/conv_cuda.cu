@@ -42,7 +42,7 @@ __global__ void im2col_f32_kernel(const float* input, float* col_buf,
 /* ============================================================
  * im2col-based conv (fallback for unusual params)
  * ============================================================ */
-static __attribute__((unused)) int conv2d_im2col(const float* in, const float* w, float* out,
+static CF_UNUSED int conv2d_im2col(const float* in, const float* w, float* out,
                           const conv_params_t* p, cudaStream_t s) {
     int64_t N = p->N, C = p->C, H = p->H, W = p->W, K = p->K;
     int64_t KH = p->kernel_h, KW = p->kernel_w;

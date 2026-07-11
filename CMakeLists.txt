@@ -36,6 +36,14 @@ elseif(CMAKE_C_COMPILER_ID STREQUAL "MSVC")
     set(CMAKE_C_FLAGS   "${CMAKE_C_FLAGS}   /W4 /WX")
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /W4 /WX")
     add_compile_definitions(_CRT_SECURE_NO_WARNINGS)
+    # C4819 (CJK comments vs code page 936), unused-code (C4100/C4189/C4505),
+    # and unreachable-code (C4702) warnings: CF_UNUSED is empty under MSVC and
+    # the dispatch-after-return pattern leaves dead code, so suppress these to
+    # keep /WX builds green. Set via CMAKE_*_FLAGS so they apply to C/CXX only;
+    # the VS generator's CUDA custom build step mangles add_compile_options
+    # generator expressions, so we avoid those for multi-flag suppressions.
+    set(CMAKE_C_FLAGS   "${CMAKE_C_FLAGS} /wd4819 /wd4100 /wd4189 /wd4505 /wd4702")
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /wd4819 /wd4100 /wd4189 /wd4505 /wd4702")
 endif()
 
 # ============================================================
@@ -51,6 +59,7 @@ if(ENABLE_HIP)
     set(CMAKE_HIP_STANDARD_REQUIRED ON)
     set(CMAKE_HIP_ARCHITECTURES ${HIP_ARCH})
     add_compile_definitions(USE_CUDA)  # reuse existing #ifdef guards
+    add_compile_definitions(USE_HIP)   # distinguish HIP-host (.c) from pure-CUDA host
     # HIP (clang) is stricter than nvcc — suppress warnings for existing CUDA patterns
     add_compile_options($<$<COMPILE_LANGUAGE:HIP>:-Wno-sign-compare>
                         $<$<COMPILE_LANGUAGE:HIP>:-Wno-missing-designated-field-initializers>
@@ -75,7 +84,16 @@ if(ENABLE_CUDA)
 endif()
 
 if(ENABLE_OPENMP)
-    find_package(OpenMP REQUIRED)
+    if(CMAKE_C_COMPILER_ID STREQUAL "MSVC")
+        # MSVC's /openmp (2.0) rejects in-loop int64_t decls and collapse(N);
+        # /openmp:llvm (3.1) accepts simple forms but still rejects some
+        # collapse structures used in the CPU op paths. Since these builds are
+        # CUDA-first (CPU OpenMP is a secondary acceleration), leave OpenMP
+        # off under MSVC: #pragma omp is silently ignored, code stays correct.
+        message(STATUS "OpenMP: disabled under MSVC (CPU ops run single-threaded)")
+    else()
+        find_package(OpenMP REQUIRED)
+    endif()
 endif()
 
 
@@ -98,8 +116,13 @@ if(GPU)
         src/platform/cuda/cuda_platform_init.cu
         src/platform/cuda/cuda_arena.cu
     )
+    # src/platform/cuda holds real headers (cuda_reduce.cuh, cuda_platform.h, ...)
+    # needed by both nvcc and hipcc. The HIP shim headers (cuda_runtime.h etc.)
+    # were moved to src/platform/hip_shim to avoid shadowing toolkit headers
+    # under nvcc; that dir is added only under ENABLE_HIP below.
     target_include_directories(platform PUBLIC src/platform/cuda)
     if(ENABLE_HIP)
+        target_include_directories(platform PUBLIC src/platform/hip_shim)
         find_library(HIPRT_LIBRARY amdhip64)
         if(HIPRT_LIBRARY)
             target_link_libraries(platform PUBLIC ${HIPRT_LIBRARY})

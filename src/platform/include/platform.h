@@ -6,6 +6,20 @@
 #include <stdbool.h>
 
 /* ============================================================
+ * Portability: "unused" annotation
+ * GCC/Clang/hipcc support __attribute__((unused)); MSVC does not.
+ * Use CF_UNUSED on deliberately-unused functions/params/vars.
+ * ============================================================ */
+#ifndef CF_UNUSED
+#if defined(__GNUC__) || defined(__clang__) || defined(__HIPCC__)
+#define CF_UNUSED __attribute__((unused))
+#else
+/* MSVC / nvcc-host: no annotation; rely on /wd4100 /wd4505 suppressions. */
+#define CF_UNUSED
+#endif
+#endif
+
+/* ============================================================
  * Data types
  * ============================================================ */
 typedef enum {

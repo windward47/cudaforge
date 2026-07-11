@@ -120,7 +120,7 @@ __global__ void batchnorm_f32_train_kernel(
 /* ============================================================
  * Helper: launch batchnorm_train with cooperative kernel support
  * ============================================================ */
-static __attribute__((unused)) int batchnorm_f32_train_launch(
+static CF_UNUSED int batchnorm_f32_train_launch(
     const float* x, const float* gamma, const float* beta,
     float* y, float* running_mean, float* running_var,
     int64_t C, int64_t hw, float epsilon, float momentum,
